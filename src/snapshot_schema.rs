@@ -119,11 +119,7 @@ impl ProviderSnapshot {
         }
     }
 
-    pub fn error(
-        source: Option<ProviderSource>,
-        attempted_at: u64,
-        error: ProviderError,
-    ) -> Self {
+    pub fn error(source: Option<ProviderSource>, attempted_at: u64, error: ProviderError) -> Self {
         Self {
             requested: true,
             status: ProviderStatus::Error,
@@ -429,8 +425,7 @@ mod tests {
             usage(),
         ));
         let json = serde_json::to_string(&snapshot).expect("snapshot should serialize");
-        let decoded: SnapshotV1 =
-            serde_json::from_str(&json).expect("snapshot should deserialize");
+        let decoded: SnapshotV1 = serde_json::from_str(&json).expect("snapshot should deserialize");
 
         assert_eq!(decoded, snapshot);
     }
