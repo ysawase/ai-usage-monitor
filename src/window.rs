@@ -19,17 +19,17 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use crate::diagnose;
 use crate::localization::{self, LanguageId, Strings};
 use crate::models::AppUsageData;
+#[cfg(feature = "self-update")]
+use crate::native_interop::TIMER_UPDATE_CHECK;
 use crate::native_interop::{
     self, Color, TIMER_COUNTDOWN, TIMER_POLL, TIMER_RESET_POLL, WM_APP_TRAY, WM_APP_USAGE_UPDATED,
 };
-#[cfg(feature = "self-update")]
-use crate::native_interop::TIMER_UPDATE_CHECK;
 use crate::poller;
 use crate::theme;
 use crate::tray_icon;
-use crate::updater::{self, InstallChannel, ReleaseDescriptor};
 #[cfg(feature = "self-update")]
 use crate::updater::UpdateCheckResult;
+use crate::updater::{self, InstallChannel, ReleaseDescriptor};
 
 /// Wrapper to make HWND sendable across threads (safe for PostMessage usage)
 #[derive(Clone, Copy)]
