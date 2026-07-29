@@ -1,6 +1,10 @@
+#[cfg(feature = "antigravity")]
 use std::collections::hash_map::DefaultHasher;
+#[cfg(feature = "antigravity")]
 use std::collections::HashMap;
+#[cfg(feature = "antigravity")]
 use std::ffi::c_void;
+#[cfg(feature = "antigravity")]
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::process::Command;
@@ -14,9 +18,12 @@ use crate::localization::Strings;
 use crate::models::{AppUsageData, UsageData, UsageSection};
 
 const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
+#[cfg(feature = "claude-messages-fallback")]
 const MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
 const CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
+#[cfg(feature = "antigravity")]
 const ANTIGRAVITY_CREDENTIAL_TARGET: &str = "gemini:antigravity";
+#[cfg(feature = "antigravity")]
 const ANTIGRAVITY_ENDPOINTS: &[&str] = &[
     "https://daily-cloudcode-pa.googleapis.com",
     "https://daily-cloudcode-pa.sandbox.googleapis.com",
@@ -24,6 +31,7 @@ const ANTIGRAVITY_ENDPOINTS: &[&str] = &[
 ];
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
+#[cfg(feature = "claude-messages-fallback")]
 const MODEL_FALLBACK_CHAIN: &[&str] = &["claude-3-haiku-20240307", "claude-haiku-4-5-20251001"];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -83,33 +91,39 @@ struct CodexRateLimitWindow {
     reset_at: i64,
 }
 
+#[cfg(feature = "antigravity")]
 #[derive(Deserialize)]
 struct AntigravityAuthFile {
     token: AntigravityTokenData,
 }
 
+#[cfg(feature = "antigravity")]
 #[derive(Deserialize)]
 struct AntigravityTokenData {
     access_token: String,
 }
 
+#[cfg(feature = "antigravity")]
 #[derive(Deserialize)]
 struct AntigravityLoadResponse {
     #[serde(rename = "cloudaicompanionProject")]
     project: Option<String>,
 }
 
+#[cfg(feature = "antigravity")]
 #[derive(Deserialize)]
 struct AntigravityModelsResponse {
     models: HashMap<String, AntigravityModelInfo>,
 }
 
+#[cfg(feature = "antigravity")]
 #[derive(Deserialize)]
 struct AntigravityModelInfo {
     #[serde(rename = "quotaInfo")]
     quota_info: Option<AntigravityQuotaInfo>,
 }
 
+#[cfg(feature = "antigravity")]
 #[derive(Deserialize)]
 struct AntigravityQuotaInfo {
     #[serde(rename = "remainingFraction")]
@@ -118,11 +132,13 @@ struct AntigravityQuotaInfo {
     reset_time: Option<String>,
 }
 
+#[cfg(feature = "antigravity")]
 #[derive(Deserialize)]
 struct AntigravityQuotaSummaryResponse {
     groups: Option<Vec<AntigravityQuotaSummaryGroup>>,
 }
 
+#[cfg(feature = "antigravity")]
 #[derive(Deserialize)]
 struct AntigravityQuotaSummaryGroup {
     #[serde(rename = "displayName")]
@@ -131,6 +147,7 @@ struct AntigravityQuotaSummaryGroup {
     buckets: Option<Vec<AntigravityQuotaSummaryBucket>>,
 }
 
+#[cfg(feature = "antigravity")]
 #[derive(Clone, Deserialize)]
 struct AntigravityQuotaSummaryBucket {
     #[serde(rename = "bucketId")]
@@ -144,6 +161,7 @@ struct AntigravityQuotaSummaryBucket {
     reset_time: Option<String>,
 }
 
+#[cfg(feature = "antigravity")]
 #[repr(C)]
 struct CredentialW {
     flags: u32,
@@ -160,6 +178,7 @@ struct CredentialW {
     user_name: *mut u16,
 }
 
+#[cfg(feature = "antigravity")]
 #[link(name = "Advapi32")]
 extern "system" {
     fn CredReadW(
@@ -176,14 +195,30 @@ pub fn poll(
     show_codex: bool,
     show_antigravity: bool,
 ) -> Result<AppUsageData, PollError> {
-    poll_with(
-        show_claude_code,
-        show_codex,
-        show_antigravity,
-        poll_claude_code,
-        poll_codex,
-        poll_antigravity,
-    )
+    #[cfg(feature = "antigravity")]
+    {
+        return poll_with(
+            show_claude_code,
+            show_codex,
+            show_antigravity,
+            poll_claude_code,
+            poll_codex,
+            poll_antigravity,
+        );
+    }
+
+    #[cfg(not(feature = "antigravity"))]
+    {
+        let _ = show_antigravity;
+        poll_with(
+            show_claude_code,
+            show_codex,
+            false,
+            poll_claude_code,
+            poll_codex,
+            || unreachable!("Antigravity is unavailable in this build"),
+        )
+    }
 }
 
 fn poll_with(
@@ -250,7 +285,14 @@ fn poll_claude_code() -> Result<UsageData, PollError> {
         }
     };
 
+    #[cfg(feature = "legacy-auto-refresh")]
     let creds = refresh_or_fallback(creds)?;
+
+    #[cfg(not(feature = "legacy-auto-refresh"))]
+    if is_token_expired(creds.expires_at) {
+        diagnose::log("Claude credentials are expired; automatic CLI refresh is disabled");
+        return Err(PollError::TokenExpired);
+    }
 
     fetch_usage_with_fallback(&creds.access_token)
 }
@@ -264,7 +306,10 @@ fn poll_codex() -> Result<UsageData, PollError> {
         }
     };
 
-    match fetch_codex_usage(&creds.access_token, creds.account_id.as_deref()) {
+    let result = fetch_codex_usage(&creds.access_token, creds.account_id.as_deref());
+
+    #[cfg(feature = "legacy-auto-refresh")]
+    match result {
         Ok(data) => Ok(data),
         Err(PollError::AuthRequired) => {
             cli_refresh_codex_token();
@@ -273,8 +318,12 @@ fn poll_codex() -> Result<UsageData, PollError> {
         }
         Err(error) => Err(error),
     }
+
+    #[cfg(not(feature = "legacy-auto-refresh"))]
+    result
 }
 
+#[cfg(feature = "antigravity")]
 fn poll_antigravity() -> Result<UsageData, PollError> {
     let creds = match read_antigravity_credentials() {
         Some(creds) => creds,
@@ -287,6 +336,7 @@ fn poll_antigravity() -> Result<UsageData, PollError> {
     fetch_antigravity_usage(&creds.access_token)
 }
 
+#[cfg(feature = "legacy-auto-refresh")]
 fn refresh_or_fallback(mut creds: Credentials) -> Result<Credentials, PollError> {
     loop {
         if !is_token_expired(creds.expires_at) {
@@ -315,6 +365,7 @@ fn refresh_or_fallback(mut creds: Credentials) -> Result<Credentials, PollError>
 
 /// Invoke the Claude CLI with a minimal prompt to force its internal
 /// OAuth token refresh.
+#[cfg(feature = "legacy-auto-refresh")]
 fn cli_refresh_token(source: &CredentialSource) {
     match source {
         CredentialSource::Windows(_) => cli_refresh_windows_token(),
@@ -322,6 +373,7 @@ fn cli_refresh_token(source: &CredentialSource) {
     }
 }
 
+#[cfg(feature = "legacy-auto-refresh")]
 fn cli_refresh_windows_token() {
     let claude_path = resolve_windows_claude_path();
     let is_cmd = claude_path.to_lowercase().ends_with(".cmd");
@@ -372,6 +424,7 @@ fn cli_refresh_windows_token() {
     }
 }
 
+#[cfg(feature = "legacy-auto-refresh")]
 fn cli_refresh_wsl_token(distro: &str) {
     diagnose::log(format!(
         "attempting WSL Claude token refresh in distro {distro}"
@@ -401,6 +454,7 @@ fn cli_refresh_wsl_token(distro: &str) {
     wait_for_refresh(&mut child);
 }
 
+#[cfg(feature = "legacy-auto-refresh")]
 fn cli_refresh_codex_token() {
     let codex_path = resolve_windows_codex_path();
     let is_cmd = codex_path.to_lowercase().ends_with(".cmd");
@@ -466,6 +520,7 @@ fn run_with_timeout(cmd: &mut Command, timeout: Duration) -> Option<std::process
     }
 }
 
+#[cfg(feature = "legacy-auto-refresh")]
 fn wait_for_refresh(child: &mut std::process::Child) {
     // Wait up to 30 seconds; don't block the poll thread forever.
     let start = std::time::Instant::now();
@@ -485,6 +540,7 @@ fn wait_for_refresh(child: &mut std::process::Child) {
 }
 
 /// Resolve the full path to the `claude` CLI executable.
+#[cfg(feature = "legacy-auto-refresh")]
 fn resolve_windows_claude_path() -> String {
     for name in &["claude.cmd", "claude"] {
         if Command::new(name)
@@ -520,6 +576,7 @@ fn resolve_windows_claude_path() -> String {
     "claude.cmd".to_string()
 }
 
+#[cfg(feature = "legacy-auto-refresh")]
 fn resolve_windows_codex_path() -> String {
     for name in &["codex.cmd", "codex.ps1", "codex.exe", "codex"] {
         if Command::new(name)
@@ -565,7 +622,11 @@ fn build_agent() -> Result<ureq::Agent, PollError> {
 
 pub fn credential_watch_snapshot(mode: CredentialWatchMode) -> CredentialWatchSnapshot {
     if mode == CredentialWatchMode::Antigravity {
+        #[cfg(feature = "antigravity")]
         return vec![antigravity_credential_watch_signature()];
+
+        #[cfg(not(feature = "antigravity"))]
+        return Vec::new();
     }
 
     let sources = match mode {
@@ -655,33 +716,41 @@ fn wsl_credential_watch_signature(distro: &str) -> Option<String> {
 }
 
 fn fetch_usage_with_fallback(token: &str) -> Result<UsageData, PollError> {
-    // Try the dedicated usage endpoint first
-    match try_usage_endpoint(token)? {
-        Some(data) => {
-            // If reset timers are missing, fill them in from the Messages API
-            if data.session.resets_at.is_none() || data.weekly.resets_at.is_none() {
-                if let Ok(fallback) = fetch_usage_via_messages(token) {
-                    let mut merged = data;
-                    if merged.session.resets_at.is_none() {
-                        merged.session.resets_at = fallback.session.resets_at;
-                    }
-                    if merged.weekly.resets_at.is_none() {
-                        merged.weekly.resets_at = fallback.weekly.resets_at;
-                    }
-                    return Ok(merged);
-                }
-            }
-            return Ok(data);
-        }
-        None => {}
+    #[cfg(not(feature = "claude-messages-fallback"))]
+    {
+        return try_usage_endpoint(token)?.ok_or(PollError::RequestFailed);
     }
 
-    // Fall back to Messages API with rate limit headers
-    let result = fetch_usage_via_messages(token);
-    if result.is_err() {
-        diagnose::log("usage endpoint and Messages API fallback both failed");
+    #[cfg(feature = "claude-messages-fallback")]
+    {
+        // Try the dedicated usage endpoint first
+        match try_usage_endpoint(token)? {
+            Some(data) => {
+                // If reset timers are missing, fill them in from the Messages API
+                if data.session.resets_at.is_none() || data.weekly.resets_at.is_none() {
+                    if let Ok(fallback) = fetch_usage_via_messages(token) {
+                        let mut merged = data;
+                        if merged.session.resets_at.is_none() {
+                            merged.session.resets_at = fallback.session.resets_at;
+                        }
+                        if merged.weekly.resets_at.is_none() {
+                            merged.weekly.resets_at = fallback.weekly.resets_at;
+                        }
+                        return Ok(merged);
+                    }
+                }
+                return Ok(data);
+            }
+            None => {}
+        }
+
+        // Fall back to Messages API with rate limit headers
+        let result = fetch_usage_via_messages(token);
+        if result.is_err() {
+            diagnose::log("usage endpoint and Messages API fallback both failed");
+        }
+        result
     }
-    result
 }
 
 fn try_usage_endpoint(token: &str) -> Result<Option<UsageData>, PollError> {
@@ -722,6 +791,7 @@ fn try_usage_endpoint(token: &str) -> Result<Option<UsageData>, PollError> {
     Ok(Some(data))
 }
 
+#[cfg(feature = "claude-messages-fallback")]
 fn fetch_usage_via_messages(token: &str) -> Result<UsageData, PollError> {
     let agent = build_agent()?;
 
@@ -762,6 +832,7 @@ fn fetch_usage_via_messages(token: &str) -> Result<UsageData, PollError> {
     Err(PollError::RequestFailed)
 }
 
+#[cfg(feature = "claude-messages-fallback")]
 fn parse_rate_limit_headers(response: &ureq::Response) -> UsageData {
     let mut data = UsageData::default();
 
@@ -858,6 +929,7 @@ fn codex_section_from_window(window: &CodexRateLimitWindow) -> UsageSection {
     }
 }
 
+#[cfg(feature = "antigravity")]
 fn antigravity_credential_watch_signature() -> String {
     let Some(content) = read_windows_generic_credential(ANTIGRAVITY_CREDENTIAL_TARGET) else {
         return format!("{ANTIGRAVITY_CREDENTIAL_TARGET}|missing");
@@ -872,6 +944,7 @@ fn antigravity_credential_watch_signature() -> String {
     )
 }
 
+#[cfg(feature = "antigravity")]
 fn fetch_antigravity_usage(token: &str) -> Result<UsageData, PollError> {
     let mut auth_error = false;
     let mut last_error = PollError::RequestFailed;
@@ -891,6 +964,7 @@ fn fetch_antigravity_usage(token: &str) -> Result<UsageData, PollError> {
     }
 }
 
+#[cfg(feature = "antigravity")]
 fn fetch_antigravity_usage_from_endpoint(
     base_url: &str,
     token: &str,
@@ -912,6 +986,7 @@ fn fetch_antigravity_usage_from_endpoint(
     Ok(UsageData { session, weekly })
 }
 
+#[cfg(feature = "antigravity")]
 fn fetch_antigravity_project(base_url: &str, token: &str) -> Result<Option<String>, PollError> {
     let agent = build_agent()?;
     let body = serde_json::json!({
@@ -951,6 +1026,7 @@ fn fetch_antigravity_project(base_url: &str, token: &str) -> Result<Option<Strin
     Ok(response.project.filter(|project| !project.is_empty()))
 }
 
+#[cfg(feature = "antigravity")]
 fn fetch_antigravity_model_quota(
     base_url: &str,
     token: &str,
@@ -1003,6 +1079,7 @@ fn fetch_antigravity_model_quota(
     .ok_or(PollError::RequestFailed)
 }
 
+#[cfg(feature = "antigravity")]
 fn fetch_antigravity_quota_summary(
     base_url: &str,
     token: &str,
@@ -1042,6 +1119,7 @@ fn fetch_antigravity_quota_summary(
     antigravity_usage_from_summary(response).ok_or(PollError::RequestFailed)
 }
 
+#[cfg(feature = "antigravity")]
 fn antigravity_section_from_quota(quota: AntigravityQuotaInfo) -> Option<UsageSection> {
     let remaining = quota.remaining_fraction?.clamp(0.0, 1.0);
     Some(UsageSection {
@@ -1050,6 +1128,7 @@ fn antigravity_section_from_quota(quota: AntigravityQuotaInfo) -> Option<UsageSe
     })
 }
 
+#[cfg(feature = "antigravity")]
 fn antigravity_section_from_summary_bucket(
     bucket: &AntigravityQuotaSummaryBucket,
 ) -> Option<UsageSection> {
@@ -1060,6 +1139,7 @@ fn antigravity_section_from_summary_bucket(
     })
 }
 
+#[cfg(feature = "antigravity")]
 fn antigravity_usage_from_summary(response: AntigravityQuotaSummaryResponse) -> Option<UsageData> {
     let mut fallback = None;
 
@@ -1079,6 +1159,7 @@ fn antigravity_usage_from_summary(response: AntigravityQuotaSummaryResponse) -> 
     fallback
 }
 
+#[cfg(feature = "antigravity")]
 fn antigravity_usage_from_summary_group(group: AntigravityQuotaSummaryGroup) -> Option<UsageData> {
     let mut data = UsageData::default();
     let mut has_quota = false;
@@ -1104,6 +1185,7 @@ fn antigravity_usage_from_summary_group(group: AntigravityQuotaSummaryGroup) -> 
     has_quota.then_some(data)
 }
 
+#[cfg(feature = "antigravity")]
 fn is_antigravity_gemini_summary_group(group: &AntigravityQuotaSummaryGroup) -> bool {
     group
         .display_name
@@ -1127,6 +1209,7 @@ fn is_antigravity_gemini_summary_group(group: &AntigravityQuotaSummaryGroup) -> 
         })
 }
 
+#[cfg(feature = "antigravity")]
 fn best_antigravity_section<I>(sections: I) -> Option<UsageSection>
 where
     I: IntoIterator<Item = UsageSection>,
@@ -1139,6 +1222,7 @@ where
     })
 }
 
+#[cfg(feature = "antigravity")]
 fn is_antigravity_display_model(model: &str) -> bool {
     model.starts_with("gemini")
         || model.starts_with("claude")
@@ -1147,6 +1231,7 @@ fn is_antigravity_display_model(model: &str) -> bool {
         || model.starts_with("imagen")
 }
 
+#[cfg(feature = "claude-messages-fallback")]
 fn get_header_f64(response: &ureq::Response, name: &str) -> f64 {
     response
         .header(name)
@@ -1154,6 +1239,7 @@ fn get_header_f64(response: &ureq::Response, name: &str) -> f64 {
         .unwrap_or(0.0)
 }
 
+#[cfg(feature = "claude-messages-fallback")]
 fn get_header_i64(response: &ureq::Response, name: &str) -> Option<i64> {
     response.header(name).and_then(|s| s.parse::<i64>().ok())
 }
@@ -1252,6 +1338,7 @@ fn read_codex_credentials() -> Option<CodexTokenData> {
     auth.tokens.filter(|tokens| !tokens.access_token.is_empty())
 }
 
+#[cfg(feature = "antigravity")]
 fn read_antigravity_credentials() -> Option<AntigravityTokenData> {
     let content = read_windows_generic_credential(ANTIGRAVITY_CREDENTIAL_TARGET)?;
     let auth: AntigravityAuthFile = serde_json::from_str(&content).ok()?;
@@ -1262,6 +1349,7 @@ fn read_antigravity_credentials() -> Option<AntigravityTokenData> {
     }
 }
 
+#[cfg(feature = "antigravity")]
 fn read_windows_generic_credential(target: &str) -> Option<String> {
     const CRED_TYPE_GENERIC: u32 = 1;
 
@@ -1349,6 +1437,7 @@ fn parse_credentials(content: &str, source: CredentialSource) -> Option<Credenti
     })
 }
 
+#[cfg(feature = "legacy-auto-refresh")]
 fn read_next_credentials_after(source: &CredentialSource) -> Option<Credentials> {
     match source {
         CredentialSource::Windows(_) => {
@@ -1677,6 +1766,21 @@ mod tests {
         assert_eq!(data.codex.unwrap().session.percentage, 42.0);
     }
 
+    #[cfg(not(feature = "antigravity"))]
+    #[test]
+    fn antigravity_requests_are_inert_without_feature() {
+        assert_eq!(
+            poll(false, false, true),
+            Err(PollError::RequestFailed),
+            "the disabled provider must not enter a poll path"
+        );
+        assert!(
+            credential_watch_snapshot(CredentialWatchMode::Antigravity).is_empty(),
+            "the disabled provider must not read Windows Credential Manager"
+        );
+    }
+
+    #[cfg(feature = "antigravity")]
     #[test]
     fn antigravity_summary_prefers_gemini_group() {
         let response: AntigravityQuotaSummaryResponse = serde_json::from_str(
