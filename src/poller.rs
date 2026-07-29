@@ -1769,9 +1769,11 @@ mod tests {
     #[cfg(not(feature = "antigravity"))]
     #[test]
     fn antigravity_requests_are_inert_without_feature() {
-        assert_eq!(
-            poll(false, false, true),
-            Err(PollError::RequestFailed),
+        assert!(
+            matches!(
+                poll(false, false, true),
+                Err(PollError::RequestFailed)
+            ),
             "the disabled provider must not enter a poll path"
         );
         assert!(
