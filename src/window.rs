@@ -19,14 +19,17 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use crate::diagnose;
 use crate::localization::{self, LanguageId, Strings};
 use crate::models::AppUsageData;
+#[cfg(feature = "self-update")]
+use crate::native_interop::TIMER_UPDATE_CHECK;
 use crate::native_interop::{
-    self, Color, TIMER_COUNTDOWN, TIMER_POLL, TIMER_RESET_POLL, TIMER_UPDATE_CHECK, WM_APP_TRAY,
-    WM_APP_USAGE_UPDATED,
+    self, Color, TIMER_COUNTDOWN, TIMER_POLL, TIMER_RESET_POLL, WM_APP_TRAY, WM_APP_USAGE_UPDATED,
 };
 use crate::poller;
 use crate::theme;
 use crate::tray_icon;
-use crate::updater::{self, InstallChannel, ReleaseDescriptor, UpdateCheckResult};
+#[cfg(feature = "self-update")]
+use crate::updater::UpdateCheckResult;
+use crate::updater::{self, InstallChannel, ReleaseDescriptor};
 
 /// Wrapper to make HWND sendable across threads (safe for PostMessage usage)
 #[derive(Clone, Copy)]
@@ -116,6 +119,7 @@ const IDM_FREQ_15MIN: u16 = 12;
 const IDM_FREQ_1HOUR: u16 = 13;
 const IDM_START_WITH_WINDOWS: u16 = 20;
 const IDM_RESET_POSITION: u16 = 30;
+#[cfg(feature = "self-update")]
 const IDM_VERSION_ACTION: u16 = 31;
 const IDM_LANG_SYSTEM: u16 = 40;
 const IDM_LANG_ENGLISH: u16 = 41;
@@ -131,9 +135,11 @@ const IDM_LANG_PORTUGUESE_BRAZIL: u16 = 50;
 const IDM_LANG_SIMPLIFIED_CHINESE: u16 = 51;
 const IDM_MODEL_CLAUDE_CODE: u16 = 60;
 const IDM_MODEL_CODEX: u16 = 61;
+#[cfg(feature = "antigravity")]
 const IDM_MODEL_ANTIGRAVITY: u16 = 62;
 
 const WM_DPICHANGED_MSG: u32 = 0x02E0;
+#[cfg(feature = "self-update")]
 const WM_APP_UPDATE_CHECK_COMPLETE: u32 = WM_APP + 2;
 const TRAY_ICON_UPDATE_REPOSITION_SUPPRESS_MS: u64 = 750;
 
@@ -361,6 +367,10 @@ fn load_settings() -> SettingsFile {
         Err(_) => return SettingsFile::default(),
     };
     let mut settings: SettingsFile = serde_json::from_str(&content).unwrap_or_default();
+    #[cfg(not(feature = "antigravity"))]
+    {
+        settings.show_antigravity = false;
+    }
     if !settings.show_claude_code && !settings.show_codex && !settings.show_antigravity {
         settings.show_claude_code = true;
     }
@@ -599,10 +609,12 @@ fn now_unix_secs() -> u64 {
         .as_secs()
 }
 
+#[cfg(feature = "self-update")]
 fn update_check_interval() -> Duration {
     Duration::from_secs(24 * 60 * 60)
 }
 
+#[cfg(feature = "self-update")]
 fn auto_update_check_due(last_update_check_unix: Option<u64>) -> bool {
     let Some(last_update_check_unix) = last_update_check_unix else {
         return true;
@@ -611,6 +623,7 @@ fn auto_update_check_due(last_update_check_unix: Option<u64>) -> bool {
     now_unix_secs().saturating_sub(last_update_check_unix) >= update_check_interval().as_secs()
 }
 
+#[cfg(feature = "self-update")]
 fn schedule_auto_update_check(hwnd: HWND) {
     let delay_ms = {
         let state = lock_state();
@@ -682,6 +695,7 @@ fn set_window_title(hwnd: HWND, strings: Strings) {
     }
 }
 
+#[cfg(feature = "self-update")]
 fn show_info_message(hwnd: HWND, title: &str, message: &str) {
     unsafe {
         let title_wide = native_interop::wide_str(title);
@@ -695,6 +709,7 @@ fn show_info_message(hwnd: HWND, title: &str, message: &str) {
     }
 }
 
+#[cfg(feature = "self-update")]
 fn show_error_message(hwnd: HWND, title: &str, message: &str) {
     unsafe {
         let title_wide = native_interop::wide_str(title);
@@ -708,6 +723,7 @@ fn show_error_message(hwnd: HWND, title: &str, message: &str) {
     }
 }
 
+#[cfg(feature = "self-update")]
 fn show_update_prompt(hwnd: HWND, strings: Strings, release: &ReleaseDescriptor) -> bool {
     let message = strings
         .update_prompt_now
@@ -751,6 +767,7 @@ fn update_language_change() -> bool {
     true
 }
 
+#[cfg(feature = "self-update")]
 fn version_action_label(
     strings: Strings,
     language: LanguageId,
@@ -779,6 +796,7 @@ fn version_action_label(
     }
 }
 
+#[cfg(feature = "self-update")]
 fn begin_update_check(hwnd: HWND, interactive: bool) {
     let send_hwnd = SendHwnd::from_hwnd(hwnd);
     let (strings, install_channel) = {
@@ -865,6 +883,7 @@ fn begin_update_check(hwnd: HWND, interactive: bool) {
     });
 }
 
+#[cfg(feature = "self-update")]
 fn begin_update_apply(hwnd: HWND, release: ReleaseDescriptor) {
     let send_hwnd = SendHwnd::from_hwnd(hwnd);
     let strings = {
@@ -912,6 +931,7 @@ fn begin_update_apply(hwnd: HWND, release: ReleaseDescriptor) {
     });
 }
 
+#[cfg(feature = "self-update")]
 fn begin_winget_update(hwnd: HWND) {
     let strings = {
         let state = lock_state();
@@ -1387,16 +1407,19 @@ pub fn run() {
             do_poll(send_hwnd);
         });
 
-        schedule_auto_update_check(hwnd);
-        let should_check_updates = {
-            let state = lock_state();
-            state
-                .as_ref()
-                .map(|s| auto_update_check_due(s.last_update_check_unix))
-                .unwrap_or(false)
-        };
-        if should_check_updates {
-            begin_update_check(hwnd, false);
+        #[cfg(feature = "self-update")]
+        {
+            schedule_auto_update_check(hwnd);
+            let should_check_updates = {
+                let state = lock_state();
+                state
+                    .as_ref()
+                    .map(|s| auto_update_check_due(s.last_update_check_unix))
+                    .unwrap_or(false)
+            };
+            if should_check_updates {
+                begin_update_check(hwnd, false);
+            }
         }
 
         // Initial theme check
@@ -2302,6 +2325,7 @@ unsafe extern "system" fn wnd_proc(
                         });
                     }
                 }
+                #[cfg(feature = "self-update")]
                 TIMER_UPDATE_CHECK => {
                     begin_update_check(hwnd, false);
                 }
@@ -2320,6 +2344,7 @@ unsafe extern "system" fn wnd_proc(
             sync_tray_icons(hwnd);
             LRESULT(0)
         }
+        #[cfg(feature = "self-update")]
         WM_APP_UPDATE_CHECK_COMPLETE => {
             schedule_auto_update_check(hwnd);
             LRESULT(0)
@@ -2522,6 +2547,7 @@ unsafe extern "system" fn wnd_proc(
                         do_poll(sh);
                     });
                 }
+                #[cfg(feature = "self-update")]
                 IDM_VERSION_ACTION => {
                     let (install_channel, release) = {
                         let state = lock_state();
@@ -2595,7 +2621,7 @@ unsafe extern "system" fn wnd_proc(
                     // Reset the poll timer with the new interval
                     SetTimer(hwnd, TIMER_POLL, new_interval, None);
                 }
-                IDM_MODEL_CLAUDE_CODE | IDM_MODEL_CODEX | IDM_MODEL_ANTIGRAVITY => {
+                IDM_MODEL_CLAUDE_CODE | IDM_MODEL_CODEX => {
                     {
                         let mut state = lock_state();
                         if let Some(s) = state.as_mut() {
@@ -2610,12 +2636,32 @@ unsafe extern "system" fn wnd_proc(
                                         s.show_codex = !s.show_codex;
                                     }
                                 }
-                                IDM_MODEL_ANTIGRAVITY => {
-                                    if s.show_claude_code || s.show_codex || !s.show_antigravity {
-                                        s.show_antigravity = !s.show_antigravity;
-                                    }
-                                }
                                 _ => {}
+                            }
+                            s.session_text = "...".to_string();
+                            s.weekly_text = "...".to_string();
+                            s.codex_session_text = "...".to_string();
+                            s.codex_weekly_text = "...".to_string();
+                            s.antigravity_session_text = "...".to_string();
+                            s.antigravity_weekly_text = "...".to_string();
+                        }
+                    }
+                    save_state_settings();
+                    position_at_taskbar();
+                    render_layered();
+                    sync_tray_icons(hwnd);
+                    let sh = SendHwnd::from_hwnd(hwnd);
+                    std::thread::spawn(move || {
+                        do_poll(sh);
+                    });
+                }
+                #[cfg(feature = "antigravity")]
+                IDM_MODEL_ANTIGRAVITY => {
+                    {
+                        let mut state = lock_state();
+                        if let Some(s) = state.as_mut() {
+                            if s.show_claude_code || s.show_codex || !s.show_antigravity {
+                                s.show_antigravity = !s.show_antigravity;
                             }
                             s.session_text = "...".to_string();
                             s.weekly_text = "...".to_string();
@@ -2817,18 +2863,21 @@ fn show_context_menu(hwnd: HWND) {
             PCWSTR::from_raw(codex_model.as_ptr()),
         );
 
-        let antigravity_model = native_interop::wide_str(strings.antigravity_model);
-        let antigravity_flags = if show_antigravity {
-            MF_CHECKED
-        } else {
-            MENU_ITEM_FLAGS(0)
-        };
-        let _ = AppendMenuW(
-            models_menu,
-            antigravity_flags,
-            IDM_MODEL_ANTIGRAVITY as usize,
-            PCWSTR::from_raw(antigravity_model.as_ptr()),
-        );
+        #[cfg(feature = "antigravity")]
+        {
+            let antigravity_model = native_interop::wide_str(strings.antigravity_model);
+            let antigravity_flags = if show_antigravity {
+                MF_CHECKED
+            } else {
+                MENU_ITEM_FLAGS(0)
+            };
+            let _ = AppendMenuW(
+                models_menu,
+                antigravity_flags,
+                IDM_MODEL_ANTIGRAVITY as usize,
+                PCWSTR::from_raw(antigravity_model.as_ptr()),
+            );
+        }
 
         let models_label = native_interop::wide_str(strings.models);
         let _ = AppendMenuW(
@@ -2912,25 +2961,28 @@ fn show_context_menu(hwnd: HWND) {
             PCWSTR::from_raw(language_label.as_ptr()),
         );
 
-        let _ = AppendMenuW(settings_menu, MF_SEPARATOR, 0, PCWSTR::null());
+        #[cfg(feature = "self-update")]
+        {
+            let _ = AppendMenuW(settings_menu, MF_SEPARATOR, 0, PCWSTR::null());
 
-        let version_label =
-            version_action_label(strings, language, install_channel, &update_status);
-        let version_str = native_interop::wide_str(&version_label);
-        let version_flags = if matches!(
-            update_status,
-            UpdateStatus::Checking | UpdateStatus::Applying
-        ) {
-            MF_GRAYED
-        } else {
-            MENU_ITEM_FLAGS(0)
-        };
-        let _ = AppendMenuW(
-            settings_menu,
-            version_flags,
-            IDM_VERSION_ACTION as usize,
-            PCWSTR::from_raw(version_str.as_ptr()),
-        );
+            let version_label =
+                version_action_label(strings, language, install_channel, &update_status);
+            let version_str = native_interop::wide_str(&version_label);
+            let version_flags = if matches!(
+                update_status,
+                UpdateStatus::Checking | UpdateStatus::Applying
+            ) {
+                MF_GRAYED
+            } else {
+                MENU_ITEM_FLAGS(0)
+            };
+            let _ = AppendMenuW(
+                settings_menu,
+                version_flags,
+                IDM_VERSION_ACTION as usize,
+                PCWSTR::from_raw(version_str.as_ptr()),
+            );
+        }
 
         let settings_label = native_interop::wide_str(strings.settings);
         let _ = AppendMenuW(
