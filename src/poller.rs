@@ -1770,10 +1770,7 @@ mod tests {
     #[test]
     fn antigravity_requests_are_inert_without_feature() {
         assert!(
-            matches!(
-                poll(false, false, true),
-                Err(PollError::RequestFailed)
-            ),
+            matches!(poll(false, false, true), Err(PollError::RequestFailed)),
             "the disabled provider must not enter a poll path"
         );
         assert!(
