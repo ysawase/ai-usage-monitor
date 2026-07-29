@@ -9,6 +9,7 @@ mod localization;
 mod models;
 mod native_interop;
 mod poller;
+mod snapshot_schema;
 mod theme;
 mod tray_icon;
 #[cfg(feature = "self-update")]
