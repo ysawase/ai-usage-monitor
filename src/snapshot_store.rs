@@ -19,10 +19,7 @@ impl MachineId {
         }
 
         if !bytes.iter().all(|byte| {
-            byte.is_ascii_lowercase()
-                || byte.is_ascii_digit()
-                || *byte == b'-'
-                || *byte == b'_'
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-' || *byte == b'_'
         }) {
             return Err(InvalidMachineId);
         }
@@ -107,14 +104,20 @@ mod tests {
     #[test]
     fn rejects_uppercase_whitespace_newline_and_non_ascii() {
         for value in ["Home", "home office", "home\n", "日本語"] {
-            assert!(MachineId::parse(value).is_err(), "{value:?} must be invalid");
+            assert!(
+                MachineId::parse(value).is_err(),
+                "{value:?} must be invalid"
+            );
         }
     }
 
     #[test]
     fn rejects_dots_separators_and_colon() {
         for value in [".", "..", "home/other", r"home\other", "home:other"] {
-            assert!(MachineId::parse(value).is_err(), "{value:?} must be invalid");
+            assert!(
+                MachineId::parse(value).is_err(),
+                "{value:?} must be invalid"
+            );
         }
     }
 
