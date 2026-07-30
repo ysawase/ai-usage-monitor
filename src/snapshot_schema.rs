@@ -953,26 +953,36 @@ mod tests {
 
     #[test]
     fn every_poll_error_maps_to_a_stable_safe_error() {
+        const SECRET_SENTINELS: [&str; 4] = [
+            "TEST_SECRET_CREDENTIAL_7f3a",
+            "TEST_RAW_RESPONSE_BODY_9b21",
+            "Bearer TEST_TOKEN_a14c",
+            "TEST_AUTHORIZATION_HEADER_d4e2",
+        ];
         let cases = [
             (
+                "auth-required",
                 PollError::AuthRequired,
                 "auth_required",
                 "Authentication required",
                 false,
             ),
             (
+                "no-credentials",
                 PollError::NoCredentials,
                 "no_credentials",
                 "Credentials not found",
                 false,
             ),
             (
+                "token-expired",
                 PollError::TokenExpired,
                 "token_expired",
                 "Token expired",
                 false,
             ),
             (
+                "request-failed",
                 PollError::RequestFailed,
                 "request_failed",
                 "Provider request failed",
@@ -980,7 +990,7 @@ mod tests {
             ),
         ];
 
-        for (poll_error, code, message, retryable) in cases {
+        for (case_id, poll_error, code, message, retryable) in cases {
             let report = poll_report(
                 error_outcome(ProviderPollSource::AnthropicOauthUsage, poll_error),
                 ProviderPollOutcome::Disabled,
@@ -988,28 +998,35 @@ mod tests {
             let value = converted_value(&report);
             let error = &value["providers"]["claude_code"]["error"];
 
-            assert_eq!(
-                error,
-                &json!({
-                    "code": code,
-                    "message": message,
-                    "retryable": retryable
-                })
+            let expected = json!({
+                "code": code,
+                "message": message,
+                "retryable": retryable
+            });
+            assert!(
+                error == &expected,
+                "{case_id}: fixed error contract changed"
             );
-            let serialized = error.to_string().to_ascii_lowercase();
-            for forbidden in [
-                "access_token",
-                "refresh_token",
-                "account",
-                "credential",
-                "authorization",
-                "response body",
-            ] {
+            assert!(
+                error["message"]
+                    .as_str()
+                    .expect("fixed error message must be a string")
+                    .len()
+                    <= 32,
+                "{case_id}: fixed error message is unexpectedly long"
+            );
+
+            let serialized = error.to_string();
+            for sentinel in SECRET_SENTINELS {
                 assert!(
-                    !serialized.contains(forbidden),
-                    "{forbidden} must not be serialized"
+                    !serialized.contains(sentinel),
+                    "{case_id}: secret sentinel leaked"
                 );
             }
+            assert!(
+                !serialized.contains(&format!("{poll_error:?}")),
+                "{case_id}: raw PollError Debug representation leaked"
+            );
         }
     }
 
