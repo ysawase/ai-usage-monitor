@@ -10,6 +10,7 @@ mod models;
 mod native_interop;
 mod poller;
 mod snapshot_schema;
+mod snapshot_store;
 mod theme;
 mod tray_icon;
 #[cfg(feature = "self-update")]
