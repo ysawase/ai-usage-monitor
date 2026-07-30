@@ -43,6 +43,73 @@ pub enum PollError {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ProviderPollSource {
+    AnthropicOauthUsage,
+    ChatgptWhamUsage,
+    AntigravityQuotaUsage,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum ProviderPollOutcome {
+    Disabled,
+    Success {
+        source: ProviderPollSource,
+        attempted_at: SystemTime,
+        acquired_at: SystemTime,
+        usage: UsageData,
+    },
+    Error {
+        source: ProviderPollSource,
+        attempted_at: SystemTime,
+        error: PollError,
+    },
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PollReport {
+    pub(crate) claude_code: ProviderPollOutcome,
+    pub(crate) codex: ProviderPollOutcome,
+    pub(crate) antigravity: ProviderPollOutcome,
+}
+
+impl PollReport {
+    pub(crate) fn into_app_usage_data(self) -> Result<AppUsageData, PollError> {
+        let mut data = AppUsageData::default();
+        let mut first_error = None;
+
+        match self.claude_code {
+            ProviderPollOutcome::Success { usage, .. } => data.claude_code = Some(usage),
+            ProviderPollOutcome::Error { error, .. } => {
+                first_error.get_or_insert(error);
+            }
+            ProviderPollOutcome::Disabled => {}
+        }
+
+        match self.codex {
+            ProviderPollOutcome::Success { usage, .. } => data.codex = Some(usage),
+            ProviderPollOutcome::Error { error, .. } => {
+                first_error.get_or_insert(error);
+            }
+            ProviderPollOutcome::Disabled => {}
+        }
+
+        match self.antigravity {
+            ProviderPollOutcome::Success { usage, .. } => data.antigravity = Some(usage),
+            ProviderPollOutcome::Error { error, .. } => {
+                first_error.get_or_insert(error);
+            }
+            ProviderPollOutcome::Disabled => {}
+        }
+
+        if data.claude_code.is_none() && data.codex.is_none() && data.antigravity.is_none() {
+            Err(first_error.unwrap_or(PollError::RequestFailed))
+        } else {
+            Ok(data)
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CredentialWatchMode {
     ActiveSource,
     AllSources,
@@ -195,9 +262,17 @@ pub fn poll(
     show_codex: bool,
     show_antigravity: bool,
 ) -> Result<AppUsageData, PollError> {
+    poll_report(show_claude_code, show_codex, show_antigravity).into_app_usage_data()
+}
+
+pub(crate) fn poll_report(
+    show_claude_code: bool,
+    show_codex: bool,
+    show_antigravity: bool,
+) -> PollReport {
     #[cfg(feature = "antigravity")]
     {
-        return poll_with(
+        return poll_report_with(
             show_claude_code,
             show_codex,
             show_antigravity,
@@ -210,7 +285,7 @@ pub fn poll(
     #[cfg(not(feature = "antigravity"))]
     {
         let _ = show_antigravity;
-        poll_with(
+        poll_report_with(
             show_claude_code,
             show_codex,
             false,
@@ -229,50 +304,115 @@ fn poll_with(
     mut poll_codex: impl FnMut() -> Result<UsageData, PollError>,
     mut poll_antigravity: impl FnMut() -> Result<UsageData, PollError>,
 ) -> Result<AppUsageData, PollError> {
-    let mut data = AppUsageData::default();
-    let mut first_error = None;
+    poll_report_with(
+        show_claude_code,
+        show_codex,
+        show_antigravity,
+        &mut poll_claude_code,
+        &mut poll_codex,
+        &mut poll_antigravity,
+    )
+    .into_app_usage_data()
+}
+
+fn poll_report_with(
+    show_claude_code: bool,
+    show_codex: bool,
+    show_antigravity: bool,
+    poll_claude_code: impl FnMut() -> Result<UsageData, PollError>,
+    poll_codex: impl FnMut() -> Result<UsageData, PollError>,
+    poll_antigravity: impl FnMut() -> Result<UsageData, PollError>,
+) -> PollReport {
+    poll_report_with_clock(
+        show_claude_code,
+        show_codex,
+        show_antigravity,
+        poll_claude_code,
+        poll_codex,
+        poll_antigravity,
+        SystemTime::now,
+    )
+}
+
+fn poll_report_with_clock(
+    show_claude_code: bool,
+    show_codex: bool,
+    show_antigravity: bool,
+    mut poll_claude_code: impl FnMut() -> Result<UsageData, PollError>,
+    mut poll_codex: impl FnMut() -> Result<UsageData, PollError>,
+    mut poll_antigravity: impl FnMut() -> Result<UsageData, PollError>,
+    mut now: impl FnMut() -> SystemTime,
+) -> PollReport {
     let active_provider_count = show_claude_code as u8 + show_codex as u8 + show_antigravity as u8;
 
-    if show_claude_code {
-        match poll_claude_code() {
-            Ok(claude_code) => data.claude_code = Some(claude_code),
-            Err(error) => {
-                if active_provider_count > 1 {
-                    diagnose::log(format!("Claude Code usage poll failed: {error:?}"));
-                }
-                first_error.get_or_insert(error);
-            }
-        }
+    let claude_code = poll_provider(
+        show_claude_code,
+        ProviderPollSource::AnthropicOauthUsage,
+        &mut poll_claude_code,
+        &mut now,
+    );
+    log_partial_failure("Claude Code", &claude_code, active_provider_count);
+
+    let codex = poll_provider(
+        show_codex,
+        ProviderPollSource::ChatgptWhamUsage,
+        &mut poll_codex,
+        &mut now,
+    );
+    log_partial_failure("Codex", &codex, active_provider_count);
+
+    let antigravity_source = ProviderPollSource::AntigravityQuotaUsage;
+
+    let antigravity = poll_provider(
+        show_antigravity,
+        antigravity_source,
+        &mut poll_antigravity,
+        &mut now,
+    );
+    log_partial_failure("Antigravity", &antigravity, active_provider_count);
+
+    PollReport {
+        claude_code,
+        codex,
+        antigravity,
+    }
+}
+
+fn poll_provider(
+    requested: bool,
+    source: ProviderPollSource,
+    poll_provider: &mut impl FnMut() -> Result<UsageData, PollError>,
+    now: &mut impl FnMut() -> SystemTime,
+) -> ProviderPollOutcome {
+    if !requested {
+        return ProviderPollOutcome::Disabled;
     }
 
-    if show_codex {
-        match poll_codex() {
-            Ok(codex) => data.codex = Some(codex),
-            Err(error) => {
-                if active_provider_count > 1 {
-                    diagnose::log(format!("Codex usage poll failed: {error:?}"));
-                }
-                first_error.get_or_insert(error);
-            }
-        }
+    let attempted_at = now();
+    match poll_provider() {
+        Ok(usage) => ProviderPollOutcome::Success {
+            source,
+            attempted_at,
+            acquired_at: now(),
+            usage,
+        },
+        Err(error) => ProviderPollOutcome::Error {
+            source,
+            attempted_at,
+            error,
+        },
     }
+}
 
-    if show_antigravity {
-        match poll_antigravity() {
-            Ok(antigravity) => data.antigravity = Some(antigravity),
-            Err(error) => {
-                if active_provider_count > 1 {
-                    diagnose::log(format!("Antigravity usage poll failed: {error:?}"));
-                }
-                first_error.get_or_insert(error);
-            }
+fn log_partial_failure(
+    provider_name: &str,
+    outcome: &ProviderPollOutcome,
+    active_provider_count: u8,
+) {
+    if active_provider_count > 1 {
+        if let ProviderPollOutcome::Error { error, .. } = outcome {
+            diagnose::log(format!("{provider_name} usage poll failed: {error:?}"));
         }
-    }
-
-    if data.claude_code.is_none() && data.codex.is_none() && data.antigravity.is_none() {
-        Err(first_error.unwrap_or(PollError::RequestFailed))
-    } else {
-        Ok(data)
     }
 }
 
@@ -1701,6 +1841,153 @@ mod tests {
             },
             weekly: UsageSection::default(),
         }
+    }
+
+    #[test]
+    fn partial_success_report_keeps_provider_error() {
+        let report = poll_report_with(
+            true,
+            true,
+            false,
+            || Err(PollError::AuthRequired),
+            || Ok(usage_with_session_percent(42.0)),
+            || unreachable!("antigravity is disabled"),
+        );
+
+        match report.claude_code {
+            ProviderPollOutcome::Error {
+                source,
+                attempted_at: _,
+                error,
+            } => {
+                assert_eq!(source, ProviderPollSource::AnthropicOauthUsage);
+                assert_eq!(error, PollError::AuthRequired);
+            }
+            _ => panic!("Claude Code error must remain in the report"),
+        }
+        assert!(matches!(
+            report.codex,
+            ProviderPollOutcome::Success {
+                source: ProviderPollSource::ChatgptWhamUsage,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn partial_success_report_converts_to_existing_ui_result() {
+        let data = poll_report_with(
+            true,
+            true,
+            false,
+            || Err(PollError::AuthRequired),
+            || Ok(usage_with_session_percent(42.0)),
+            || unreachable!("antigravity is disabled"),
+        )
+        .into_app_usage_data()
+        .expect("Codex data should keep the poll successful");
+
+        assert!(data.claude_code.is_none());
+        assert_eq!(data.codex.unwrap().session.percentage, 42.0);
+    }
+
+    #[test]
+    fn report_conversion_preserves_first_error_priority() {
+        let error = poll_report_with(
+            true,
+            true,
+            true,
+            || Err(PollError::AuthRequired),
+            || Err(PollError::RequestFailed),
+            || Err(PollError::NoCredentials),
+        )
+        .into_app_usage_data()
+        .expect_err("all-provider failure should return an error");
+
+        assert_eq!(error, PollError::AuthRequired);
+    }
+
+    #[test]
+    fn unrequested_providers_are_explicitly_disabled() {
+        let report = poll_report_with(
+            false,
+            false,
+            false,
+            || unreachable!("Claude Code is disabled"),
+            || unreachable!("Codex is disabled"),
+            || unreachable!("Antigravity is disabled"),
+        );
+
+        assert!(matches!(report.claude_code, ProviderPollOutcome::Disabled));
+        assert!(matches!(report.codex, ProviderPollOutcome::Disabled));
+        assert!(matches!(report.antigravity, ProviderPollOutcome::Disabled));
+    }
+
+    #[test]
+    fn success_outcome_keeps_usage_source_and_timestamps() {
+        let attempted_at = UNIX_EPOCH + Duration::from_secs(10);
+        let acquired_at = UNIX_EPOCH + Duration::from_secs(11);
+        let mut times = [attempted_at, acquired_at].into_iter();
+        let report = poll_report_with_clock(
+            true,
+            false,
+            false,
+            || Ok(usage_with_session_percent(42.0)),
+            || unreachable!("Codex is disabled"),
+            || unreachable!("Antigravity is disabled"),
+            || times.next().expect("fixed clock should have enough values"),
+        );
+
+        match report.claude_code {
+            ProviderPollOutcome::Success {
+                source,
+                attempted_at: actual_attempted_at,
+                acquired_at: actual_acquired_at,
+                usage,
+            } => {
+                assert_eq!(source, ProviderPollSource::AnthropicOauthUsage);
+                assert_eq!(actual_attempted_at, attempted_at);
+                assert_eq!(actual_acquired_at, acquired_at);
+                assert_eq!(usage.session.percentage, 42.0);
+            }
+            _ => panic!("Claude Code should have a successful outcome"),
+        }
+    }
+
+    #[test]
+    fn error_outcome_keeps_error_source_and_attempt_timestamp_without_usage() {
+        let attempted_at = UNIX_EPOCH + Duration::from_secs(10);
+        let mut times = [attempted_at].into_iter();
+        let report = poll_report_with_clock(
+            false,
+            true,
+            false,
+            || unreachable!("Claude Code is disabled"),
+            || Err(PollError::RequestFailed),
+            || unreachable!("Antigravity is disabled"),
+            || times.next().expect("fixed clock should have enough values"),
+        );
+
+        match report.codex {
+            ProviderPollOutcome::Error {
+                source,
+                attempted_at: actual_attempted_at,
+                error,
+            } => {
+                assert_eq!(source, ProviderPollSource::ChatgptWhamUsage);
+                assert_eq!(actual_attempted_at, attempted_at);
+                assert_eq!(error, PollError::RequestFailed);
+            }
+            _ => panic!("Codex should have an error outcome without usage"),
+        }
+    }
+
+    #[cfg(not(feature = "antigravity"))]
+    #[test]
+    fn antigravity_report_is_disabled_without_feature() {
+        let report = poll_report(false, false, true);
+
+        assert!(matches!(report.antigravity, ProviderPollOutcome::Disabled));
     }
 
     #[test]
