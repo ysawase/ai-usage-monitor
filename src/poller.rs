@@ -916,19 +916,27 @@ fn try_usage_endpoint(token: &str) -> Result<Option<UsageData>, PollError> {
         Ok(response) => response,
         Err(_) => return Ok(None),
     };
+    Ok(Some(claude_usage_from_response(response)))
+}
+
+fn claude_usage_from_response(response: UsageResponse) -> UsageData {
     let mut data = UsageData::default();
 
-    if let Some(bucket) = &response.five_hour {
-        data.session.percentage = bucket.utilization;
-        data.session.resets_at = parse_iso8601(bucket.resets_at.as_deref());
+    if let Some(bucket) = response.five_hour {
+        data.set_session(UsageSection {
+            percentage: bucket.utilization,
+            resets_at: parse_iso8601(bucket.resets_at.as_deref()),
+        });
     }
 
-    if let Some(bucket) = &response.seven_day {
-        data.weekly.percentage = bucket.utilization;
-        data.weekly.resets_at = parse_iso8601(bucket.resets_at.as_deref());
+    if let Some(bucket) = response.seven_day {
+        data.set_weekly(UsageSection {
+            percentage: bucket.utilization,
+            resets_at: parse_iso8601(bucket.resets_at.as_deref()),
+        });
     }
 
-    Ok(Some(data))
+    data
 }
 
 #[cfg(feature = "claude-messages-fallback")]
@@ -976,19 +984,35 @@ fn fetch_usage_via_messages(token: &str) -> Result<UsageData, PollError> {
 fn parse_rate_limit_headers(response: &ureq::Response) -> UsageData {
     let mut data = UsageData::default();
 
-    data.session.percentage =
-        get_header_f64(response, "anthropic-ratelimit-unified-5h-utilization") * 100.0;
-    data.session.resets_at = unix_to_system_time(get_header_i64(
+    let session_resets_at = unix_to_system_time(get_header_i64(
         response,
         "anthropic-ratelimit-unified-5h-reset",
     ));
+    if let Some(utilization) =
+        get_header_f64(response, "anthropic-ratelimit-unified-5h-utilization")
+    {
+        data.set_session(UsageSection {
+            percentage: utilization * 100.0,
+            resets_at: session_resets_at,
+        });
+    } else {
+        data.session.resets_at = session_resets_at;
+    }
 
-    data.weekly.percentage =
-        get_header_f64(response, "anthropic-ratelimit-unified-7d-utilization") * 100.0;
-    data.weekly.resets_at = unix_to_system_time(get_header_i64(
+    let weekly_resets_at = unix_to_system_time(get_header_i64(
         response,
         "anthropic-ratelimit-unified-7d-reset",
     ));
+    if let Some(utilization) =
+        get_header_f64(response, "anthropic-ratelimit-unified-7d-utilization")
+    {
+        data.set_weekly(UsageSection {
+            percentage: utilization * 100.0,
+            resets_at: weekly_resets_at,
+        });
+    } else {
+        data.weekly.resets_at = weekly_resets_at;
+    }
 
     let overall_reset = get_header_i64(response, "anthropic-ratelimit-unified-reset");
 
@@ -997,8 +1021,20 @@ fn parse_rate_limit_headers(response: &ureq::Response) -> UsageData {
         if status == Some("rejected") {
             let claim = response.header("anthropic-ratelimit-unified-representative-claim");
             match claim {
-                Some("five_hour") => data.session.percentage = 100.0,
-                Some("seven_day") => data.weekly.percentage = 100.0,
+                Some("five_hour") => {
+                    let resets_at = data.session.resets_at;
+                    data.set_session(UsageSection {
+                        percentage: 100.0,
+                        resets_at,
+                    });
+                }
+                Some("seven_day") => {
+                    let resets_at = data.weekly.resets_at;
+                    data.set_weekly(UsageSection {
+                        percentage: 100.0,
+                        resets_at,
+                    });
+                }
                 _ => {}
             }
         }
@@ -1052,11 +1088,11 @@ fn codex_usage_from_response(response: CodexUsageResponse) -> Option<UsageData> 
     let mut data = UsageData::default();
 
     if let Some(window) = details.primary_window.flatten() {
-        data.session = codex_section_from_window(&window);
+        data.set_session(codex_section_from_window(&window));
     }
 
     if let Some(window) = details.secondary_window.flatten() {
-        data.weekly = codex_section_from_window(&window);
+        data.set_weekly(codex_section_from_window(&window));
     }
 
     Some(data)
@@ -1121,9 +1157,10 @@ fn fetch_antigravity_usage_from_endpoint(
     }
 
     let session = fetch_antigravity_model_quota(base_url, token, project.as_deref())?;
-    let weekly = UsageSection::default();
+    let mut data = UsageData::default();
+    data.set_session(session);
 
-    Ok(UsageData { session, weekly })
+    Ok(data)
 }
 
 #[cfg(feature = "antigravity")]
@@ -1311,11 +1348,11 @@ fn antigravity_usage_from_summary_group(group: AntigravityQuotaSummaryGroup) -> 
 
         match bucket.window.as_deref() {
             Some(window) if window.eq_ignore_ascii_case("5h") => {
-                data.session = section;
+                data.set_session(section);
                 has_quota = true;
             }
             Some(window) if window.eq_ignore_ascii_case("weekly") => {
-                data.weekly = section;
+                data.set_weekly(section);
                 has_quota = true;
             }
             _ => {}
@@ -1372,11 +1409,8 @@ fn is_antigravity_display_model(model: &str) -> bool {
 }
 
 #[cfg(feature = "claude-messages-fallback")]
-fn get_header_f64(response: &ureq::Response, name: &str) -> f64 {
-    response
-        .header(name)
-        .and_then(|s| s.parse::<f64>().ok())
-        .unwrap_or(0.0)
+fn get_header_f64(response: &ureq::Response, name: &str) -> Option<f64> {
+    response.header(name).and_then(|s| s.parse::<f64>().ok())
 }
 
 #[cfg(feature = "claude-messages-fallback")]
@@ -1834,13 +1868,124 @@ mod tests {
     use super::*;
 
     fn usage_with_session_percent(percentage: f64) -> UsageData {
-        UsageData {
-            session: UsageSection {
-                percentage,
-                resets_at: None,
-            },
-            weekly: UsageSection::default(),
+        let mut usage = UsageData::default();
+        usage.set_session(UsageSection {
+            percentage,
+            resets_at: None,
+        });
+        usage
+    }
+
+    fn codex_response(
+        primary_window: Option<CodexRateLimitWindow>,
+        secondary_window: Option<CodexRateLimitWindow>,
+    ) -> CodexUsageResponse {
+        CodexUsageResponse {
+            rate_limit: Some(Some(Box::new(CodexRateLimitDetails {
+                primary_window: primary_window.map(|window| Some(Box::new(window))),
+                secondary_window: secondary_window.map(|window| Some(Box::new(window))),
+            }))),
         }
+    }
+
+    #[test]
+    fn claude_missing_windows_remain_unavailable() {
+        let usage = claude_usage_from_response(UsageResponse {
+            five_hour: None,
+            seven_day: None,
+        });
+
+        assert!(!usage.session_available());
+        assert!(!usage.weekly_available());
+        assert_eq!(usage.session.percentage, 0.0);
+        assert_eq!(usage.weekly.percentage, 0.0);
+    }
+
+    #[test]
+    fn claude_actual_zero_is_available() {
+        let usage = claude_usage_from_response(UsageResponse {
+            five_hour: Some(UsageBucket {
+                utilization: 0.0,
+                resets_at: None,
+            }),
+            seven_day: None,
+        });
+
+        assert!(usage.session_available());
+        assert_eq!(usage.session.percentage, 0.0);
+        assert!(!usage.weekly_available());
+    }
+
+    #[test]
+    fn claude_window_availability_is_independent() {
+        let usage = claude_usage_from_response(UsageResponse {
+            five_hour: None,
+            seven_day: Some(UsageBucket {
+                utilization: 42.0,
+                resets_at: None,
+            }),
+        });
+
+        assert!(!usage.session_available());
+        assert!(usage.weekly_available());
+        assert_eq!(usage.session.percentage, 0.0);
+        assert_eq!(usage.weekly.percentage, 42.0);
+    }
+
+    #[test]
+    fn codex_window_availability_is_independent() {
+        let primary_only = codex_usage_from_response(codex_response(
+            Some(CodexRateLimitWindow {
+                used_percent: 12.0,
+                reset_at: 10,
+            }),
+            None,
+        ))
+        .expect("rate limit details should produce usage");
+        let secondary_only = codex_usage_from_response(codex_response(
+            None,
+            Some(CodexRateLimitWindow {
+                used_percent: 34.0,
+                reset_at: 20,
+            }),
+        ))
+        .expect("rate limit details should produce usage");
+
+        assert!(primary_only.session_available());
+        assert!(!primary_only.weekly_available());
+        assert_eq!(primary_only.session.percentage, 12.0);
+        assert_eq!(primary_only.weekly.percentage, 0.0);
+        assert!(!secondary_only.session_available());
+        assert!(secondary_only.weekly_available());
+        assert_eq!(secondary_only.session.percentage, 0.0);
+        assert_eq!(secondary_only.weekly.percentage, 34.0);
+    }
+
+    #[test]
+    fn codex_actual_zero_is_available() {
+        let usage = codex_usage_from_response(codex_response(
+            Some(CodexRateLimitWindow {
+                used_percent: 0.0,
+                reset_at: 10,
+            }),
+            None,
+        ))
+        .expect("rate limit details should produce usage");
+
+        assert!(usage.session_available());
+        assert_eq!(usage.session.percentage, 0.0);
+        assert!(!usage.weekly_available());
+    }
+
+    #[test]
+    fn codex_missing_rate_limit_remains_request_failed() {
+        let result = codex_usage_from_response(CodexUsageResponse { rate_limit: None })
+            .ok_or(PollError::RequestFailed);
+
+        assert_eq!(
+            result.expect_err("missing rate limit should remain an error"),
+            PollError::RequestFailed
+        );
     }
 
     #[test]
@@ -1888,7 +2033,10 @@ mod tests {
         .expect("Codex data should keep the poll successful");
 
         assert!(data.claude_code.is_none());
-        assert_eq!(data.codex.unwrap().session.percentage, 42.0);
+        let codex = data.codex.unwrap();
+        assert_eq!(codex.session.percentage, 42.0);
+        assert!(codex.session_available());
+        assert!(!codex.weekly_available());
     }
 
     #[test]
@@ -1949,6 +2097,8 @@ mod tests {
                 assert_eq!(actual_attempted_at, attempted_at);
                 assert_eq!(actual_acquired_at, acquired_at);
                 assert_eq!(usage.session.percentage, 42.0);
+                assert!(usage.session_available());
+                assert!(!usage.weekly_available());
             }
             _ => panic!("Claude Code should have a successful outcome"),
         }
@@ -2119,6 +2269,8 @@ mod tests {
 
         assert!((usage.weekly.percentage - 0.695705).abs() < 0.000001);
         assert!((usage.session.percentage - 4.17425).abs() < 0.000001);
+        assert!(usage.weekly_available());
+        assert!(usage.session_available());
         assert!(usage.weekly.resets_at.is_some());
         assert!(usage.session.resets_at.is_some());
     }
