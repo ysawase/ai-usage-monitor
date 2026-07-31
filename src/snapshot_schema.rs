@@ -67,7 +67,8 @@ impl std::error::Error for SnapshotDeserializeError {}
 pub(crate) fn deserialize_validated_snapshot(
     json: &str,
 ) -> Result<SnapshotV1, SnapshotDeserializeError> {
-    let snapshot = serde_json::from_str(json).map_err(|_| SnapshotDeserializeError::InvalidJson)?;
+    let snapshot: SnapshotV1 =
+        serde_json::from_str(json).map_err(|_| SnapshotDeserializeError::InvalidJson)?;
     snapshot
         .validate()
         .map_err(SnapshotDeserializeError::Validation)?;
