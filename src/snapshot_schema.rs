@@ -1,4 +1,7 @@
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::{
+    fmt,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 
@@ -7,12 +10,68 @@ use crate::poller::{PollError, PollReport, ProviderPollOutcome, ProviderPollSour
 use crate::snapshot_store::MachineId;
 
 const SCHEMA_VERSION: u8 = 1;
+const MAX_PROVIDER_ERROR_MESSAGE_LEN: usize = 32;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SnapshotConversionError {
     TimestampBeforeUnixEpoch,
     TimestampMillisOverflow,
     UnsupportedProviderSource,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SnapshotValidationError {
+    InvalidMachineId,
+    InvalidProviderState,
+    InvalidProviderSource,
+    InvalidUsageWindow,
+    ErrorMessageTooLong,
+    InvalidErrorMessage,
+    InvalidErrorRetryability,
+}
+
+impl fmt::Display for SnapshotValidationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let message = match self {
+            Self::InvalidMachineId => "invalid snapshot machine ID",
+            Self::InvalidProviderState => "invalid snapshot provider state",
+            Self::InvalidProviderSource => "invalid snapshot provider source",
+            Self::InvalidUsageWindow => "invalid snapshot usage window",
+            Self::ErrorMessageTooLong => "snapshot error message is too long",
+            Self::InvalidErrorMessage => "invalid snapshot error message",
+            Self::InvalidErrorRetryability => "invalid snapshot error retryability",
+        };
+        formatter.write_str(message)
+    }
+}
+
+impl std::error::Error for SnapshotValidationError {}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SnapshotDeserializeError {
+    InvalidJson,
+    Validation(SnapshotValidationError),
+}
+
+impl fmt::Display for SnapshotDeserializeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidJson => formatter.write_str("invalid snapshot JSON"),
+            Self::Validation(error) => fmt::Display::fmt(error, formatter),
+        }
+    }
+}
+
+impl std::error::Error for SnapshotDeserializeError {}
+
+pub(crate) fn deserialize_validated_snapshot(
+    json: &str,
+) -> Result<SnapshotV1, SnapshotDeserializeError> {
+    let snapshot = serde_json::from_str(json).map_err(|_| SnapshotDeserializeError::InvalidJson)?;
+    snapshot
+        .validate()
+        .map_err(SnapshotDeserializeError::Validation)?;
+    Ok(snapshot)
 }
 
 pub(crate) fn snapshot_from_poll_report(
@@ -171,6 +230,12 @@ impl SnapshotV1 {
             providers,
         }
     }
+
+    pub(crate) fn validate(&self) -> Result<(), SnapshotValidationError> {
+        MachineId::parse(&self.machine_id)
+            .map_err(|_| SnapshotValidationError::InvalidMachineId)?;
+        self.providers.validate()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -223,6 +288,14 @@ impl Providers {
             codex,
             antigravity,
         }
+    }
+
+    fn validate(&self) -> Result<(), SnapshotValidationError> {
+        self.claude_code
+            .validate(Some(ProviderSource::AnthropicOauthUsage))?;
+        self.codex
+            .validate(Some(ProviderSource::ChatgptWhamUsage))?;
+        self.antigravity.validate(None)
     }
 }
 
@@ -306,6 +379,73 @@ impl ProviderSnapshot {
             error: None,
         }
     }
+
+    fn validate(
+        &self,
+        expected_source: Option<ProviderSource>,
+    ) -> Result<(), SnapshotValidationError> {
+        let valid_state = match self.status {
+            ProviderStatus::Success => {
+                self.requested
+                    && self.source.is_some()
+                    && self.attempted_at.is_some()
+                    && self.acquired_at.is_some()
+                    && self.last_success_at == self.acquired_at
+                    && !self.stale
+                    && self.usage.is_some()
+                    && self.error.is_none()
+            }
+            ProviderStatus::Error => {
+                self.requested
+                    && self.attempted_at.is_some()
+                    && self.acquired_at.is_none()
+                    && self.last_success_at.is_none()
+                    && !self.stale
+                    && self.usage.is_none()
+                    && self.error.is_some()
+            }
+            ProviderStatus::Stale => {
+                self.requested
+                    && self.attempted_at.is_some()
+                    && self.acquired_at.is_some()
+                    && self.last_success_at == self.acquired_at
+                    && self.stale
+                    && self.usage.is_some()
+                    && self.error.is_some()
+            }
+            ProviderStatus::Disabled => {
+                !self.requested
+                    && self.source.is_none()
+                    && self.attempted_at.is_none()
+                    && self.acquired_at.is_none()
+                    && self.last_success_at.is_none()
+                    && !self.stale
+                    && self.usage.is_none()
+                    && self.error.is_none()
+            }
+        };
+        if !valid_state {
+            return Err(SnapshotValidationError::InvalidProviderState);
+        }
+
+        match expected_source {
+            Some(expected) if self.source.is_some_and(|source| source != expected) => {
+                return Err(SnapshotValidationError::InvalidProviderSource);
+            }
+            None if self.status != ProviderStatus::Disabled => {
+                return Err(SnapshotValidationError::InvalidProviderSource);
+            }
+            _ => {}
+        }
+
+        if let Some(usage) = &self.usage {
+            usage.validate()?;
+        }
+        if let Some(error) = &self.error {
+            error.validate()?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -334,6 +474,16 @@ impl ProviderUsage {
     pub fn new(session: Option<UsageWindow>, weekly: Option<UsageWindow>) -> Self {
         Self { session, weekly }
     }
+
+    fn validate(&self) -> Result<(), SnapshotValidationError> {
+        if let Some(window) = &self.session {
+            window.validate()?;
+        }
+        if let Some(window) = &self.weekly {
+            window.validate()?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -347,6 +497,13 @@ impl UsageWindow {
         Self {
             used_percent,
             resets_at,
+        }
+    }
+
+    fn validate(&self) -> Result<(), SnapshotValidationError> {
+        match self.used_percent {
+            Some(value) if value.is_finite() && value >= 0.0 => Ok(()),
+            _ => Err(SnapshotValidationError::InvalidUsageWindow),
         }
     }
 }
@@ -372,6 +529,21 @@ impl ProviderError {
             message: message.to_string(),
             retryable,
         }
+    }
+
+    fn validate(&self) -> Result<(), SnapshotValidationError> {
+        if self.message.len() > MAX_PROVIDER_ERROR_MESSAGE_LEN {
+            return Err(SnapshotValidationError::ErrorMessageTooLong);
+        }
+
+        let expected = Self::from_code(self.code);
+        if self.message != expected.message {
+            return Err(SnapshotValidationError::InvalidErrorMessage);
+        }
+        if self.retryable != expected.retryable {
+            return Err(SnapshotValidationError::InvalidErrorRetryability);
+        }
+        Ok(())
     }
 }
 
@@ -468,6 +640,11 @@ mod tests {
             snapshot_from_poll_report(&machine_id(), report, at_millis(1_725_000_000_200))
                 .expect("report should convert");
         serde_json::to_value(snapshot).expect("snapshot should serialize")
+    }
+
+    fn validated_from_value(value: Value) -> Result<SnapshotV1, SnapshotDeserializeError> {
+        let json = serde_json::to_string(&value).expect("snapshot value should serialize");
+        deserialize_validated_snapshot(&json)
     }
 
     #[test]
@@ -617,7 +794,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_round_trips_through_json() {
+    fn snapshot_round_trips_through_validated_json() {
         let snapshot = snapshot_with(ProviderSnapshot::success(
             ProviderSource::AnthropicOauthUsage,
             1_725_000_000_000,
@@ -625,9 +802,344 @@ mod tests {
             usage(),
         ));
         let json = serde_json::to_string(&snapshot).expect("snapshot should serialize");
-        let decoded: SnapshotV1 = serde_json::from_str(&json).expect("snapshot should deserialize");
+        let decoded =
+            deserialize_validated_snapshot(&json).expect("snapshot should validate after decoding");
 
         assert_eq!(decoded, snapshot);
+    }
+
+    #[test]
+    fn poll_report_snapshot_passes_validation() {
+        let report = poll_report(
+            success_outcome(
+                ProviderPollSource::AnthropicOauthUsage,
+                poll_usage(Some((0.0, None)), Some((42.0, None))),
+            ),
+            error_outcome(
+                ProviderPollSource::ChatgptWhamUsage,
+                PollError::RequestFailed,
+            ),
+        );
+        let snapshot =
+            snapshot_from_poll_report(&machine_id(), &report, at_millis(1_725_000_000_200))
+                .expect("report should convert");
+
+        assert_eq!(snapshot.validate(), Ok(()));
+    }
+
+    #[test]
+    fn validated_deserialize_rejects_unsupported_schema_version() {
+        let mut value = serde_json::to_value(snapshot_with(ProviderSnapshot::disabled())).unwrap();
+        value["schema_version"] = json!(2);
+
+        assert_eq!(
+            validated_from_value(value),
+            Err(SnapshotDeserializeError::InvalidJson)
+        );
+    }
+
+    #[test]
+    fn validation_rejects_invalid_machine_id() {
+        let mut value = serde_json::to_value(snapshot_with(ProviderSnapshot::disabled())).unwrap();
+        value["machine_id"] = json!("Home/other");
+
+        assert_eq!(
+            validated_from_value(value),
+            Err(SnapshotDeserializeError::Validation(
+                SnapshotValidationError::InvalidMachineId
+            ))
+        );
+    }
+
+    #[test]
+    fn validation_rejects_status_and_error_contradiction() {
+        let mut value = serde_json::to_value(snapshot_with(ProviderSnapshot::success(
+            ProviderSource::AnthropicOauthUsage,
+            1_725_000_000_000,
+            1_725_000_000_100,
+            usage(),
+        )))
+        .unwrap();
+        value["providers"]["claude_code"]["error"] = json!({
+            "code": "request_failed",
+            "message": "Provider request failed",
+            "retryable": true
+        });
+
+        assert_eq!(
+            validated_from_value(value),
+            Err(SnapshotDeserializeError::Validation(
+                SnapshotValidationError::InvalidProviderState
+            ))
+        );
+    }
+
+    #[test]
+    fn validation_rejects_provider_source_mismatch() {
+        let mut value = serde_json::to_value(snapshot_with(ProviderSnapshot::success(
+            ProviderSource::AnthropicOauthUsage,
+            1_725_000_000_000,
+            1_725_000_000_100,
+            usage(),
+        )))
+        .unwrap();
+        value["providers"]["claude_code"]["source"] = json!("chatgpt_wham_usage");
+
+        assert_eq!(
+            validated_from_value(value),
+            Err(SnapshotDeserializeError::Validation(
+                SnapshotValidationError::InvalidProviderSource
+            ))
+        );
+    }
+
+    #[test]
+    fn validation_rejects_available_window_without_value() {
+        let mut value = serde_json::to_value(snapshot_with(ProviderSnapshot::success(
+            ProviderSource::AnthropicOauthUsage,
+            1_725_000_000_000,
+            1_725_000_000_100,
+            usage(),
+        )))
+        .unwrap();
+        value["providers"]["claude_code"]["usage"]["session"]["used_percent"] = Value::Null;
+
+        assert_eq!(
+            validated_from_value(value),
+            Err(SnapshotDeserializeError::Validation(
+                SnapshotValidationError::InvalidUsageWindow
+            ))
+        );
+    }
+
+    #[test]
+    fn validation_rejects_non_finite_window_value() {
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let snapshot = snapshot_with(ProviderSnapshot::success(
+                ProviderSource::AnthropicOauthUsage,
+                1_725_000_000_000,
+                1_725_000_000_100,
+                ProviderUsage::new(Some(UsageWindow::new(Some(value), None)), None),
+            ));
+
+            assert_eq!(
+                snapshot.validate(),
+                Err(SnapshotValidationError::InvalidUsageWindow)
+            );
+        }
+    }
+
+    #[test]
+    fn validation_rejects_negative_finite_window_value() {
+        let mut value = serde_json::to_value(snapshot_with(ProviderSnapshot::success(
+            ProviderSource::AnthropicOauthUsage,
+            1_725_000_000_000,
+            1_725_000_000_100,
+            usage(),
+        )))
+        .unwrap();
+        value["providers"]["claude_code"]["usage"]["session"]["used_percent"] = json!(-0.5);
+
+        assert_eq!(
+            validated_from_value(value),
+            Err(SnapshotDeserializeError::Validation(
+                SnapshotValidationError::InvalidUsageWindow
+            ))
+        );
+    }
+
+    #[test]
+    fn validated_deserialize_accepts_one_hundred_and_preserves_value_above_it() {
+        for expected in [100.0, 125.5] {
+            let report = poll_report(
+                success_outcome(
+                    ProviderPollSource::AnthropicOauthUsage,
+                    poll_usage(Some((expected, None)), None),
+                ),
+                ProviderPollOutcome::Disabled,
+            );
+            let value = converted_value(&report);
+            let decoded = validated_from_value(value)
+                .expect("finite value at or above 100 must remain valid");
+            let decoded = serde_json::to_value(decoded).unwrap();
+
+            assert_eq!(
+                decoded["providers"]["claude_code"]["usage"]["session"]["used_percent"],
+                json!(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn validated_deserialize_accepts_actual_zero_percent() {
+        let report = poll_report(
+            success_outcome(
+                ProviderPollSource::AnthropicOauthUsage,
+                poll_usage(Some((0.0, None)), None),
+            ),
+            ProviderPollOutcome::Disabled,
+        );
+        let value = converted_value(&report);
+        let decoded = validated_from_value(value).expect("actual zero must remain valid");
+        let decoded = serde_json::to_value(decoded).unwrap();
+
+        assert_eq!(
+            decoded["providers"]["claude_code"]["usage"]["session"]["used_percent"],
+            json!(0.0)
+        );
+    }
+
+    #[test]
+    fn validated_deserialize_keeps_missing_window_null() {
+        let report = poll_report(
+            success_outcome(
+                ProviderPollSource::AnthropicOauthUsage,
+                poll_usage(None, Some((42.0, None))),
+            ),
+            ProviderPollOutcome::Disabled,
+        );
+        let value = converted_value(&report);
+        let decoded = validated_from_value(value).expect("missing window must remain valid");
+        let decoded = serde_json::to_value(decoded).unwrap();
+
+        assert_eq!(
+            decoded["providers"]["claude_code"]["usage"]["session"],
+            Value::Null
+        );
+    }
+
+    #[test]
+    fn validation_accepts_disabled_without_error() {
+        let snapshot = snapshot_with(ProviderSnapshot::disabled());
+
+        assert_eq!(snapshot.validate(), Ok(()));
+    }
+
+    #[test]
+    fn validation_accepts_error_without_source() {
+        let snapshot = snapshot_with(ProviderSnapshot::error(
+            None,
+            1_725_000_000_000,
+            ProviderError::from_code(ProviderErrorCode::RequestFailed),
+        ));
+
+        assert_eq!(snapshot.validate(), Ok(()));
+    }
+
+    #[test]
+    fn validation_accepts_existing_stale_contract() {
+        let snapshot = snapshot_with(ProviderSnapshot::stale(
+            None,
+            1_725_000_000_000,
+            1_724_999_000_000,
+            usage(),
+            ProviderError::from_code(ProviderErrorCode::RequestFailed),
+        ));
+
+        assert_eq!(snapshot.validate(), Ok(()));
+    }
+
+    #[test]
+    fn validation_rejects_non_disabled_antigravity() {
+        let snapshot = SnapshotV1::new(
+            "home".to_string(),
+            1_725_000_000_200,
+            1_725_000_000_000,
+            1_725_000_000_100,
+            Providers::new(
+                ProviderSnapshot::disabled(),
+                ProviderSnapshot::disabled(),
+                ProviderSnapshot::error(
+                    None,
+                    1_725_000_000_000,
+                    ProviderError::from_code(ProviderErrorCode::RequestFailed),
+                ),
+            ),
+        );
+
+        assert_eq!(
+            snapshot.validate(),
+            Err(SnapshotValidationError::InvalidProviderSource)
+        );
+    }
+
+    #[test]
+    fn validation_rejects_overlong_error_message() {
+        let mut value = serde_json::to_value(snapshot_with(ProviderSnapshot::error(
+            Some(ProviderSource::AnthropicOauthUsage),
+            1_725_000_000_000,
+            ProviderError::from_code(ProviderErrorCode::RequestFailed),
+        )))
+        .unwrap();
+        value["providers"]["claude_code"]["error"]["message"] =
+            json!("x".repeat(MAX_PROVIDER_ERROR_MESSAGE_LEN + 1));
+
+        assert_eq!(
+            validated_from_value(value),
+            Err(SnapshotDeserializeError::Validation(
+                SnapshotValidationError::ErrorMessageTooLong
+            ))
+        );
+    }
+
+    #[test]
+    fn validation_rejects_noncanonical_error_message_and_retryability() {
+        let base = serde_json::to_value(snapshot_with(ProviderSnapshot::error(
+            Some(ProviderSource::AnthropicOauthUsage),
+            1_725_000_000_000,
+            ProviderError::from_code(ProviderErrorCode::RequestFailed),
+        )))
+        .unwrap();
+        let mut message_changed = base.clone();
+        message_changed["providers"]["claude_code"]["error"]["message"] = json!("Request failed");
+        let mut retryability_changed = base;
+        retryability_changed["providers"]["claude_code"]["error"]["retryable"] = json!(false);
+
+        assert_eq!(
+            validated_from_value(message_changed),
+            Err(SnapshotDeserializeError::Validation(
+                SnapshotValidationError::InvalidErrorMessage
+            ))
+        );
+        assert_eq!(
+            validated_from_value(retryability_changed),
+            Err(SnapshotDeserializeError::Validation(
+                SnapshotValidationError::InvalidErrorRetryability
+            ))
+        );
+    }
+
+    #[test]
+    fn validated_deserialize_errors_do_not_echo_input_values() {
+        const SECRET_SENTINEL: &str = "TEST_SECRET_CREDENTIAL_7f3a";
+        const RAW_SOURCE_SENTINEL: &str = "TEST_RAW_SOURCE_RESPONSE_9b21";
+
+        let mut secret_value = serde_json::to_value(snapshot_with(ProviderSnapshot::error(
+            Some(ProviderSource::AnthropicOauthUsage),
+            1_725_000_000_000,
+            ProviderError::from_code(ProviderErrorCode::RequestFailed),
+        )))
+        .unwrap();
+        secret_value["providers"]["claude_code"]["error"]["message"] = json!(SECRET_SENTINEL);
+        let secret_error = validated_from_value(secret_value).unwrap_err();
+
+        let mut source_value = serde_json::to_value(snapshot_with(ProviderSnapshot::success(
+            ProviderSource::AnthropicOauthUsage,
+            1_725_000_000_000,
+            1_725_000_000_100,
+            usage(),
+        )))
+        .unwrap();
+        source_value["providers"]["claude_code"]["source"] = json!(RAW_SOURCE_SENTINEL);
+        let source_error = validated_from_value(source_value).unwrap_err();
+
+        for (error, sentinel) in [
+            (secret_error, SECRET_SENTINEL),
+            (source_error, RAW_SOURCE_SENTINEL),
+        ] {
+            let rendered = format!("{error:?}: {error}");
+            assert!(!rendered.contains(sentinel));
+        }
     }
 
     #[test]
@@ -1012,7 +1524,7 @@ mod tests {
                     .as_str()
                     .expect("fixed error message must be a string")
                     .len()
-                    <= 32,
+                    <= MAX_PROVIDER_ERROR_MESSAGE_LEN,
                 "{case_id}: fixed error message is unexpectedly long"
             );
 
