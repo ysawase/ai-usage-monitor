@@ -1,7 +1,7 @@
 use std::{
     fmt, fs,
     fs::{File, OpenOptions},
-    io::Write,
+    io::{Read, Seek, SeekFrom, Write},
     os::windows::ffi::OsStrExt,
     path::{Path, PathBuf},
     str,
@@ -375,6 +375,99 @@ impl SnapshotPaths {
     pub(crate) fn history(&self) -> &Path {
         &self.history
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HistoryAppendError {
+    InvalidSnapshot,
+    SerializeFailed,
+    InvalidPath,
+    DirectoryCreateFailed,
+    HistoryOpenFailed,
+    HistoryTailCheckFailed,
+    HistoryTailInvalid,
+    HistoryAppendFailed,
+    HistorySyncFailed,
+}
+
+impl fmt::Display for HistoryAppendError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let message = match self {
+            Self::InvalidSnapshot => "invalid snapshot",
+            Self::SerializeFailed => "unable to serialize snapshot",
+            Self::InvalidPath => "invalid snapshot history path",
+            Self::DirectoryCreateFailed => "unable to create snapshot directory",
+            Self::HistoryOpenFailed => "unable to open snapshot history",
+            Self::HistoryTailCheckFailed => "unable to inspect snapshot history",
+            Self::HistoryTailInvalid => "snapshot history ends unexpectedly",
+            Self::HistoryAppendFailed => "unable to append snapshot history entry",
+            Self::HistorySyncFailed => "unable to sync snapshot history entry",
+        };
+        formatter.write_str(message)
+    }
+}
+
+impl std::error::Error for HistoryAppendError {}
+
+pub(crate) fn append_snapshot_to_history(
+    paths: &SnapshotPaths,
+    snapshot: &SnapshotV1,
+) -> Result<(), HistoryAppendError> {
+    snapshot
+        .validate()
+        .map_err(|_| HistoryAppendError::InvalidSnapshot)?;
+
+    let history = paths.history();
+    if history.as_os_str().encode_wide().any(|unit| unit == 0) {
+        return Err(HistoryAppendError::InvalidPath);
+    }
+
+    let mut line = serde_json::to_vec(snapshot).map_err(|_| HistoryAppendError::SerializeFailed)?;
+    line.push(b'\n');
+
+    let directory = history.parent().ok_or(HistoryAppendError::InvalidPath)?;
+    fs::create_dir_all(directory).map_err(|_| HistoryAppendError::DirectoryCreateFailed)?;
+
+    let mut file = OpenOptions::new()
+        .read(true)
+        .append(true)
+        .create(true)
+        .open(history)
+        .map_err(|_| HistoryAppendError::HistoryOpenFailed)?;
+
+    ensure_valid_history_tail(&mut file)?;
+
+    file.write_all(&line)
+        .map_err(|_| HistoryAppendError::HistoryAppendFailed)?;
+    file.flush()
+        .map_err(|_| HistoryAppendError::HistoryAppendFailed)?;
+    file.sync_all()
+        .map_err(|_| HistoryAppendError::HistorySyncFailed)
+}
+
+fn ensure_valid_history_tail(file: &mut File) -> Result<(), HistoryAppendError> {
+    let length = file
+        .metadata()
+        .map_err(|_| HistoryAppendError::HistoryTailCheckFailed)?
+        .len();
+    if length == 0 {
+        return Ok(());
+    }
+
+    let tail_len = length.min(2) as usize;
+    file.seek(SeekFrom::End(-(tail_len as i64)))
+        .map_err(|_| HistoryAppendError::HistoryTailCheckFailed)?;
+    let mut tail = [0u8; 2];
+    file.read_exact(&mut tail[..tail_len])
+        .map_err(|_| HistoryAppendError::HistoryTailCheckFailed)?;
+
+    if tail[tail_len - 1] != b'\n' {
+        return Err(HistoryAppendError::HistoryTailInvalid);
+    }
+    if tail_len == 2 && tail[0] == b'\r' {
+        return Err(HistoryAppendError::HistoryTailInvalid);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1114,5 +1207,244 @@ mod tests {
         assert!(paths.machine_id_file().starts_with(&root));
         assert!(paths.current_snapshot().starts_with(&root));
         assert!(paths.history().starts_with(&root));
+    }
+
+    fn history_entries(bytes: &[u8]) -> Vec<&str> {
+        assert!(
+            bytes.ends_with(b"\n"),
+            "history must end with exactly one LF"
+        );
+        assert!(!bytes.ends_with(b"\r\n"), "history must not end with CRLF");
+        let without_trailing_lf = &bytes[..bytes.len() - 1];
+        let text = str::from_utf8(without_trailing_lf).expect("history should be UTF-8");
+        let lines: Vec<&str> = text.split('\n').collect();
+        assert!(
+            lines.iter().all(|line| !line.is_empty()),
+            "history must not contain blank lines"
+        );
+        lines
+    }
+
+    #[test]
+    fn appends_first_line_to_missing_history_file() {
+        let root = TestRoot::uncreated("history-missing");
+        let paths = root.snapshot_paths();
+        let expected = snapshot("home", 1_725_000_000_200);
+
+        append_snapshot_to_history(&paths, &expected)
+            .expect("first history entry should be written");
+
+        let bytes = fs::read(paths.history()).expect("history file should be read");
+        let lines = history_entries(&bytes);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(
+            deserialize_validated_snapshot(lines[0]).expect("history line should validate"),
+            expected
+        );
+    }
+
+    #[test]
+    fn appends_first_line_to_zero_byte_history_file() {
+        let root = TestRoot::uncreated("history-zero-byte");
+        let paths = root.snapshot_paths();
+        create_snapshot_directory(&paths);
+        fs::write(paths.history(), b"").expect("zero byte history should be created");
+        let expected = snapshot("home", 1_725_000_000_200);
+
+        append_snapshot_to_history(&paths, &expected).expect("history entry should be appended");
+
+        let bytes = fs::read(paths.history()).expect("history file should be read");
+        let lines = history_entries(&bytes);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(
+            deserialize_validated_snapshot(lines[0]).expect("history line should validate"),
+            expected
+        );
+    }
+
+    #[test]
+    fn appends_second_line_after_existing_entry_and_preserves_order_and_bytes() {
+        let root = TestRoot::uncreated("history-second-line");
+        let paths = root.snapshot_paths();
+        let first = snapshot("home", 1_725_000_000_100);
+        let second = snapshot("home", 1_725_000_000_200);
+        append_snapshot_to_history(&paths, &first).expect("first history entry should be written");
+        let after_first = fs::read(paths.history()).unwrap();
+
+        append_snapshot_to_history(&paths, &second)
+            .expect("second history entry should be appended");
+
+        let bytes = fs::read(paths.history()).expect("history file should be read");
+        assert!(bytes.starts_with(&after_first));
+        let lines = history_entries(&bytes);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(deserialize_validated_snapshot(lines[0]).unwrap(), first);
+        assert_eq!(deserialize_validated_snapshot(lines[1]).unwrap(), second);
+    }
+
+    #[test]
+    fn invalid_snapshot_is_rejected_without_creating_directory_or_history() {
+        let root = TestRoot::uncreated("history-invalid-snapshot");
+        let paths = root.snapshot_paths();
+        let invalid = snapshot("TEST_SECRET_INVALID_MACHINE_ID", 1_725_000_000_200);
+
+        assert_eq!(
+            append_snapshot_to_history(&paths, &invalid),
+            Err(HistoryAppendError::InvalidSnapshot)
+        );
+        assert!(!root.path.exists());
+        assert!(!paths.history().exists());
+    }
+
+    #[test]
+    fn invalid_snapshot_does_not_modify_existing_history() {
+        let root = TestRoot::uncreated("history-invalid-preserves");
+        let paths = root.snapshot_paths();
+        let valid = snapshot("home", 1_725_000_000_100);
+        append_snapshot_to_history(&paths, &valid).expect("valid history entry should be written");
+        let before = fs::read(paths.history()).unwrap();
+        let invalid = snapshot("TEST_SECRET_INVALID_MACHINE_ID", 1_725_000_000_200);
+
+        assert_eq!(
+            append_snapshot_to_history(&paths, &invalid),
+            Err(HistoryAppendError::InvalidSnapshot)
+        );
+        assert_eq!(fs::read(paths.history()).unwrap(), before);
+    }
+
+    #[test]
+    fn nonempty_history_without_trailing_lf_is_rejected_and_left_unchanged() {
+        let root = TestRoot::uncreated("history-missing-lf");
+        let paths = root.snapshot_paths();
+        create_snapshot_directory(&paths);
+        let existing = b"TEST_SECRET_HISTORY_TAIL_7f3a-no-newline".to_vec();
+        fs::write(paths.history(), &existing).unwrap();
+
+        assert_eq!(
+            append_snapshot_to_history(&paths, &snapshot("home", 1_725_000_000_200)),
+            Err(HistoryAppendError::HistoryTailInvalid)
+        );
+        assert_eq!(fs::read(paths.history()).unwrap(), existing);
+    }
+
+    #[test]
+    fn history_ending_in_crlf_is_rejected_as_noncanonical_and_left_unchanged() {
+        let root = TestRoot::uncreated("history-crlf-tail");
+        let paths = root.snapshot_paths();
+        create_snapshot_directory(&paths);
+        let existing = b"{\"line\":\"one\"}\r\n".to_vec();
+        fs::write(paths.history(), &existing).unwrap();
+
+        assert_eq!(
+            append_snapshot_to_history(&paths, &snapshot("home", 1_725_000_000_200)),
+            Err(HistoryAppendError::HistoryTailInvalid)
+        );
+        assert_eq!(fs::read(paths.history()).unwrap(), existing);
+    }
+
+    #[test]
+    fn history_ending_in_bare_cr_is_rejected_and_left_unchanged() {
+        let root = TestRoot::uncreated("history-cr-tail");
+        let paths = root.snapshot_paths();
+        create_snapshot_directory(&paths);
+        let existing = b"{\"line\":\"one\"}\r".to_vec();
+        fs::write(paths.history(), &existing).unwrap();
+
+        assert_eq!(
+            append_snapshot_to_history(&paths, &snapshot("home", 1_725_000_000_200)),
+            Err(HistoryAppendError::HistoryTailInvalid)
+        );
+        assert_eq!(fs::read(paths.history()).unwrap(), existing);
+    }
+
+    #[test]
+    fn append_does_not_modify_current_snapshot_backup_machine_id_or_unrelated_files() {
+        let root = TestRoot::uncreated("history-non-destructive");
+        let paths = root.snapshot_paths();
+        create_snapshot_directory(&paths);
+        fs::write(paths.current_snapshot(), b"current-untouched").unwrap();
+        fs::write(paths.current_snapshot_backup(), b"backup-untouched").unwrap();
+        root.write_machine_id(b"home");
+        let unrelated = paths
+            .current_snapshot()
+            .parent()
+            .unwrap()
+            .join("unrelated.txt");
+        fs::write(&unrelated, b"unrelated-untouched").unwrap();
+
+        append_snapshot_to_history(&paths, &snapshot("home", 1_725_000_000_200))
+            .expect("history entry should be appended");
+
+        assert_eq!(
+            fs::read(paths.current_snapshot()).unwrap(),
+            b"current-untouched"
+        );
+        assert_eq!(
+            fs::read(paths.current_snapshot_backup()).unwrap(),
+            b"backup-untouched"
+        );
+        assert_eq!(fs::read(root.machine_id_file()).unwrap(), b"home");
+        assert_eq!(fs::read(&unrelated).unwrap(), b"unrelated-untouched");
+    }
+
+    #[test]
+    fn open_failure_does_not_expose_path_or_os_error() {
+        const PATH_SENTINEL: &str = "TEST_HISTORY_OPEN_PATH_9b21";
+        let root = TestRoot::uncreated(PATH_SENTINEL);
+        let paths = root.snapshot_paths();
+        create_snapshot_directory(&paths);
+        fs::create_dir(paths.history()).expect("history path should be a directory");
+
+        let error =
+            append_snapshot_to_history(&paths, &snapshot("home", 1_725_000_000_200)).unwrap_err();
+
+        assert_eq!(error, HistoryAppendError::HistoryOpenFailed);
+        let rendered = format!("{error:?}: {error}");
+        assert_eq!(
+            rendered,
+            "HistoryOpenFailed: unable to open snapshot history"
+        );
+        assert!(!rendered.contains(PATH_SENTINEL));
+        assert!(!rendered.contains(root.path.to_string_lossy().as_ref()));
+        assert!(std::error::Error::source(&error).is_none());
+    }
+
+    #[test]
+    fn tail_invalid_error_does_not_expose_existing_history_content() {
+        const CONTENT_SENTINEL: &str = "TEST_SECRET_HISTORY_CONTENT_a14c";
+        let root = TestRoot::uncreated("history-tail-secret");
+        let paths = root.snapshot_paths();
+        create_snapshot_directory(&paths);
+        let existing = format!("{CONTENT_SENTINEL}-no-newline").into_bytes();
+        fs::write(paths.history(), &existing).unwrap();
+
+        let error =
+            append_snapshot_to_history(&paths, &snapshot("home", 1_725_000_000_200)).unwrap_err();
+
+        assert_eq!(error, HistoryAppendError::HistoryTailInvalid);
+        let rendered = format!("{error:?}: {error}");
+        assert_eq!(
+            rendered,
+            "HistoryTailInvalid: snapshot history ends unexpectedly"
+        );
+        assert!(!rendered.contains(CONTENT_SENTINEL));
+        assert!(std::error::Error::source(&error).is_none());
+        assert_eq!(fs::read(paths.history()).unwrap(), existing);
+    }
+
+    #[test]
+    fn invalid_snapshot_error_does_not_expose_machine_id_secret() {
+        const SECRET_SENTINEL: &str = "TEST_SECRET_MACHINE_ID_d4e2";
+        let root = TestRoot::uncreated("history-invalid-secret");
+        let paths = root.snapshot_paths();
+        let invalid = snapshot(SECRET_SENTINEL, 1_725_000_000_200);
+
+        let error = append_snapshot_to_history(&paths, &invalid).unwrap_err();
+
+        assert_eq!(error, HistoryAppendError::InvalidSnapshot);
+        let rendered = format!("{error:?}: {error}");
+        assert_eq!(rendered, "InvalidSnapshot: invalid snapshot");
+        assert!(!rendered.contains(SECRET_SENTINEL));
+        assert!(std::error::Error::source(&error).is_none());
     }
 }
