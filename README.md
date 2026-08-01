@@ -146,6 +146,22 @@ What the app stores locally:
 - Language preference
 - Last update check time
 - Displayed model preferences
+- A local, app-specific machine ID (a random identifier generated on this PC, not a hardware or OS ID)
+- Usage snapshots for Claude Code and Codex. Antigravity snapshot storage is not supported yet.
+
+Usage snapshots and the machine ID are stored under:
+
+```text
+%LOCALAPPDATA%\ClaudeCodeUsageMonitor
+```
+
+- `machine_id.txt` — the app-specific machine ID
+- `usage\<machine-id>\current.json` — the latest successfully saved snapshot
+- `usage\<machine-id>\history.jsonl` — an append-only history of successfully saved snapshot entries, with no automatic size limit, rotation, or cleanup
+
+When a snapshot is created successfully, the app attempts to update `current.json` and append to `history.jsonl` independently.
+
+Each snapshot records session and weekly usage percentages, reset times, and provider statuses such as `success`, `error`, `stale`, or `disabled`. It does not include credentials, tokens, or raw provider responses.
 
 What it does **not** do:
 
@@ -154,6 +170,7 @@ What it does **not** do:
 - It does not collect analytics or telemetry
 - It does not upload your project files
 - It does not directly edit your Codex credentials file
+- It does not upload usage snapshots or the machine ID to any server
 
 Notes:
 
