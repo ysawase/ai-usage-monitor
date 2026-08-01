@@ -470,6 +470,33 @@ fn ensure_valid_history_tail(file: &mut File) -> Result<(), HistoryAppendError> 
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PersistResult {
+    Saved,
+    Failed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SnapshotPersistOutcome {
+    pub(crate) current: PersistResult,
+    pub(crate) history: PersistResult,
+}
+
+pub(crate) fn persist_snapshot(
+    paths: &SnapshotPaths,
+    snapshot: &SnapshotV1,
+) -> SnapshotPersistOutcome {
+    let current = match write_current_snapshot(paths, snapshot) {
+        Ok(()) => PersistResult::Saved,
+        Err(_) => PersistResult::Failed,
+    };
+    let history = match append_snapshot_to_history(paths, snapshot) {
+        Ok(()) => PersistResult::Saved,
+        Err(_) => PersistResult::Failed,
+    };
+    SnapshotPersistOutcome { current, history }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1446,5 +1473,162 @@ mod tests {
         assert_eq!(rendered, "InvalidSnapshot: invalid snapshot");
         assert!(!rendered.contains(SECRET_SENTINEL));
         assert!(std::error::Error::source(&error).is_none());
+    }
+
+    #[test]
+    fn persist_snapshot_reports_success_for_both_current_and_history() {
+        let root = TestRoot::uncreated("persist-both-success");
+        let paths = root.snapshot_paths();
+        let expected = snapshot("home", 1_725_000_000_200);
+
+        let outcome = persist_snapshot(&paths, &expected);
+
+        assert_eq!(
+            outcome,
+            SnapshotPersistOutcome {
+                current: PersistResult::Saved,
+                history: PersistResult::Saved,
+            }
+        );
+        let current_json = fs::read_to_string(paths.current_snapshot()).unwrap();
+        assert_eq!(
+            deserialize_validated_snapshot(&current_json).unwrap(),
+            expected
+        );
+        let history_bytes = fs::read(paths.history()).unwrap();
+        let lines = history_entries(&history_bytes);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(deserialize_validated_snapshot(lines[0]).unwrap(), expected);
+    }
+
+    #[test]
+    fn persist_snapshot_attempts_history_even_when_current_fails() {
+        let root = TestRoot::uncreated("persist-current-fails");
+        let paths = root.snapshot_paths();
+        create_snapshot_directory(&paths);
+        fs::write(paths.current_snapshot_backup(), b"stale-backup").unwrap();
+        let expected = snapshot("home", 1_725_000_000_200);
+
+        let outcome = persist_snapshot(&paths, &expected);
+
+        assert_eq!(
+            outcome,
+            SnapshotPersistOutcome {
+                current: PersistResult::Failed,
+                history: PersistResult::Saved,
+            }
+        );
+        assert!(!paths.current_snapshot().exists());
+        assert_eq!(
+            fs::read(paths.current_snapshot_backup()).unwrap(),
+            b"stale-backup"
+        );
+        let history_bytes = fs::read(paths.history()).unwrap();
+        let lines = history_entries(&history_bytes);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(deserialize_validated_snapshot(lines[0]).unwrap(), expected);
+    }
+
+    #[test]
+    fn persist_snapshot_preserves_current_success_when_history_fails() {
+        let root = TestRoot::uncreated("persist-history-fails");
+        let paths = root.snapshot_paths();
+        create_snapshot_directory(&paths);
+        let malformed_history = b"TEST_SECRET_PERSIST_HISTORY_TAIL_9b21-no-newline".to_vec();
+        fs::write(paths.history(), &malformed_history).unwrap();
+        let expected = snapshot("home", 1_725_000_000_200);
+
+        let outcome = persist_snapshot(&paths, &expected);
+
+        assert_eq!(
+            outcome,
+            SnapshotPersistOutcome {
+                current: PersistResult::Saved,
+                history: PersistResult::Failed,
+            }
+        );
+        let current_json = fs::read_to_string(paths.current_snapshot()).unwrap();
+        assert_eq!(
+            deserialize_validated_snapshot(&current_json).unwrap(),
+            expected
+        );
+        assert_eq!(fs::read(paths.history()).unwrap(), malformed_history);
+    }
+
+    #[test]
+    fn persist_snapshot_reports_failure_for_both_without_panicking() {
+        let root = TestRoot::uncreated("persist-both-fail");
+        let paths = root.snapshot_paths();
+        create_snapshot_directory(&paths);
+        fs::write(paths.current_snapshot_backup(), b"stale-backup").unwrap();
+        let malformed_history = b"TEST_SECRET_PERSIST_BOTH_FAIL_a14c-no-newline".to_vec();
+        fs::write(paths.history(), &malformed_history).unwrap();
+        let expected = snapshot("home", 1_725_000_000_200);
+
+        let outcome = persist_snapshot(&paths, &expected);
+
+        assert_eq!(
+            outcome,
+            SnapshotPersistOutcome {
+                current: PersistResult::Failed,
+                history: PersistResult::Failed,
+            }
+        );
+        assert!(!paths.current_snapshot().exists());
+        assert_eq!(
+            fs::read(paths.current_snapshot_backup()).unwrap(),
+            b"stale-backup"
+        );
+        assert_eq!(fs::read(paths.history()).unwrap(), malformed_history);
+    }
+
+    #[test]
+    fn persist_outcome_debug_does_not_expose_secret_snapshot_or_path() {
+        const PATH_SENTINEL: &str = "TEST_PERSIST_OUTCOME_PATH_d4e2";
+        const HISTORY_SENTINEL: &str = "TEST_PERSIST_OUTCOME_HISTORY_7f3a";
+        let root = TestRoot::uncreated(PATH_SENTINEL);
+        let paths = root.snapshot_paths();
+        create_snapshot_directory(&paths);
+        fs::write(paths.current_snapshot_backup(), b"stale-backup").unwrap();
+        let malformed_history = format!("{HISTORY_SENTINEL}-no-newline").into_bytes();
+        fs::write(paths.history(), &malformed_history).unwrap();
+        let secret_snapshot = snapshot("home", 1_725_000_000_200);
+
+        let outcome = persist_snapshot(&paths, &secret_snapshot);
+
+        let rendered = format!("{outcome:?}");
+        assert_eq!(
+            rendered,
+            "SnapshotPersistOutcome { current: Failed, history: Failed }"
+        );
+        assert!(!rendered.contains(PATH_SENTINEL));
+        assert!(!rendered.contains(HISTORY_SENTINEL));
+        assert!(!rendered.contains(root.path.to_string_lossy().as_ref()));
+    }
+
+    #[test]
+    fn persist_snapshot_only_touches_current_and_history_files() {
+        let root = TestRoot::uncreated("persist-non-destructive");
+        let paths = root.snapshot_paths();
+        create_snapshot_directory(&paths);
+        root.write_machine_id(b"home");
+        let unrelated = paths
+            .current_snapshot()
+            .parent()
+            .unwrap()
+            .join("unrelated.txt");
+        fs::write(&unrelated, b"unrelated-untouched").unwrap();
+
+        let outcome = persist_snapshot(&paths, &snapshot("home", 1_725_000_000_200));
+
+        assert_eq!(
+            outcome,
+            SnapshotPersistOutcome {
+                current: PersistResult::Saved,
+                history: PersistResult::Saved,
+            }
+        );
+        assert_eq!(fs::read(root.machine_id_file()).unwrap(), b"home");
+        assert_eq!(fs::read(&unrelated).unwrap(), b"unrelated-untouched");
     }
 }
