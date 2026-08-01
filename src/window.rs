@@ -25,6 +25,8 @@ use crate::native_interop::{
     self, Color, TIMER_COUNTDOWN, TIMER_POLL, TIMER_RESET_POLL, WM_APP_TRAY, WM_APP_USAGE_UPDATED,
 };
 use crate::poller;
+use crate::snapshot_schema;
+use crate::snapshot_store;
 use crate::theme;
 use crate::tray_icon;
 #[cfg(feature = "self-update")]
@@ -1789,8 +1791,12 @@ fn do_poll(send_hwnd: SendHwnd) {
             .unwrap_or((true, false, false))
     };
 
-    match poller::poll(show_claude_code, show_codex, show_antigravity) {
+    let report = poller::poll_report(show_claude_code, show_codex, show_antigravity);
+
+    match report.clone().into_app_usage_data() {
         Ok(data) => {
+            persist_poll_snapshot(&report);
+
             let mut state = lock_state();
             if let Some(s) = state.as_mut() {
                 if let Some(claude_code) = data.claude_code.as_ref() {
@@ -1956,6 +1962,50 @@ fn do_poll(send_hwnd: SendHwnd) {
             unsafe {
                 let _ = PostMessageW(hwnd, WM_APP_USAGE_UPDATED, WPARAM(0), LPARAM(0));
             }
+        }
+    }
+}
+
+/// Persist a snapshot of a successful poll. Failures here are logged as fixed,
+/// non-identifying warnings and never affect the already-completed poll result
+/// or the next poll.
+fn persist_poll_snapshot(report: &poller::PollReport) {
+    let Some(local_data_root) = snapshot_store::local_data_root() else {
+        diagnose::log("snapshot persistence skipped: local data root unavailable");
+        return;
+    };
+
+    let machine_id = match snapshot_store::ensure_machine_id(&local_data_root) {
+        Ok(machine_id) => machine_id,
+        Err(_) => {
+            diagnose::log("snapshot persistence skipped: machine id unavailable");
+            return;
+        }
+    };
+
+    let snapshot =
+        match snapshot_schema::snapshot_from_poll_report(&machine_id, report, SystemTime::now()) {
+            Ok(snapshot) => snapshot,
+            Err(_) => {
+                diagnose::log("snapshot persistence skipped: unable to build snapshot");
+                return;
+            }
+        };
+
+    let paths = snapshot_store::SnapshotPaths::new(&local_data_root, &machine_id);
+    let outcome = snapshot_store::persist_snapshot(&paths, &snapshot);
+    match (outcome.current, outcome.history) {
+        (snapshot_store::PersistResult::Saved, snapshot_store::PersistResult::Saved) => {}
+        (snapshot_store::PersistResult::Failed, snapshot_store::PersistResult::Saved) => {
+            diagnose::log("snapshot persistence warning: current snapshot save failed");
+        }
+        (snapshot_store::PersistResult::Saved, snapshot_store::PersistResult::Failed) => {
+            diagnose::log("snapshot persistence warning: history snapshot save failed");
+        }
+        (snapshot_store::PersistResult::Failed, snapshot_store::PersistResult::Failed) => {
+            diagnose::log(
+                "snapshot persistence warning: current and history snapshot save failed",
+            );
         }
     }
 }
