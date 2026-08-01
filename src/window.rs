@@ -2003,9 +2003,7 @@ fn persist_poll_snapshot(report: &poller::PollReport) {
             diagnose::log("snapshot persistence warning: history snapshot save failed");
         }
         (snapshot_store::PersistResult::Failed, snapshot_store::PersistResult::Failed) => {
-            diagnose::log(
-                "snapshot persistence warning: current and history snapshot save failed",
-            );
+            diagnose::log("snapshot persistence warning: current and history snapshot save failed");
         }
     }
 }
