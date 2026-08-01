@@ -1,11 +1,26 @@
 use std::{
     fmt, fs,
+    fs::{File, OpenOptions},
+    io::Write,
+    os::windows::ffi::OsStrExt,
     path::{Path, PathBuf},
     str,
+    sync::atomic::{AtomicU64, Ordering},
 };
+
+use windows::{
+    core::PCWSTR,
+    Win32::Storage::FileSystem::{MoveFileExW, ReplaceFileW, MOVE_FILE_FLAGS, REPLACE_FILE_FLAGS},
+};
+
+use crate::snapshot_schema::SnapshotV1;
 
 const APPLICATION_DIRECTORY: &str = "ClaudeCodeUsageMonitor";
 const USAGE_DIRECTORY: &str = "usage";
+const CURRENT_SNAPSHOT_FILE: &str = "current.json";
+const CURRENT_SNAPSHOT_BACKUP_FILE: &str = "current.json.bak";
+
+static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct MachineId(String);
@@ -96,10 +111,237 @@ fn machine_id_file_path(local_data_root: &Path) -> PathBuf {
         .join("machine_id.txt")
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SnapshotWriteError {
+    InvalidSnapshot,
+    BackupConflict,
+    SerializeFailed,
+    InvalidPath,
+    DirectoryCreateFailed,
+    CurrentCheckFailed,
+    TempCreateFailed,
+    TempWriteFailed,
+    TempSyncFailed,
+    InitialPlacementFailed,
+    ReplacementFailed,
+}
+
+impl fmt::Display for SnapshotWriteError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let message = match self {
+            Self::InvalidSnapshot => "invalid snapshot",
+            Self::BackupConflict => "snapshot backup already exists",
+            Self::SerializeFailed => "unable to serialize snapshot",
+            Self::InvalidPath => "invalid snapshot path",
+            Self::DirectoryCreateFailed => "unable to create snapshot directory",
+            Self::CurrentCheckFailed => "unable to inspect current snapshot",
+            Self::TempCreateFailed => "unable to create snapshot temp file",
+            Self::TempWriteFailed => "unable to write snapshot temp file",
+            Self::TempSyncFailed => "unable to sync snapshot temp file",
+            Self::InitialPlacementFailed => "unable to place initial snapshot",
+            Self::ReplacementFailed => "unable to replace current snapshot",
+        };
+        formatter.write_str(message)
+    }
+}
+
+impl std::error::Error for SnapshotWriteError {}
+
+pub(crate) fn write_current_snapshot(
+    paths: &SnapshotPaths,
+    snapshot: &SnapshotV1,
+) -> Result<(), SnapshotWriteError> {
+    write_current_snapshot_with(paths, snapshot, &WindowsSnapshotPlacement, || {
+        TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed)
+    })
+}
+
+fn write_current_snapshot_with<F>(
+    paths: &SnapshotPaths,
+    snapshot: &SnapshotV1,
+    placement: &impl SnapshotPlacement,
+    next_temp_counter: F,
+) -> Result<(), SnapshotWriteError>
+where
+    F: FnOnce() -> u64,
+{
+    snapshot
+        .validate()
+        .map_err(|_| SnapshotWriteError::InvalidSnapshot)?;
+    ensure_no_interior_null(paths.current_snapshot())?;
+    ensure_no_interior_null(paths.current_snapshot_backup())?;
+    ensure_backup_absent(paths.current_snapshot_backup())?;
+    let json = serde_json::to_vec(snapshot).map_err(|_| SnapshotWriteError::SerializeFailed)?;
+
+    let current = paths.current_snapshot();
+    let directory = current.parent().ok_or(SnapshotWriteError::InvalidPath)?;
+    fs::create_dir_all(directory).map_err(|_| SnapshotWriteError::DirectoryCreateFailed)?;
+
+    let temp = temp_file_path(current, next_temp_counter())?;
+    let mut temp_file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp)
+        .map_err(|_| SnapshotWriteError::TempCreateFailed)?;
+    let mut temp_guard = TempFileGuard::new(temp);
+    let write_result = write_and_sync(&mut temp_file, &json);
+    drop(temp_file);
+    write_result?;
+
+    if current_exists(current)? {
+        placement
+            .replace(current, temp_guard.path(), paths.current_snapshot_backup())
+            .map_err(replacement_error)?;
+        temp_guard.disarm();
+        let _ = fs::remove_file(paths.current_snapshot_backup());
+    } else {
+        placement
+            .move_new(temp_guard.path(), current)
+            .map_err(initial_placement_error)?;
+        temp_guard.disarm();
+    }
+    Ok(())
+}
+
+fn ensure_backup_absent(backup: &Path) -> Result<(), SnapshotWriteError> {
+    match fs::symlink_metadata(backup) {
+        Ok(_) => Err(SnapshotWriteError::BackupConflict),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err(SnapshotWriteError::CurrentCheckFailed),
+    }
+}
+
+fn current_exists(current: &Path) -> Result<bool, SnapshotWriteError> {
+    match fs::symlink_metadata(current) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(_) => Err(SnapshotWriteError::CurrentCheckFailed),
+    }
+}
+
+fn temp_file_path(current: &Path, counter: u64) -> Result<PathBuf, SnapshotWriteError> {
+    let directory = current.parent().ok_or(SnapshotWriteError::InvalidPath)?;
+    Ok(directory.join(format!(
+        ".{CURRENT_SNAPSHOT_FILE}.{}.{counter}.tmp",
+        std::process::id()
+    )))
+}
+
+fn write_and_sync(file: &mut File, json: &[u8]) -> Result<(), SnapshotWriteError> {
+    file.write_all(json)
+        .map_err(|_| SnapshotWriteError::TempWriteFailed)?;
+    file.flush()
+        .map_err(|_| SnapshotWriteError::TempWriteFailed)?;
+    file.sync_all()
+        .map_err(|_| SnapshotWriteError::TempSyncFailed)
+}
+
+struct TempFileGuard {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl TempFileGuard {
+    fn new(path: PathBuf) -> Self {
+        Self { path, armed: true }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for TempFileGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+trait SnapshotPlacement {
+    fn move_new(&self, temp: &Path, current: &Path) -> Result<(), PlacementError>;
+    fn replace(&self, current: &Path, temp: &Path, backup: &Path) -> Result<(), PlacementError>;
+}
+
+#[derive(Clone, Copy)]
+enum PlacementError {
+    InvalidPath,
+    Failed,
+}
+
+fn initial_placement_error(error: PlacementError) -> SnapshotWriteError {
+    match error {
+        PlacementError::InvalidPath => SnapshotWriteError::InvalidPath,
+        PlacementError::Failed => SnapshotWriteError::InitialPlacementFailed,
+    }
+}
+
+fn replacement_error(error: PlacementError) -> SnapshotWriteError {
+    match error {
+        PlacementError::InvalidPath => SnapshotWriteError::InvalidPath,
+        PlacementError::Failed => SnapshotWriteError::ReplacementFailed,
+    }
+}
+
+struct WindowsSnapshotPlacement;
+
+impl SnapshotPlacement for WindowsSnapshotPlacement {
+    fn move_new(&self, temp: &Path, current: &Path) -> Result<(), PlacementError> {
+        let temp = path_to_wide(temp).map_err(|_| PlacementError::InvalidPath)?;
+        let current = path_to_wide(current).map_err(|_| PlacementError::InvalidPath)?;
+        unsafe {
+            MoveFileExW(
+                PCWSTR::from_raw(temp.as_ptr()),
+                PCWSTR::from_raw(current.as_ptr()),
+                MOVE_FILE_FLAGS(0),
+            )
+        }
+        .map_err(|_| PlacementError::Failed)
+    }
+
+    fn replace(&self, current: &Path, temp: &Path, backup: &Path) -> Result<(), PlacementError> {
+        let current = path_to_wide(current).map_err(|_| PlacementError::InvalidPath)?;
+        let temp = path_to_wide(temp).map_err(|_| PlacementError::InvalidPath)?;
+        let backup = path_to_wide(backup).map_err(|_| PlacementError::InvalidPath)?;
+        unsafe {
+            ReplaceFileW(
+                PCWSTR::from_raw(current.as_ptr()),
+                PCWSTR::from_raw(temp.as_ptr()),
+                PCWSTR::from_raw(backup.as_ptr()),
+                REPLACE_FILE_FLAGS(0),
+                None,
+                None,
+            )
+        }
+        .map_err(|_| PlacementError::Failed)
+    }
+}
+
+fn path_to_wide(path: &Path) -> Result<Vec<u16>, SnapshotWriteError> {
+    ensure_no_interior_null(path)?;
+    let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+    wide.push(0);
+    Ok(wide)
+}
+
+fn ensure_no_interior_null(path: &Path) -> Result<(), SnapshotWriteError> {
+    if path.as_os_str().encode_wide().any(|unit| unit == 0) {
+        Err(SnapshotWriteError::InvalidPath)
+    } else {
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SnapshotPaths {
     machine_id_file: PathBuf,
     current_snapshot: PathBuf,
+    current_snapshot_backup: PathBuf,
     history: PathBuf,
 }
 
@@ -112,7 +354,8 @@ impl SnapshotPaths {
 
         Self {
             machine_id_file: machine_id_file_path(local_data_root),
-            current_snapshot: machine_usage_root.join("current.json"),
+            current_snapshot: machine_usage_root.join(CURRENT_SNAPSHOT_FILE),
+            current_snapshot_backup: machine_usage_root.join(CURRENT_SNAPSHOT_BACKUP_FILE),
             history: machine_usage_root.join("history.jsonl"),
         }
     }
@@ -125,6 +368,10 @@ impl SnapshotPaths {
         &self.current_snapshot
     }
 
+    fn current_snapshot_backup(&self) -> &Path {
+        &self.current_snapshot_backup
+    }
+
     pub(crate) fn history(&self) -> &Path {
         &self.history
     }
@@ -133,7 +380,11 @@ impl SnapshotPaths {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::{ffi::OsString, os::windows::ffi::OsStringExt};
+
+    use crate::snapshot_schema::{
+        deserialize_validated_snapshot, ProviderSnapshot, Providers, SnapshotV1,
+    };
 
     static TEST_DIRECTORY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -142,15 +393,20 @@ mod tests {
     }
 
     impl TestRoot {
-        fn new(case: &str) -> Self {
+        fn uncreated(case: &str) -> Self {
             let sequence = TEST_DIRECTORY_SEQUENCE.fetch_add(1, Ordering::Relaxed);
             let path = std::env::temp_dir().join(format!(
                 "ai-usage-monitor-snapshot-store-{}-{case}-{sequence}",
                 std::process::id()
             ));
-            fs::create_dir_all(path.join(APPLICATION_DIRECTORY))
-                .expect("test application directory should be created");
             Self { path }
+        }
+
+        fn new(case: &str) -> Self {
+            let root = Self::uncreated(case);
+            fs::create_dir_all(root.path.join(APPLICATION_DIRECTORY))
+                .expect("test application directory should be created");
+            root
         }
 
         fn local_data_root(&self) -> &Path {
@@ -164,6 +420,13 @@ mod tests {
         fn write_machine_id(&self, bytes: &[u8]) {
             fs::write(self.machine_id_file(), bytes).expect("test machine ID should be written");
         }
+
+        fn snapshot_paths(&self) -> SnapshotPaths {
+            SnapshotPaths::new(
+                self.local_data_root(),
+                &MachineId::parse("home").expect("test machine ID should be valid"),
+            )
+        }
     }
 
     impl Drop for TestRoot {
@@ -174,6 +437,126 @@ mod tests {
 
     fn injected_root() -> PathBuf {
         PathBuf::from(r"C:\local-data-root")
+    }
+
+    fn snapshot(machine_id: &str, generated_at: u64) -> SnapshotV1 {
+        SnapshotV1::new(
+            machine_id.to_string(),
+            generated_at,
+            generated_at,
+            generated_at,
+            Providers::new(
+                ProviderSnapshot::disabled(),
+                ProviderSnapshot::disabled(),
+                ProviderSnapshot::disabled(),
+            ),
+        )
+    }
+
+    fn create_snapshot_directory(paths: &SnapshotPaths) {
+        fs::create_dir_all(
+            paths
+                .current_snapshot()
+                .parent()
+                .expect("snapshot path should have a parent"),
+        )
+        .expect("test snapshot directory should be created");
+    }
+
+    fn snapshot_temp_files(paths: &SnapshotPaths) -> Vec<PathBuf> {
+        let Some(directory) = paths.current_snapshot().parent() else {
+            return Vec::new();
+        };
+        let Ok(entries) = fs::read_dir(directory) else {
+            return Vec::new();
+        };
+        entries
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| {
+                        name.starts_with(&format!(".{CURRENT_SNAPSHOT_FILE}."))
+                            && name.ends_with(".tmp")
+                    })
+            })
+            .collect()
+    }
+
+    struct FailingPlacement;
+
+    impl SnapshotPlacement for FailingPlacement {
+        fn move_new(&self, _temp: &Path, _current: &Path) -> Result<(), PlacementError> {
+            Err(PlacementError::Failed)
+        }
+
+        fn replace(
+            &self,
+            _current: &Path,
+            _temp: &Path,
+            _backup: &Path,
+        ) -> Result<(), PlacementError> {
+            Err(PlacementError::Failed)
+        }
+    }
+
+    struct CompetingInitialPlacement;
+
+    impl SnapshotPlacement for CompetingInitialPlacement {
+        fn move_new(&self, _temp: &Path, current: &Path) -> Result<(), PlacementError> {
+            fs::write(current, b"competing-current").expect("competing current should be created");
+            Err(PlacementError::Failed)
+        }
+
+        fn replace(
+            &self,
+            _current: &Path,
+            _temp: &Path,
+            _backup: &Path,
+        ) -> Result<(), PlacementError> {
+            Err(PlacementError::Failed)
+        }
+    }
+
+    struct FailingReplacementWithBackup;
+
+    impl SnapshotPlacement for FailingReplacementWithBackup {
+        fn move_new(&self, _temp: &Path, _current: &Path) -> Result<(), PlacementError> {
+            Err(PlacementError::Failed)
+        }
+
+        fn replace(
+            &self,
+            current: &Path,
+            _temp: &Path,
+            backup: &Path,
+        ) -> Result<(), PlacementError> {
+            fs::copy(current, backup).expect("recovery backup should be simulated");
+            Err(PlacementError::Failed)
+        }
+    }
+
+    struct SuccessfulReplacementWithUndeletableBackup;
+
+    impl SnapshotPlacement for SuccessfulReplacementWithUndeletableBackup {
+        fn move_new(&self, _temp: &Path, _current: &Path) -> Result<(), PlacementError> {
+            Err(PlacementError::Failed)
+        }
+
+        fn replace(
+            &self,
+            current: &Path,
+            temp: &Path,
+            backup: &Path,
+        ) -> Result<(), PlacementError> {
+            let old_current = fs::read(current).unwrap();
+            fs::create_dir(backup).unwrap();
+            fs::write(backup.join("old-current"), old_current).unwrap();
+            fs::write(current, fs::read(temp).unwrap()).unwrap();
+            fs::remove_file(temp).unwrap();
+            Ok(())
+        }
     }
 
     #[test]
@@ -372,6 +755,296 @@ mod tests {
     }
 
     #[test]
+    fn creates_initial_current_as_compact_validated_json() {
+        let root = TestRoot::uncreated("initial-current");
+        let paths = root.snapshot_paths();
+        let expected = snapshot("home", 1_725_000_000_200);
+
+        write_current_snapshot(&paths, &expected).expect("initial snapshot should be written");
+
+        let bytes = fs::read(paths.current_snapshot()).expect("current snapshot should be read");
+        assert_eq!(bytes, serde_json::to_vec(&expected).unwrap());
+        assert!(!bytes.ends_with(b"\n"));
+        assert!(!bytes.ends_with(b"\r\n"));
+        let json = str::from_utf8(&bytes).expect("snapshot JSON should be UTF-8");
+        assert_eq!(
+            deserialize_validated_snapshot(json).expect("written snapshot should validate"),
+            expected
+        );
+        assert!(snapshot_temp_files(&paths).is_empty());
+        assert!(!paths.current_snapshot_backup().exists());
+    }
+
+    #[test]
+    fn replaces_existing_current_and_removes_backup() {
+        let root = TestRoot::uncreated("replace-current");
+        let paths = root.snapshot_paths();
+        let old_snapshot = snapshot("home", 1_725_000_000_100);
+        let new_snapshot = snapshot("home", 1_725_000_000_200);
+        write_current_snapshot(&paths, &old_snapshot).expect("initial snapshot should be written");
+
+        write_current_snapshot(&paths, &new_snapshot)
+            .expect("existing snapshot should be replaced");
+
+        let bytes = fs::read(paths.current_snapshot()).expect("current snapshot should be read");
+        let json = str::from_utf8(&bytes).expect("snapshot JSON should be UTF-8");
+        assert_eq!(
+            deserialize_validated_snapshot(json).expect("replaced snapshot should validate"),
+            new_snapshot
+        );
+        assert_ne!(bytes, serde_json::to_vec(&old_snapshot).unwrap());
+        assert!(snapshot_temp_files(&paths).is_empty());
+        assert!(!paths.current_snapshot_backup().exists());
+    }
+
+    #[test]
+    fn invalid_snapshot_does_not_touch_filesystem() {
+        let root = TestRoot::uncreated("invalid-snapshot");
+        let paths = root.snapshot_paths();
+        let invalid = snapshot("TEST_SECRET_INVALID_MACHINE_ID", 1_725_000_000_200);
+
+        assert_eq!(
+            write_current_snapshot(&paths, &invalid),
+            Err(SnapshotWriteError::InvalidSnapshot)
+        );
+        assert!(!root.path.exists());
+        assert!(!paths.current_snapshot().exists());
+        assert!(!paths.current_snapshot_backup().exists());
+    }
+
+    #[test]
+    fn preexisting_backup_stops_before_temp_creation_and_preserves_files() {
+        let root = TestRoot::uncreated("backup-conflict");
+        let paths = root.snapshot_paths();
+        create_snapshot_directory(&paths);
+        fs::write(paths.current_snapshot(), b"old-current").unwrap();
+        fs::write(paths.current_snapshot_backup(), b"recovery-backup").unwrap();
+
+        assert_eq!(
+            write_current_snapshot(&paths, &snapshot("home", 1_725_000_000_200)),
+            Err(SnapshotWriteError::BackupConflict)
+        );
+        assert_eq!(fs::read(paths.current_snapshot()).unwrap(), b"old-current");
+        assert_eq!(
+            fs::read(paths.current_snapshot_backup()).unwrap(),
+            b"recovery-backup"
+        );
+        assert!(snapshot_temp_files(&paths).is_empty());
+    }
+
+    #[test]
+    fn temp_names_use_required_prefix_and_unique_counters() {
+        let root = TestRoot::uncreated("temp-names");
+        let paths = root.snapshot_paths();
+        let first_counter = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let second_counter = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let first = temp_file_path(paths.current_snapshot(), first_counter).unwrap();
+        let second = temp_file_path(paths.current_snapshot(), second_counter).unwrap();
+        let expected_name = format!(
+            ".{CURRENT_SNAPSHOT_FILE}.{}.{first_counter}.tmp",
+            std::process::id()
+        );
+
+        assert_eq!(
+            first.file_name().and_then(|name| name.to_str()),
+            Some(expected_name.as_str())
+        );
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn create_new_does_not_overwrite_existing_temp() {
+        const COUNTER: u64 = 7;
+        let root = TestRoot::uncreated("existing-temp");
+        let paths = root.snapshot_paths();
+        create_snapshot_directory(&paths);
+        let temp = temp_file_path(paths.current_snapshot(), COUNTER).unwrap();
+        fs::write(&temp, b"unrelated-existing-temp").unwrap();
+
+        assert_eq!(
+            write_current_snapshot_with(
+                &paths,
+                &snapshot("home", 1_725_000_000_200),
+                &FailingPlacement,
+                || COUNTER,
+            ),
+            Err(SnapshotWriteError::TempCreateFailed)
+        );
+        assert_eq!(fs::read(&temp).unwrap(), b"unrelated-existing-temp");
+        assert!(!paths.current_snapshot().exists());
+    }
+
+    #[test]
+    fn placement_failure_removes_only_current_temp() {
+        const COUNTER: u64 = 8;
+        let root = TestRoot::uncreated("placement-failure");
+        let paths = root.snapshot_paths();
+        create_snapshot_directory(&paths);
+        let unrelated = paths
+            .current_snapshot()
+            .parent()
+            .unwrap()
+            .join(".current.json.unrelated.tmp");
+        fs::write(&unrelated, b"keep-me").unwrap();
+        let current_temp = temp_file_path(paths.current_snapshot(), COUNTER).unwrap();
+
+        assert_eq!(
+            write_current_snapshot_with(
+                &paths,
+                &snapshot("home", 1_725_000_000_200),
+                &FailingPlacement,
+                || COUNTER,
+            ),
+            Err(SnapshotWriteError::InitialPlacementFailed)
+        );
+        assert!(!current_temp.exists());
+        assert_eq!(fs::read(unrelated).unwrap(), b"keep-me");
+        assert!(!paths.current_snapshot().exists());
+    }
+
+    #[test]
+    fn initial_placement_race_does_not_overwrite_competing_current() {
+        const COUNTER: u64 = 9;
+        let root = TestRoot::uncreated("initial-race");
+        let paths = root.snapshot_paths();
+
+        assert_eq!(
+            write_current_snapshot_with(
+                &paths,
+                &snapshot("home", 1_725_000_000_200),
+                &CompetingInitialPlacement,
+                || COUNTER,
+            ),
+            Err(SnapshotWriteError::InitialPlacementFailed)
+        );
+        assert_eq!(
+            fs::read(paths.current_snapshot()).unwrap(),
+            b"competing-current"
+        );
+        assert!(!temp_file_path(paths.current_snapshot(), COUNTER)
+            .unwrap()
+            .exists());
+    }
+
+    #[test]
+    fn replacement_failure_preserves_old_current_and_cleans_temp() {
+        const COUNTER: u64 = 10;
+        let root = TestRoot::uncreated("replacement-failure");
+        let paths = root.snapshot_paths();
+        create_snapshot_directory(&paths);
+        fs::write(paths.current_snapshot(), b"old-current").unwrap();
+
+        assert_eq!(
+            write_current_snapshot_with(
+                &paths,
+                &snapshot("home", 1_725_000_000_200),
+                &FailingReplacementWithBackup,
+                || COUNTER,
+            ),
+            Err(SnapshotWriteError::ReplacementFailed)
+        );
+        assert_eq!(fs::read(paths.current_snapshot()).unwrap(), b"old-current");
+        assert_eq!(
+            fs::read(paths.current_snapshot_backup()).unwrap(),
+            b"old-current"
+        );
+        assert!(!temp_file_path(paths.current_snapshot(), COUNTER)
+            .unwrap()
+            .exists());
+    }
+
+    #[test]
+    fn backup_cleanup_failure_does_not_turn_success_into_write_failure() {
+        const COUNTER: u64 = 12;
+        let root = TestRoot::uncreated("backup-cleanup-failure");
+        let paths = root.snapshot_paths();
+        create_snapshot_directory(&paths);
+        fs::write(paths.current_snapshot(), b"old-current").unwrap();
+        let expected = snapshot("home", 1_725_000_000_200);
+
+        assert_eq!(
+            write_current_snapshot_with(
+                &paths,
+                &expected,
+                &SuccessfulReplacementWithUndeletableBackup,
+                || COUNTER,
+            ),
+            Ok(())
+        );
+        let json = fs::read_to_string(paths.current_snapshot()).unwrap();
+        assert_eq!(deserialize_validated_snapshot(&json).unwrap(), expected);
+        assert!(paths.current_snapshot_backup().is_dir());
+        assert_eq!(
+            fs::read(paths.current_snapshot_backup().join("old-current")).unwrap(),
+            b"old-current"
+        );
+    }
+
+    #[test]
+    fn pcwstr_buffer_is_null_terminated_and_rejects_interior_null() {
+        let wide = path_to_wide(Path::new(r"C:\snapshots\current.json")).unwrap();
+        assert_eq!(wide.last(), Some(&0));
+        assert!(!wide[..wide.len() - 1].contains(&0));
+
+        let path = PathBuf::from(OsString::from_wide(&[
+            b'C' as u16,
+            b':' as u16,
+            b'\\' as u16,
+            b'a' as u16,
+            0,
+            b'b' as u16,
+        ]));
+        assert_eq!(path_to_wide(&path), Err(SnapshotWriteError::InvalidPath));
+    }
+
+    #[test]
+    fn writer_rejects_interior_null_path_before_filesystem_changes() {
+        let root = TestRoot {
+            path: PathBuf::from(OsString::from_wide(&[
+                b'C' as u16,
+                b':' as u16,
+                b'\\' as u16,
+                b'a' as u16,
+                0,
+                b'b' as u16,
+            ])),
+        };
+        let paths = root.snapshot_paths();
+
+        assert_eq!(
+            write_current_snapshot(&paths, &snapshot("home", 1_725_000_000_200)),
+            Err(SnapshotWriteError::InvalidPath)
+        );
+        assert!(!paths.current_snapshot().exists());
+        assert!(!paths.current_snapshot_backup().exists());
+    }
+
+    #[test]
+    fn write_errors_do_not_expose_snapshot_path_json_or_os_error() {
+        const COUNTER: u64 = 11;
+        const PATH_SENTINEL: &str = "TEST_ATOMIC_PATH_SENTINEL_9b21";
+        let root = TestRoot::uncreated(PATH_SENTINEL);
+        let paths = root.snapshot_paths();
+        let secret_snapshot = snapshot("secret-snapshot-7f3a", 1_725_000_000_200);
+        let raw_json = serde_json::to_string(&secret_snapshot).unwrap();
+
+        let error =
+            write_current_snapshot_with(&paths, &secret_snapshot, &FailingPlacement, || COUNTER)
+                .unwrap_err();
+        assert_eq!(error, SnapshotWriteError::InitialPlacementFailed);
+        let rendered = format!("{error:?}: {error}");
+        assert_eq!(
+            rendered,
+            "InitialPlacementFailed: unable to place initial snapshot"
+        );
+        assert!(!rendered.contains("secret-snapshot-7f3a"));
+        assert!(!rendered.contains(PATH_SENTINEL));
+        assert!(!rendered.contains(&raw_json));
+        assert!(!rendered.contains(root.path.to_string_lossy().as_ref()));
+        assert!(std::error::Error::source(&error).is_none());
+    }
+
+    #[test]
     fn builds_machine_id_file_from_injected_root() {
         let root = injected_root();
         let machine_id = MachineId::parse("home").unwrap();
@@ -395,6 +1068,13 @@ mod tests {
                 .join(USAGE_DIRECTORY)
                 .join("pc-1")
                 .join("current.json")
+        );
+        assert_eq!(
+            paths.current_snapshot_backup(),
+            root.join(APPLICATION_DIRECTORY)
+                .join(USAGE_DIRECTORY)
+                .join("pc-1")
+                .join("current.json.bak")
         );
     }
 
