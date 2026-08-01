@@ -10,7 +10,13 @@ use std::{
 
 use windows::{
     core::PCWSTR,
-    Win32::Storage::FileSystem::{MoveFileExW, ReplaceFileW, MOVE_FILE_FLAGS, REPLACE_FILE_FLAGS},
+    Win32::{
+        Foundation::STATUS_SUCCESS,
+        Security::Cryptography::{
+            BCryptGenRandom, BCRYPT_ALG_HANDLE, BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+        },
+        Storage::FileSystem::{MoveFileExW, ReplaceFileW, MOVE_FILE_FLAGS, REPLACE_FILE_FLAGS},
+    },
 };
 
 use crate::snapshot_schema::SnapshotV1;
@@ -109,6 +115,134 @@ fn machine_id_file_path(local_data_root: &Path) -> PathBuf {
     local_data_root
         .join(APPLICATION_DIRECTORY)
         .join("machine_id.txt")
+}
+
+pub(crate) fn local_data_root() -> Option<PathBuf> {
+    dirs::data_local_dir()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MachineIdInitError {
+    ExistingMachineIdUnavailable,
+    RandomGenerationFailed,
+    GeneratedIdInvalid,
+    InvalidPath,
+    DirectoryCreateFailed,
+    TempCreateFailed,
+    TempWriteFailed,
+    TempSyncFailed,
+    PublishFailed,
+}
+
+impl fmt::Display for MachineIdInitError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let message = match self {
+            Self::ExistingMachineIdUnavailable => "existing machine ID is unavailable",
+            Self::RandomGenerationFailed => "unable to generate a machine ID",
+            Self::GeneratedIdInvalid => "generated machine ID is invalid",
+            Self::InvalidPath => "invalid machine ID path",
+            Self::DirectoryCreateFailed => "unable to create machine ID directory",
+            Self::TempCreateFailed => "unable to create machine ID temp file",
+            Self::TempWriteFailed => "unable to write machine ID temp file",
+            Self::TempSyncFailed => "unable to sync machine ID temp file",
+            Self::PublishFailed => "unable to publish machine ID",
+        };
+        formatter.write_str(message)
+    }
+}
+
+impl std::error::Error for MachineIdInitError {}
+
+pub(crate) fn ensure_machine_id(local_data_root: &Path) -> Result<MachineId, MachineIdInitError> {
+    match read_machine_id(local_data_root) {
+        Ok(machine_id) => return Ok(machine_id),
+        Err(MachineIdReadError::NotConfigured) => {}
+        Err(_) => return Err(MachineIdInitError::ExistingMachineIdUnavailable),
+    }
+
+    let generated = generate_machine_id()?;
+    publish_machine_id(local_data_root, &generated)
+}
+
+fn generate_machine_id() -> Result<MachineId, MachineIdInitError> {
+    let mut random_bytes = [0u8; 16];
+    let status = unsafe {
+        BCryptGenRandom(
+            BCRYPT_ALG_HANDLE::default(),
+            &mut random_bytes,
+            BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+        )
+    };
+    if status != STATUS_SUCCESS {
+        return Err(MachineIdInitError::RandomGenerationFailed);
+    }
+
+    let hex: String = random_bytes
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    MachineId::parse(&hex).map_err(|_| MachineIdInitError::GeneratedIdInvalid)
+}
+
+fn machine_id_temp_path(target: &Path, counter: u64) -> Result<PathBuf, MachineIdInitError> {
+    let directory = target.parent().ok_or(MachineIdInitError::InvalidPath)?;
+    Ok(directory.join(format!(
+        ".machine_id.txt.{}.{counter}.tmp",
+        std::process::id()
+    )))
+}
+
+fn publish_machine_id(
+    local_data_root: &Path,
+    machine_id: &MachineId,
+) -> Result<MachineId, MachineIdInitError> {
+    let target = machine_id_file_path(local_data_root);
+    let directory = target.parent().ok_or(MachineIdInitError::InvalidPath)?;
+    fs::create_dir_all(directory).map_err(|_| MachineIdInitError::DirectoryCreateFailed)?;
+
+    let temp = machine_id_temp_path(&target, TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed))?;
+    let mut temp_file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp)
+        .map_err(|_| MachineIdInitError::TempCreateFailed)?;
+    let mut temp_guard = TempFileGuard::new(temp);
+
+    let content = format!("{}\n", machine_id.as_str());
+    let write_result = write_machine_id_temp(&mut temp_file, content.as_bytes());
+    drop(temp_file);
+    write_result?;
+
+    let temp_wide = path_to_wide(temp_guard.path()).map_err(|_| MachineIdInitError::InvalidPath)?;
+    let target_wide = path_to_wide(&target).map_err(|_| MachineIdInitError::InvalidPath)?;
+
+    let publish_result = unsafe {
+        MoveFileExW(
+            PCWSTR::from_raw(temp_wide.as_ptr()),
+            PCWSTR::from_raw(target_wide.as_ptr()),
+            MOVE_FILE_FLAGS(0),
+        )
+    };
+
+    match publish_result {
+        Ok(()) => {
+            temp_guard.disarm();
+            Ok(machine_id.clone())
+        }
+        Err(_) => match read_machine_id(local_data_root) {
+            Ok(existing) => Ok(existing),
+            Err(_) => Err(MachineIdInitError::PublishFailed),
+        },
+    }
+}
+
+fn write_machine_id_temp(file: &mut File, content: &[u8]) -> Result<(), MachineIdInitError> {
+    file.write_all(content)
+        .map_err(|_| MachineIdInitError::TempWriteFailed)?;
+    file.flush()
+        .map_err(|_| MachineIdInitError::TempWriteFailed)?;
+    file.sync_all()
+        .map_err(|_| MachineIdInitError::TempSyncFailed)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1630,5 +1764,200 @@ mod tests {
         );
         assert_eq!(fs::read(root.machine_id_file()).unwrap(), b"home");
         assert_eq!(fs::read(&unrelated).unwrap(), b"unrelated-untouched");
+    }
+
+    fn is_lowercase_hex_32(value: &str) -> bool {
+        value.len() == 32
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    }
+
+    #[test]
+    fn machine_id_file_path_composes_local_data_root_with_application_directory() {
+        let fake_root = PathBuf::from(r"C:\fake-local-data-root");
+
+        assert_eq!(
+            machine_id_file_path(&fake_root),
+            fake_root.join(APPLICATION_DIRECTORY).join("machine_id.txt")
+        );
+    }
+
+    #[test]
+    fn ensure_machine_id_generates_lowercase_hex_id_when_unconfigured() {
+        let root = TestRoot::uncreated("machine-id-generate");
+
+        let machine_id =
+            ensure_machine_id(root.local_data_root()).expect("machine ID should be generated");
+
+        assert!(is_lowercase_hex_32(machine_id.as_str()));
+    }
+
+    #[test]
+    fn ensure_machine_id_writes_id_followed_by_single_lf() {
+        let root = TestRoot::uncreated("machine-id-lf-format");
+
+        let machine_id =
+            ensure_machine_id(root.local_data_root()).expect("machine ID should be generated");
+
+        let bytes = fs::read(root.machine_id_file()).expect("machine ID file should be read");
+        assert_eq!(bytes, format!("{}\n", machine_id.as_str()).into_bytes());
+        assert!(!bytes.ends_with(b"\r\n"));
+    }
+
+    #[test]
+    fn ensure_machine_id_returns_same_id_and_leaves_bytes_unchanged_on_second_call() {
+        let root = TestRoot::uncreated("machine-id-idempotent");
+
+        let first =
+            ensure_machine_id(root.local_data_root()).expect("first machine ID should generate");
+        let bytes_after_first = fs::read(root.machine_id_file()).unwrap();
+
+        let second =
+            ensure_machine_id(root.local_data_root()).expect("second call should reuse the ID");
+
+        assert_eq!(first, second);
+        assert_eq!(fs::read(root.machine_id_file()).unwrap(), bytes_after_first);
+    }
+
+    #[test]
+    fn ensure_machine_id_does_not_overwrite_empty_file() {
+        let root = TestRoot::new("machine-id-empty");
+        root.write_machine_id(b"");
+
+        assert_eq!(
+            ensure_machine_id(root.local_data_root()),
+            Err(MachineIdInitError::ExistingMachineIdUnavailable)
+        );
+        assert_eq!(fs::read(root.machine_id_file()).unwrap(), b"");
+    }
+
+    #[test]
+    fn ensure_machine_id_does_not_overwrite_invalid_id() {
+        let root = TestRoot::new("machine-id-invalid");
+        root.write_machine_id(b"Not-Valid-ID");
+
+        assert_eq!(
+            ensure_machine_id(root.local_data_root()),
+            Err(MachineIdInitError::ExistingMachineIdUnavailable)
+        );
+        assert_eq!(fs::read(root.machine_id_file()).unwrap(), b"Not-Valid-ID");
+    }
+
+    #[test]
+    fn ensure_machine_id_does_not_overwrite_multiline_bom_or_bare_cr() {
+        for (case, bytes) in [
+            ("multiple-lines", b"home\nother".as_slice()),
+            ("embedded-cr", b"ho\rme".as_slice()),
+            ("bom", b"\xef\xbb\xbfhome".as_slice()),
+            ("double-lf", b"home\n\n".as_slice()),
+        ] {
+            let root = TestRoot::new(case);
+            root.write_machine_id(bytes);
+
+            assert_eq!(
+                ensure_machine_id(root.local_data_root()),
+                Err(MachineIdInitError::ExistingMachineIdUnavailable),
+                "{case} should not be overwritten"
+            );
+            assert_eq!(
+                fs::read(root.machine_id_file()).unwrap(),
+                bytes,
+                "{case} bytes must remain unchanged"
+            );
+        }
+    }
+
+    #[test]
+    fn ensure_machine_id_does_not_touch_directory_in_place_of_file() {
+        let root = TestRoot::new("machine-id-directory");
+        fs::create_dir(root.machine_id_file()).expect("test directory should be created");
+
+        assert_eq!(
+            ensure_machine_id(root.local_data_root()),
+            Err(MachineIdInitError::ExistingMachineIdUnavailable)
+        );
+        assert!(root.machine_id_file().is_dir());
+    }
+
+    #[test]
+    fn ensure_machine_id_does_not_modify_current_history_backup_or_unrelated_files() {
+        let root = TestRoot::uncreated("machine-id-non-destructive");
+        let paths = root.snapshot_paths();
+        create_snapshot_directory(&paths);
+        fs::write(paths.current_snapshot(), b"current-untouched").unwrap();
+        fs::write(paths.current_snapshot_backup(), b"backup-untouched").unwrap();
+        fs::write(paths.history(), b"TEST_SECRET_HISTORY_UNTOUCHED\n").unwrap();
+        let unrelated = paths
+            .current_snapshot()
+            .parent()
+            .unwrap()
+            .join("unrelated.txt");
+        fs::write(&unrelated, b"unrelated-untouched").unwrap();
+
+        ensure_machine_id(root.local_data_root()).expect("machine ID should be generated");
+
+        assert_eq!(
+            fs::read(paths.current_snapshot()).unwrap(),
+            b"current-untouched"
+        );
+        assert_eq!(
+            fs::read(paths.current_snapshot_backup()).unwrap(),
+            b"backup-untouched"
+        );
+        assert_eq!(
+            fs::read(paths.history()).unwrap(),
+            b"TEST_SECRET_HISTORY_UNTOUCHED\n"
+        );
+        assert_eq!(fs::read(&unrelated).unwrap(), b"unrelated-untouched");
+    }
+
+    #[test]
+    fn machine_id_init_error_does_not_expose_path_or_os_error() {
+        const PATH_SENTINEL: &str = "TEST_MACHINE_ID_INIT_PATH_9b21";
+        let root = TestRoot::new(PATH_SENTINEL);
+        fs::create_dir(root.machine_id_file()).expect("test directory should be created");
+
+        let error = ensure_machine_id(root.local_data_root()).unwrap_err();
+
+        assert_eq!(error, MachineIdInitError::ExistingMachineIdUnavailable);
+        let rendered = format!("{error:?}: {error}");
+        assert_eq!(
+            rendered,
+            "ExistingMachineIdUnavailable: existing machine ID is unavailable"
+        );
+        assert!(!rendered.contains(PATH_SENTINEL));
+        assert!(!rendered.contains(root.path.to_string_lossy().as_ref()));
+        assert!(std::error::Error::source(&error).is_none());
+    }
+
+    #[test]
+    fn publish_machine_id_converges_to_existing_target_when_publish_fails() {
+        let root = TestRoot::uncreated("machine-id-publish-race");
+        fs::create_dir_all(root.machine_id_file().parent().unwrap()).unwrap();
+        fs::write(root.machine_id_file(), b"home\n").unwrap();
+        let attempted = MachineId::parse("central").expect("test machine ID should be valid");
+
+        let result = publish_machine_id(root.local_data_root(), &attempted);
+
+        assert_eq!(result, Ok(MachineId::parse("home").unwrap()));
+        assert_eq!(fs::read(root.machine_id_file()).unwrap(), b"home\n");
+        assert!(snapshot_temp_files_matching(&root.path, ".machine_id.txt.").is_empty());
+    }
+
+    fn snapshot_temp_files_matching(local_data_root: &Path, prefix: &str) -> Vec<PathBuf> {
+        let directory = local_data_root.join(APPLICATION_DIRECTORY);
+        let Ok(entries) = fs::read_dir(directory) else {
+            return Vec::new();
+        };
+        entries
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(prefix) && name.ends_with(".tmp"))
+            })
+            .collect()
     }
 }
