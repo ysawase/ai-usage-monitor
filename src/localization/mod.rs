@@ -190,6 +190,15 @@ pub struct Strings {
     pub antigravity_token_expired_body: &'static str,
     pub codex_window_title: &'static str,
     pub antigravity_window_title: &'static str,
+    pub usage_display_basis: &'static str,
+    pub used_percentage: &'static str,
+    pub remaining_allowance: &'static str,
+    pub reset_in: &'static str,
+    pub loading: &'static str,
+    pub fetch_failed: &'static str,
+    pub retrying: &'static str,
+    pub not_configured: &'static str,
+    pub not_available: &'static str,
 }
 
 pub fn resolve_language(language_override: Option<LanguageId>) -> LanguageId {

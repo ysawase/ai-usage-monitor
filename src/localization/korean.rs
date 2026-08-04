@@ -48,4 +48,13 @@ pub(super) const STRINGS: Strings = Strings {
     codex_window_title: "Codex 사용량 모니터",
     antigravity_window_title: "Antigravity 사용량 모니터",
     second_suffix: "초",
+    usage_display_basis: "표시 기준",
+    used_percentage: "사용률",
+    remaining_allowance: "남은 한도",
+    reset_in: "초기화까지",
+    loading: "불러오는 중",
+    fetch_failed: "가져오기 실패",
+    retrying: "재시도 중",
+    not_configured: "설정 안 됨",
+    not_available: "해당 없음",
 };

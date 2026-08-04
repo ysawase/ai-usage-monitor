@@ -48,4 +48,13 @@ pub(super) const STRINGS: Strings = Strings {
     codex_window_title: "Codex-gebruiksmonitor",
     antigravity_window_title: "Antigravity-gebruiksmonitor",
     second_suffix: "s",
+    usage_display_basis: "Weergavebasis",
+    used_percentage: "Gebruikt %",
+    remaining_allowance: "Resterend quotum",
+    reset_in: "Reset over",
+    loading: "Laden",
+    fetch_failed: "Ophalen mislukt",
+    retrying: "Opnieuw proberen",
+    not_configured: "Niet ingesteld",
+    not_available: "Niet beschikbaar",
 };

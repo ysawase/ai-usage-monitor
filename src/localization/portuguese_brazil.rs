@@ -48,4 +48,13 @@ pub(super) const STRINGS: Strings = Strings {
     antigravity_token_expired_body: "Abra o Antigravity e entre novamente. Depois disso, atualize ou reinicie este aplicativo.",
     codex_window_title: "Monitor de uso do Codex",
     antigravity_window_title: "Monitor de uso do Antigravity",
+    usage_display_basis: "Base de exibição",
+    used_percentage: "% usado",
+    remaining_allowance: "Limite restante",
+    reset_in: "Reinício em",
+    loading: "Carregando",
+    fetch_failed: "Falha ao obter",
+    retrying: "Tentando novamente",
+    not_configured: "Não configurado",
+    not_available: "Não disponível",
 };

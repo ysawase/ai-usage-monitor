@@ -48,4 +48,13 @@ pub(super) const STRINGS: Strings = Strings {
     codex_window_title: "Codex 使用量监控",
     antigravity_window_title: "Antigravity 使用量监控",
     second_suffix: "秒",
+    usage_display_basis: "显示方式",
+    used_percentage: "已用百分比",
+    remaining_allowance: "剩余额度",
+    reset_in: "距重置",
+    loading: "获取中",
+    fetch_failed: "获取失败",
+    retrying: "重试中",
+    not_configured: "未配置",
+    not_available: "不适用",
 };

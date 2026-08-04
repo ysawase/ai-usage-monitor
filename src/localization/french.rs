@@ -48,4 +48,13 @@ pub(super) const STRINGS: Strings = Strings {
     codex_window_title: "Moniteur d'utilisation Codex",
     antigravity_window_title: "Moniteur d'utilisation Antigravity",
     second_suffix: "s",
+    usage_display_basis: "Base d'affichage",
+    used_percentage: "% utilisé",
+    remaining_allowance: "Quota restant",
+    reset_in: "Réinit. dans",
+    loading: "Chargement",
+    fetch_failed: "Échec de récupération",
+    retrying: "Nouvelle tentative",
+    not_configured: "Non configuré",
+    not_available: "Non disponible",
 };

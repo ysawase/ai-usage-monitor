@@ -18,7 +18,9 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::diagnose;
 use crate::localization::{self, LanguageId, Strings};
-use crate::models::AppUsageData;
+#[cfg(test)]
+use crate::models::UsageData;
+use crate::models::{AppUsageData, UsageSection};
 #[cfg(feature = "self-update")]
 use crate::native_interop::TIMER_UPDATE_CHECK;
 use crate::native_interop::{
@@ -60,17 +62,25 @@ struct AppState {
     language: LanguageId,
     install_channel: InstallChannel,
 
-    session_percent: f64,
+    display_basis: DisplayBasis,
+
+    session_state: CellState,
+    session_percent: Option<f64>,
     session_text: String,
-    weekly_percent: f64,
+    weekly_state: CellState,
+    weekly_percent: Option<f64>,
     weekly_text: String,
-    codex_session_percent: f64,
+    codex_session_state: CellState,
+    codex_session_percent: Option<f64>,
     codex_session_text: String,
-    codex_weekly_percent: f64,
+    codex_weekly_state: CellState,
+    codex_weekly_percent: Option<f64>,
     codex_weekly_text: String,
-    antigravity_session_percent: f64,
+    antigravity_session_state: CellState,
+    antigravity_session_percent: Option<f64>,
     antigravity_session_text: String,
-    antigravity_weekly_percent: f64,
+    antigravity_weekly_state: CellState,
+    antigravity_weekly_percent: Option<f64>,
     antigravity_weekly_text: String,
     show_claude_code: bool,
     show_codex: bool,
@@ -108,6 +118,197 @@ enum UpdateStatus {
     Available(ReleaseDescriptor),
 }
 
+/// User's chosen basis for the usage number and bar: how much of the quota
+/// has been used, or how much is left. Only the AppState-level display copy
+/// is affected — the internal `UsageSection::percentage` (always "used%")
+/// from `poller`/`models`/`snapshot_schema` is never rewritten.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum DisplayBasis {
+    UsedPercentage,
+    RemainingAllowance,
+}
+
+impl Default for DisplayBasis {
+    fn default() -> Self {
+        DisplayBasis::UsedPercentage
+    }
+}
+
+/// Availability/status of a single (provider, window) usage cell.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CellState {
+    Loading,
+    Ok,
+    FetchFailed,
+    Retrying,
+    NotConfigured,
+    NotAvailable,
+}
+
+/// What a single usage cell should render. `bar_percent` is `Some` only when
+/// there is a real current value to draw — a normal 0% is `Some(0.0)`, while
+/// loading/error/unconfigured/not-available states are `None` so the bar can
+/// never show a stale or invented "current" fill. `text` always carries the
+/// user-facing string (either the basis-formatted number, or a localized
+/// status word).
+struct CellDisplay {
+    bar_percent: Option<f64>,
+    text: String,
+}
+
+/// Convert an internal used-percentage into the value to show, for the
+/// chosen basis. The same result feeds both the number and the bar fill
+/// (via `CellDisplay::bar_percent`), so they can never disagree.
+fn display_value(basis: DisplayBasis, used_percent: f64) -> f64 {
+    let used = used_percent.clamp(0.0, 100.0);
+    match basis {
+        DisplayBasis::UsedPercentage => used,
+        DisplayBasis::RemainingAllowance => (100.0 - used).clamp(0.0, 100.0),
+    }
+}
+
+/// Countdown text for a reset time, computed directly from `resets_at`
+/// rather than by reparsing `poller::format_line`'s output. This mirrors
+/// `poller::format_countdown`'s day/hour/minute/second floor rounding
+/// exactly (verified line-by-line against the current `src/poller.rs`; see
+/// the completion report). That function is a private detail of
+/// `poller::format_line` and isn't reachable from here without a
+/// `src/poller.rs` visibility change, which is out of scope for this
+/// change. `None` in, `None` out (no countdown shown). A past reset time
+/// reuses the existing `strings.now` word, same as `poller.rs`.
+fn countdown_text(resets_at: Option<SystemTime>, strings: Strings) -> Option<String> {
+    let reset = resets_at?;
+    let remaining = match reset.duration_since(SystemTime::now()) {
+        Ok(d) => d,
+        Err(_) => return Some(strings.now.to_string()),
+    };
+
+    let total_secs = remaining.as_secs();
+    let total_mins = total_secs / 60;
+    let total_hours = total_secs / 3600;
+    let total_days = total_secs / 86400;
+
+    Some(if total_days >= 1 {
+        format!("{total_days}{}", strings.day_suffix)
+    } else if total_hours >= 1 {
+        format!("{total_hours}{}", strings.hour_suffix)
+    } else if total_mins >= 1 {
+        format!("{total_mins}{}", strings.minute_suffix)
+    } else {
+        format!("{total_secs}{}", strings.second_suffix)
+    })
+}
+
+/// The display-basis prefix ("Used"/"Remaining") is shown once in the
+/// popup's header row rather than repeated on every cell — see
+/// `draw_basis_label_row` — so this is just "<percent>%" optionally
+/// followed by " · <reset-in word> <countdown>".
+fn format_cell_text(basis: DisplayBasis, section: &UsageSection, strings: Strings) -> String {
+    let pct = display_value(basis, section.percentage);
+    let pct_text = format!("{pct:.0}%");
+    match countdown_text(section.resets_at, strings) {
+        Some(countdown) => format!("{pct_text} \u{00b7} {} {countdown}", strings.reset_in),
+        None => pct_text,
+    }
+}
+
+/// Localized status word for a non-`Ok` cell. `CellState::Ok` has no status
+/// word of its own — a caller reaching this with `Ok` has already failed to
+/// pair it with `Some(section)`, which is a caller bug, not a real "loading"
+/// state; assert in debug builds and fail safe to "not available" text
+/// rather than silently presenting it as ordinary loading.
+fn status_text(state: CellState, strings: Strings) -> &'static str {
+    match state {
+        CellState::Loading => strings.loading,
+        CellState::FetchFailed => strings.fetch_failed,
+        CellState::Retrying => strings.retrying,
+        CellState::NotConfigured => strings.not_configured,
+        CellState::NotAvailable => strings.not_available,
+        CellState::Ok => {
+            debug_assert!(
+                false,
+                "status_text called with CellState::Ok (caller should pair Ok with Some(section))"
+            );
+            strings.not_available
+        }
+    }
+}
+
+fn render_cell(
+    state: CellState,
+    section: Option<&UsageSection>,
+    basis: DisplayBasis,
+    strings: Strings,
+) -> CellDisplay {
+    match (state, section) {
+        (CellState::Ok, Some(section)) => CellDisplay {
+            bar_percent: Some(display_value(basis, section.percentage)),
+            text: format_cell_text(basis, section, strings),
+        },
+        _ => CellDisplay {
+            bar_percent: None,
+            text: status_text(state, strings).to_string(),
+        },
+    }
+}
+
+/// Classify a just-completed provider poll into session/weekly cell states.
+/// `Disabled` (provider not requested this poll) is not a normal render
+/// target — it maps to `NotAvailable` rather than `Loading`, since it does
+/// not mean "waiting for first data"; the genuine "never polled yet" state
+/// is `CellState::Loading` set once at `AppState` construction and left
+/// alone here.
+fn poll_cell_states(outcome: &poller::ProviderPollOutcome) -> (CellState, CellState) {
+    match outcome {
+        poller::ProviderPollOutcome::Success { usage, .. } => (
+            if usage.session_available() {
+                CellState::Ok
+            } else {
+                CellState::NotAvailable
+            },
+            if usage.weekly_available() {
+                CellState::Ok
+            } else {
+                CellState::NotAvailable
+            },
+        ),
+        poller::ProviderPollOutcome::Error { error, .. } => {
+            let state = match error {
+                poller::PollError::AuthRequired | poller::PollError::TokenExpired => {
+                    CellState::FetchFailed
+                }
+                poller::PollError::NoCredentials => CellState::NotConfigured,
+                poller::PollError::RequestFailed => CellState::Retrying,
+            };
+            (state, state)
+        }
+        poller::ProviderPollOutcome::Disabled => (CellState::NotAvailable, CellState::NotAvailable),
+    }
+}
+
+/// Overwrite each provider's cached `UsageData` with this poll's result only
+/// when that provider actually succeeded this round; a provider that didn't
+/// succeed (error or disabled) keeps whatever was cached before. That old
+/// value is never read once the corresponding `CellState` (set from the same
+/// `report`, right alongside this call) is anything but `Ok` — see
+/// `render_cell`. Called the same way from both the success and failure
+/// branches of `do_poll` so "this provider is Ok" and "this provider's
+/// displayed value is from an old poll" can never occur together, regardless
+/// of ordering.
+fn merge_successful_providers(data: &mut Option<AppUsageData>, report: &poller::PollReport) {
+    let data = data.get_or_insert_with(AppUsageData::default);
+    if let poller::ProviderPollOutcome::Success { usage, .. } = &report.claude_code {
+        data.claude_code = Some(usage.clone());
+    }
+    if let poller::ProviderPollOutcome::Success { usage, .. } = &report.codex {
+        data.codex = Some(usage.clone());
+    }
+    if let poller::ProviderPollOutcome::Success { usage, .. } = &report.antigravity {
+        data.antigravity = Some(usage.clone());
+    }
+}
+
 const RETRY_BASE_MS: u32 = 30_000; // 30 seconds
 
 const POLL_1_MIN: u32 = 60_000;
@@ -141,6 +342,8 @@ const IDM_MODEL_CLAUDE_CODE: u16 = 60;
 const IDM_MODEL_CODEX: u16 = 61;
 #[cfg(feature = "antigravity")]
 const IDM_MODEL_ANTIGRAVITY: u16 = 62;
+const IDM_DISPLAY_BASIS_USED: u16 = 70;
+const IDM_DISPLAY_BASIS_REMAINING: u16 = 71;
 
 const WM_DPICHANGED_MSG: u32 = 0x02E0;
 #[cfg(feature = "self-update")]
@@ -332,6 +535,8 @@ struct SettingsFile {
     show_codex: bool,
     #[serde(default = "default_show_antigravity")]
     show_antigravity: bool,
+    #[serde(default, deserialize_with = "deserialize_display_basis")]
+    display_basis: DisplayBasis,
 }
 
 impl Default for SettingsFile {
@@ -347,8 +552,23 @@ impl Default for SettingsFile {
             show_claude_code: true,
             show_codex: false,
             show_antigravity: false,
+            display_basis: DisplayBasis::default(),
         }
     }
+}
+
+/// Falls back to the default basis for any value this build doesn't
+/// recognize (e.g. a newer settings.json written by a future version),
+/// rather than letting one unrecognized field fail the whole `SettingsFile`
+/// parse and reset every other saved preference back to default.
+fn deserialize_display_basis<'de, D>(deserializer: D) -> Result<DisplayBasis, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(serde_json::Value::deserialize(deserializer)
+        .ok()
+        .and_then(|value| serde_json::from_value::<DisplayBasis>(value).ok())
+        .unwrap_or_default())
 }
 
 fn default_poll_interval() -> u32 {
@@ -413,6 +633,7 @@ fn save_state_settings() {
             show_claude_code: s.show_claude_code,
             show_codex: s.show_codex,
             show_antigravity: s.show_antigravity,
+            display_basis: s.display_basis,
         });
     }
 }
@@ -421,40 +642,125 @@ fn tray_icon_data_from_state() -> Vec<tray_icon::TrayIconData> {
     let state = lock_state();
     match state.as_ref() {
         Some(s) if s.last_poll_ok => {
+            // The tray icon's fill color/text-color thresholds in
+            // `tray_icon::create_icon` assume `percent` is used-percentage
+            // (they redden/invert as it rises toward 100 — see the
+            // completion report). `s.*_percent`/`s.*_text` are basis-
+            // converted for the popup and would both invert that meaning
+            // and disagree with the icon's own color under "remaining"
+            // (e.g. icon shows a low, safe-looking number while the
+            // tooltip says "30% remaining" — actually 70% used). So every
+            // tray field (icon percent AND tooltip text) is recomputed here
+            // independently, always as used-percentage, regardless of
+            // `s.display_basis`; the popup keeps the user's chosen basis.
+            let strings = s.language.strings();
+
+            let claude_session = s
+                .data
+                .as_ref()
+                .and_then(|d| d.claude_code.as_ref())
+                .map(|u| &u.session);
+            let claude_weekly = s
+                .data
+                .as_ref()
+                .and_then(|d| d.claude_code.as_ref())
+                .map(|u| &u.weekly);
+            let claude_session_used = render_cell(
+                s.session_state,
+                claude_session,
+                DisplayBasis::UsedPercentage,
+                strings,
+            );
+            let claude_weekly_used = render_cell(
+                s.weekly_state,
+                claude_weekly,
+                DisplayBasis::UsedPercentage,
+                strings,
+            );
+
+            let codex_session = s
+                .data
+                .as_ref()
+                .and_then(|d| d.codex.as_ref())
+                .map(|u| &u.session);
+            let codex_weekly = s
+                .data
+                .as_ref()
+                .and_then(|d| d.codex.as_ref())
+                .map(|u| &u.weekly);
+            let codex_session_used = render_cell(
+                s.codex_session_state,
+                codex_session,
+                DisplayBasis::UsedPercentage,
+                strings,
+            );
+            let codex_weekly_used = render_cell(
+                s.codex_weekly_state,
+                codex_weekly,
+                DisplayBasis::UsedPercentage,
+                strings,
+            );
+
+            let antigravity_session = s
+                .data
+                .as_ref()
+                .and_then(|d| d.antigravity.as_ref())
+                .map(|u| &u.session);
+            let antigravity_weekly = s
+                .data
+                .as_ref()
+                .and_then(|d| d.antigravity.as_ref())
+                .map(|u| &u.weekly);
+            let antigravity_session_used = render_cell(
+                s.antigravity_session_state,
+                antigravity_session,
+                DisplayBasis::UsedPercentage,
+                strings,
+            );
+            let antigravity_weekly_used = render_cell(
+                s.antigravity_weekly_state,
+                antigravity_weekly,
+                DisplayBasis::UsedPercentage,
+                strings,
+            );
+
             let mut icons = Vec::new();
             if s.show_claude_code {
                 icons.push(tray_icon::TrayIconData {
                     kind: tray_icon::TrayIconKind::Claude,
-                    percent: Some(s.session_percent),
+                    percent: claude_session_used.bar_percent,
                     tooltip: format!(
-                        "{} 5h: {} | 7d: {}",
-                        s.language.strings().claude_code_model,
-                        s.session_text,
-                        s.weekly_text
+                        "{} | {} | 5h: {} | 7d: {}",
+                        strings.claude_code_model,
+                        strings.used_percentage,
+                        claude_session_used.text,
+                        claude_weekly_used.text,
                     ),
                 });
             }
             if s.show_codex {
                 icons.push(tray_icon::TrayIconData {
                     kind: tray_icon::TrayIconKind::Codex,
-                    percent: Some(s.codex_session_percent),
+                    percent: codex_session_used.bar_percent,
                     tooltip: format!(
-                        "{} 5h: {} | 7d: {}",
-                        s.language.strings().codex_model,
-                        s.codex_session_text,
-                        s.codex_weekly_text
+                        "{} | {} | 5h: {} | 7d: {}",
+                        strings.codex_model,
+                        strings.used_percentage,
+                        codex_session_used.text,
+                        codex_weekly_used.text,
                     ),
                 });
             }
             if s.show_antigravity {
                 icons.push(tray_icon::TrayIconData {
                     kind: tray_icon::TrayIconKind::Antigravity,
-                    percent: Some(s.antigravity_session_percent),
+                    percent: antigravity_session_used.bar_percent,
                     tooltip: format!(
-                        "{} 5h: {} | 7d: {}",
-                        s.language.strings().antigravity_model,
-                        s.antigravity_session_text,
-                        s.antigravity_weekly_text
+                        "{} | {} | 5h: {} | 7d: {}",
+                        strings.antigravity_model,
+                        strings.used_percentage,
+                        antigravity_session_used.text,
+                        antigravity_weekly_used.text,
                     ),
                 });
             }
@@ -683,44 +989,73 @@ fn schedule_auto_update_check(hwnd: HWND) {
     }
 }
 
+/// Recompute the bar-fill value and display text for every cell from the
+/// currently cached poll data (`state.data`), each cell's already-determined
+/// `CellState` (set only by `do_poll`, untouched here), the current display
+/// basis, and the current language. Safe to call on a countdown tick, a
+/// display-basis change, or a language change — none of those change what
+/// data is available, only how it should be shown right now. A non-`Ok`
+/// cell's `section` lookup is irrelevant (`render_cell` ignores it), which
+/// is what keeps a stale cached percentage from ever being drawn once a
+/// poll has marked that cell as failed/loading/unavailable.
 fn refresh_usage_texts(state: &mut AppState) {
-    if !state.last_poll_ok {
-        return;
-    }
-
     let strings = state.language.strings();
-    let Some(data) = state.data.as_ref() else {
-        return;
-    };
+    let basis = state.display_basis;
+    let data = state.data.as_ref();
 
-    if let Some(claude_code) = data.claude_code.as_ref() {
-        state.session_text = poller::format_line(&claude_code.session, strings);
-        state.weekly_text = poller::format_line(&claude_code.weekly, strings);
-    } else if state.show_claude_code {
-        state.session_text = "!".to_string();
-        state.weekly_text = "!".to_string();
-    }
+    let claude_code = data.and_then(|d| d.claude_code.as_ref());
+    let session = render_cell(
+        state.session_state,
+        claude_code.map(|u| &u.session),
+        basis,
+        strings,
+    );
+    state.session_percent = session.bar_percent;
+    state.session_text = session.text;
+    let weekly = render_cell(
+        state.weekly_state,
+        claude_code.map(|u| &u.weekly),
+        basis,
+        strings,
+    );
+    state.weekly_percent = weekly.bar_percent;
+    state.weekly_text = weekly.text;
 
-    if let Some(codex) = data.codex.as_ref() {
-        state.codex_session_text = poller::format_line(&codex.session, strings);
-        state.codex_weekly_text = poller::format_line(&codex.weekly, strings);
-    } else if state.show_codex {
-        state.codex_session_text = "!".to_string();
-        state.codex_weekly_text = "!".to_string();
-    }
+    let codex = data.and_then(|d| d.codex.as_ref());
+    let codex_session = render_cell(
+        state.codex_session_state,
+        codex.map(|u| &u.session),
+        basis,
+        strings,
+    );
+    state.codex_session_percent = codex_session.bar_percent;
+    state.codex_session_text = codex_session.text;
+    let codex_weekly = render_cell(
+        state.codex_weekly_state,
+        codex.map(|u| &u.weekly),
+        basis,
+        strings,
+    );
+    state.codex_weekly_percent = codex_weekly.bar_percent;
+    state.codex_weekly_text = codex_weekly.text;
 
-    if let Some(antigravity) = data.antigravity.as_ref() {
-        state.antigravity_session_text = poller::format_line(&antigravity.session, strings);
-        state.antigravity_weekly_text =
-            if antigravity.weekly.resets_at.is_none() && antigravity.weekly.percentage == 0.0 {
-                "--".to_string()
-            } else {
-                poller::format_line(&antigravity.weekly, strings)
-            };
-    } else if state.show_antigravity {
-        state.antigravity_session_text = "!".to_string();
-        state.antigravity_weekly_text = "!".to_string();
-    }
+    let antigravity = data.and_then(|d| d.antigravity.as_ref());
+    let antigravity_session = render_cell(
+        state.antigravity_session_state,
+        antigravity.map(|u| &u.session),
+        basis,
+        strings,
+    );
+    state.antigravity_session_percent = antigravity_session.bar_percent;
+    state.antigravity_session_text = antigravity_session.text;
+    let antigravity_weekly = render_cell(
+        state.antigravity_weekly_state,
+        antigravity.map(|u| &u.weekly),
+        basis,
+        strings,
+    );
+    state.antigravity_weekly_percent = antigravity_weekly.bar_percent;
+    state.antigravity_weekly_text = antigravity_weekly.text;
 }
 
 fn set_window_title(hwnd: HWND, strings: Strings) {
@@ -1114,10 +1449,31 @@ const DIVIDER_RIGHT_MARGIN: i32 = 10;
 const LABEL_WIDTH: i32 = 18;
 const LABEL_RIGHT_MARGIN: i32 = 10;
 const BAR_RIGHT_MARGIN: i32 = 4;
-const TEXT_WIDTH: i32 = 62;
+/// Wide enough for the longest expected per-cell value+reset text — 3-digit
+/// percent + " · " + reset-in word + countdown, no display-basis prefix
+/// (that now lives once in the header row instead of on every cell). Worst
+/// case measured against the actual localized `reset_in`/`day_suffix`
+/// strings shipped in `src/localization/*.rs`: Japanese
+/// "100% · リセットまで 7日" ≈ "100%"(~28px) + " · "(~14px) +
+/// "リセットまで"(6 full-width glyphs ≈78px) + " "(~4px) + "7日"(~20px) ≈ 144px
+/// at Segoe UI 12px (≈7px/Latin glyph, ≈13px/CJK full-width glyph). 160px
+/// leaves a ~16px margin for other languages. This is a character-count
+/// calculation, not a live GDI measurement (see completion report for why);
+/// it has not been visually verified on this machine (no runtime access
+/// here) and needs a home-PC check across all 11 languages.
+const TEXT_WIDTH: i32 = 160;
 const MODEL_RIGHT_MARGIN: i32 = 3;
 const RIGHT_MARGIN: i32 = 1;
-const WIDGET_HEIGHT: i32 = 46;
+/// Height of each of the two header text rows (display-basis label, then
+/// provider names) added above the existing 5h/7d bar rows.
+const HEADER_ROW_H: i32 = 14;
+/// 3px top margin + HEADER_ROW_H (basis label) + 2px + HEADER_ROW_H
+/// (provider names) + 4px + SEGMENT_H (5h row) + 10px + SEGMENT_H (7d row)
+/// + 5px bottom margin = 3+14+2+14+4+13+10+13+5 = 78. The 5h/7d row height
+/// and the 10px gap between them are unchanged from before this feature;
+/// only the two header rows and their margins are new. Not visually
+/// verified on this machine — see completion report.
+const WIDGET_HEIGHT: i32 = 78;
 
 fn is_drag_handle_point(client_x: i32, client_y: i32) -> bool {
     let divider_h = sc(25);
@@ -1152,9 +1508,7 @@ fn row_bar_segment_count(active_models: i32) -> i32 {
 
 fn total_widget_width_for(active_models: i32) -> i32 {
     let bar_segments = row_bar_segment_count(active_models);
-    let model_width = (sc(SEGMENT_W) + sc(SEGMENT_GAP)) * bar_segments - sc(SEGMENT_GAP)
-        + sc(BAR_RIGHT_MARGIN)
-        + sc(TEXT_WIDTH);
+    let model_width = model_usage_width(bar_segments);
 
     sc(LEFT_DIVIDER_W)
         + sc(DIVIDER_RIGHT_MARGIN)
@@ -1353,18 +1707,25 @@ pub fn run() {
                 language_override,
                 language,
                 install_channel,
-                session_percent: 0.0,
-                session_text: "--".to_string(),
-                weekly_percent: 0.0,
-                weekly_text: "--".to_string(),
-                codex_session_percent: 0.0,
-                codex_session_text: "--".to_string(),
-                codex_weekly_percent: 0.0,
-                codex_weekly_text: "--".to_string(),
-                antigravity_session_percent: 0.0,
-                antigravity_session_text: "--".to_string(),
-                antigravity_weekly_percent: 0.0,
-                antigravity_weekly_text: "--".to_string(),
+                display_basis: settings.display_basis,
+                session_state: CellState::Loading,
+                session_percent: None,
+                session_text: String::new(),
+                weekly_state: CellState::Loading,
+                weekly_percent: None,
+                weekly_text: String::new(),
+                codex_session_state: CellState::Loading,
+                codex_session_percent: None,
+                codex_session_text: String::new(),
+                codex_weekly_state: CellState::Loading,
+                codex_weekly_percent: None,
+                codex_weekly_text: String::new(),
+                antigravity_session_state: CellState::Loading,
+                antigravity_session_percent: None,
+                antigravity_session_text: String::new(),
+                antigravity_weekly_state: CellState::Loading,
+                antigravity_weekly_percent: None,
+                antigravity_weekly_text: String::new(),
                 show_claude_code: settings.show_claude_code,
                 show_codex: settings.show_codex,
                 show_antigravity: settings.show_antigravity,
@@ -1387,6 +1748,9 @@ pub fn run() {
                 widget_visible: settings.widget_visible,
                 always_on_top: settings.always_on_top,
             });
+            if let Some(s) = state.as_mut() {
+                refresh_usage_texts(s);
+            }
         }
 
         // Locate the taskbar to anchor the popup against; this does not
@@ -1472,6 +1836,7 @@ fn render_layered() {
         is_dark,
         embedded,
         strings,
+        display_basis,
         session_pct,
         session_text,
         weekly_pct,
@@ -1495,6 +1860,7 @@ fn render_layered() {
                 s.is_dark,
                 s.embedded,
                 s.language.strings(),
+                s.display_basis,
                 s.session_percent,
                 s.session_text.clone(),
                 s.weekly_percent,
@@ -1590,6 +1956,7 @@ fn render_layered() {
             &accent,
             &track,
             strings,
+            display_basis,
             session_pct,
             &session_text,
             weekly_pct,
@@ -1666,17 +2033,18 @@ fn paint_content(
     accent: &Color,
     track: &Color,
     strings: Strings,
-    session_pct: f64,
+    display_basis: DisplayBasis,
+    session_pct: Option<f64>,
     session_text: &str,
-    weekly_pct: f64,
+    weekly_pct: Option<f64>,
     weekly_text: &str,
-    codex_session_pct: f64,
+    codex_session_pct: Option<f64>,
     codex_session_text: &str,
-    codex_weekly_pct: f64,
+    codex_weekly_pct: Option<f64>,
     codex_weekly_text: &str,
-    antigravity_session_pct: f64,
+    antigravity_session_pct: Option<f64>,
     antigravity_session_text: &str,
-    antigravity_weekly_pct: f64,
+    antigravity_weekly_pct: Option<f64>,
     antigravity_weekly_text: &str,
     show_claude_code: bool,
     show_codex: bool,
@@ -1736,6 +2104,8 @@ fn paint_content(
         let content_x = sc(LEFT_DIVIDER_W) + sc(DIVIDER_RIGHT_MARGIN);
         let row2_y = height - sc(5) - sc(SEGMENT_H);
         let row1_y = row2_y - sc(10) - sc(SEGMENT_H);
+        let provider_header_y = row1_y - sc(4) - sc(HEADER_ROW_H);
+        let basis_label_y = provider_header_y - sc(2) - sc(HEADER_ROW_H);
 
         let _ = SetBkMode(hdc, TRANSPARENT);
         let _ = SetTextColor(hdc, COLORREF(text_color.to_colorref()));
@@ -1758,6 +2128,29 @@ fn paint_content(
             PCWSTR::from_raw(font_name.as_ptr()),
         );
         let old_font = SelectObject(hdc, font);
+
+        let basis_label = match display_basis {
+            DisplayBasis::UsedPercentage => strings.used_percentage,
+            DisplayBasis::RemainingAllowance => strings.remaining_allowance,
+        };
+        draw_basis_label_row(
+            hdc,
+            content_x,
+            basis_label_y,
+            width - sc(RIGHT_MARGIN),
+            text_color,
+            basis_label,
+        );
+        draw_provider_header_row(
+            hdc,
+            content_x,
+            provider_header_y,
+            text_color,
+            strings,
+            show_claude_code,
+            show_codex,
+            show_antigravity,
+        );
 
         draw_row(
             hdc,
@@ -1825,27 +2218,21 @@ fn do_poll(send_hwnd: SendHwnd) {
 
             let mut state = lock_state();
             if let Some(s) = state.as_mut() {
-                if let Some(claude_code) = data.claude_code.as_ref() {
-                    s.session_percent = claude_code.session.percentage;
-                    s.weekly_percent = claude_code.weekly.percentage;
-                } else if s.show_claude_code {
-                    s.session_percent = 0.0;
-                    s.weekly_percent = 0.0;
-                }
-                if let Some(codex) = data.codex.as_ref() {
-                    s.codex_session_percent = codex.session.percentage;
-                    s.codex_weekly_percent = codex.weekly.percentage;
-                } else if s.show_codex {
-                    s.codex_session_percent = 0.0;
-                    s.codex_weekly_percent = 0.0;
-                }
-                if let Some(antigravity) = data.antigravity.as_ref() {
-                    s.antigravity_session_percent = antigravity.session.percentage;
-                    s.antigravity_weekly_percent = antigravity.weekly.percentage;
-                } else if s.show_antigravity {
-                    s.antigravity_session_percent = 0.0;
-                    s.antigravity_weekly_percent = 0.0;
-                }
+                // Classify availability straight from this poll's outcome for
+                // every provider (not just the ones that succeeded): a
+                // provider that failed this round while others succeeded
+                // must not keep showing its old percentage as current.
+                let (session_state, weekly_state) = poll_cell_states(&report.claude_code);
+                s.session_state = session_state;
+                s.weekly_state = weekly_state;
+                let (codex_session_state, codex_weekly_state) = poll_cell_states(&report.codex);
+                s.codex_session_state = codex_session_state;
+                s.codex_weekly_state = codex_weekly_state;
+                let (antigravity_session_state, antigravity_weekly_state) =
+                    poll_cell_states(&report.antigravity);
+                s.antigravity_session_state = antigravity_session_state;
+                s.antigravity_weekly_state = antigravity_weekly_state;
+
                 // Stop fast-poll if reset data is now fresh
                 if !poller::app_is_past_reset(&data) {
                     unsafe {
@@ -1853,7 +2240,7 @@ fn do_poll(send_hwnd: SendHwnd) {
                     }
                 }
 
-                s.data = Some(data);
+                merge_successful_providers(&mut s.data, &report);
                 s.last_poll_ok = true;
                 refresh_usage_texts(s);
 
@@ -1901,6 +2288,31 @@ fn do_poll(send_hwnd: SendHwnd) {
                 let mut should_notify = false;
                 if let Some(s) = state.as_mut() {
                     s.last_poll_ok = false;
+
+                    // The whole poll failed, but classify per-provider from
+                    // `report` anyway (Disabled/Error only here): this
+                    // distinguishes NotConfigured/FetchFailed/Retrying per
+                    // provider instead of collapsing everything into one
+                    // generic error word, and `refresh_usage_texts` below
+                    // reads these states to keep the bar unfilled rather
+                    // than leaving the last successful percentage on screen.
+                    let (session_state, weekly_state) = poll_cell_states(&report.claude_code);
+                    s.session_state = session_state;
+                    s.weekly_state = weekly_state;
+                    let (codex_session_state, codex_weekly_state) = poll_cell_states(&report.codex);
+                    s.codex_session_state = codex_session_state;
+                    s.codex_weekly_state = codex_weekly_state;
+                    let (antigravity_session_state, antigravity_weekly_state) =
+                        poll_cell_states(&report.antigravity);
+                    s.antigravity_session_state = antigravity_session_state;
+                    s.antigravity_weekly_state = antigravity_weekly_state;
+                    // No-op in practice today (a total-failure `report` never
+                    // contains a `Success` outcome), but keeps this branch
+                    // using the exact same update path as the success branch
+                    // instead of relying on that invariant.
+                    merge_successful_providers(&mut s.data, &report);
+                    refresh_usage_texts(s);
+
                     match auth_watch {
                         Some((watch_mode, watch_snapshot)) => {
                             // Only show the balloon on the first failure so it doesn't spam.
@@ -1911,12 +2323,6 @@ fn do_poll(send_hwnd: SendHwnd) {
                             s.auth_error_paused_polling = true;
                             s.auth_watch_mode = watch_mode;
                             s.auth_watch_snapshot = watch_snapshot;
-                            s.session_text = "!".to_string();
-                            s.weekly_text = "!".to_string();
-                            s.codex_session_text = "!".to_string();
-                            s.codex_weekly_text = "!".to_string();
-                            s.antigravity_session_text = "!".to_string();
-                            s.antigravity_weekly_text = "!".to_string();
                             s.retry_count = s.retry_count.saturating_add(1);
                             unsafe {
                                 let _ = KillTimer(hwnd, TIMER_POLL);
@@ -1931,12 +2337,6 @@ fn do_poll(send_hwnd: SendHwnd) {
                             s.auth_error_paused_polling = false;
                             s.auth_watch_mode = poller::CredentialWatchMode::ActiveSource;
                             s.auth_watch_snapshot.clear();
-                            s.session_text = "...".to_string();
-                            s.weekly_text = "...".to_string();
-                            s.codex_session_text = "...".to_string();
-                            s.codex_weekly_text = "...".to_string();
-                            s.antigravity_session_text = "...".to_string();
-                            s.antigravity_weekly_text = "...".to_string();
                             s.retry_count = s.retry_count.saturating_add(1);
                             let backoff = RETRY_BASE_MS.saturating_mul(
                                 1u32.checked_shl(s.retry_count - 1).unwrap_or(u32::MAX),
@@ -2609,10 +3009,13 @@ unsafe extern "system" fn wnd_proc(
                     {
                         let mut state = lock_state();
                         if let Some(s) = state.as_mut() {
-                            s.session_text = "...".to_string();
-                            s.weekly_text = "...".to_string();
-                            s.codex_session_text = "...".to_string();
-                            s.codex_weekly_text = "...".to_string();
+                            s.session_state = CellState::Loading;
+                            s.weekly_state = CellState::Loading;
+                            s.codex_session_state = CellState::Loading;
+                            s.codex_weekly_state = CellState::Loading;
+                            s.antigravity_session_state = CellState::Loading;
+                            s.antigravity_weekly_state = CellState::Loading;
+                            refresh_usage_texts(s);
                             s.force_notify_auth_error = true;
                         }
                     }
@@ -2693,6 +3096,23 @@ unsafe extern "system" fn wnd_proc(
                         apply_always_on_top(hwnd, always_on_top);
                     }
                 }
+                IDM_DISPLAY_BASIS_USED | IDM_DISPLAY_BASIS_REMAINING => {
+                    let new_basis = if id == IDM_DISPLAY_BASIS_USED {
+                        DisplayBasis::UsedPercentage
+                    } else {
+                        DisplayBasis::RemainingAllowance
+                    };
+                    {
+                        let mut state = lock_state();
+                        if let Some(s) = state.as_mut() {
+                            s.display_basis = new_basis;
+                            refresh_usage_texts(s);
+                        }
+                    }
+                    save_state_settings();
+                    render_layered();
+                    sync_tray_icons(hwnd);
+                }
                 IDM_FREQ_1MIN | IDM_FREQ_5MIN | IDM_FREQ_15MIN | IDM_FREQ_1HOUR => {
                     let new_interval = match id {
                         IDM_FREQ_1MIN => POLL_1_MIN,
@@ -2728,12 +3148,13 @@ unsafe extern "system" fn wnd_proc(
                                 }
                                 _ => {}
                             }
-                            s.session_text = "...".to_string();
-                            s.weekly_text = "...".to_string();
-                            s.codex_session_text = "...".to_string();
-                            s.codex_weekly_text = "...".to_string();
-                            s.antigravity_session_text = "...".to_string();
-                            s.antigravity_weekly_text = "...".to_string();
+                            s.session_state = CellState::Loading;
+                            s.weekly_state = CellState::Loading;
+                            s.codex_session_state = CellState::Loading;
+                            s.codex_weekly_state = CellState::Loading;
+                            s.antigravity_session_state = CellState::Loading;
+                            s.antigravity_weekly_state = CellState::Loading;
+                            refresh_usage_texts(s);
                         }
                     }
                     save_state_settings();
@@ -2753,12 +3174,13 @@ unsafe extern "system" fn wnd_proc(
                             if s.show_claude_code || s.show_codex || !s.show_antigravity {
                                 s.show_antigravity = !s.show_antigravity;
                             }
-                            s.session_text = "...".to_string();
-                            s.weekly_text = "...".to_string();
-                            s.codex_session_text = "...".to_string();
-                            s.codex_weekly_text = "...".to_string();
-                            s.antigravity_session_text = "...".to_string();
-                            s.antigravity_weekly_text = "...".to_string();
+                            s.session_state = CellState::Loading;
+                            s.weekly_state = CellState::Loading;
+                            s.codex_session_state = CellState::Loading;
+                            s.codex_weekly_state = CellState::Loading;
+                            s.antigravity_session_state = CellState::Loading;
+                            s.antigravity_weekly_state = CellState::Loading;
+                            refresh_usage_texts(s);
                         }
                     }
                     save_state_settings();
@@ -2855,6 +3277,7 @@ fn show_context_menu(hwnd: HWND) {
             show_claude_code,
             show_codex,
             show_antigravity,
+            display_basis,
         ) = {
             let state = lock_state();
             match state.as_ref() {
@@ -2870,6 +3293,7 @@ fn show_context_menu(hwnd: HWND) {
                     s.show_claude_code,
                     s.show_codex,
                     s.show_antigravity,
+                    s.display_basis,
                 ),
                 None => (
                     POLL_15_MIN,
@@ -2883,6 +3307,7 @@ fn show_context_menu(hwnd: HWND) {
                     true,
                     false,
                     false,
+                    DisplayBasis::default(),
                 ),
             }
         };
@@ -3067,6 +3492,44 @@ fn show_context_menu(hwnd: HWND) {
             PCWSTR::from_raw(language_label.as_ptr()),
         );
 
+        // Display basis submenu: mutually exclusive, radio-style, same
+        // pattern as the language submenu above.
+        let display_basis_menu = CreatePopupMenu().unwrap();
+
+        let used_percentage_str = native_interop::wide_str(strings.used_percentage);
+        let used_percentage_flags = if display_basis == DisplayBasis::UsedPercentage {
+            MF_CHECKED
+        } else {
+            MENU_ITEM_FLAGS(0)
+        };
+        let _ = AppendMenuW(
+            display_basis_menu,
+            used_percentage_flags,
+            IDM_DISPLAY_BASIS_USED as usize,
+            PCWSTR::from_raw(used_percentage_str.as_ptr()),
+        );
+
+        let remaining_allowance_str = native_interop::wide_str(strings.remaining_allowance);
+        let remaining_allowance_flags = if display_basis == DisplayBasis::RemainingAllowance {
+            MF_CHECKED
+        } else {
+            MENU_ITEM_FLAGS(0)
+        };
+        let _ = AppendMenuW(
+            display_basis_menu,
+            remaining_allowance_flags,
+            IDM_DISPLAY_BASIS_REMAINING as usize,
+            PCWSTR::from_raw(remaining_allowance_str.as_ptr()),
+        );
+
+        let display_basis_label = native_interop::wide_str(strings.usage_display_basis);
+        let _ = AppendMenuW(
+            settings_menu,
+            MF_POPUP,
+            display_basis_menu.0 as usize,
+            PCWSTR::from_raw(display_basis_label.as_ptr()),
+        );
+
         #[cfg(feature = "self-update")]
         {
             let _ = AppendMenuW(settings_menu, MF_SEPARATOR, 0, PCWSTR::null());
@@ -3134,6 +3597,7 @@ fn paint(hdc: HDC, hwnd: HWND) {
     let (
         is_dark,
         strings,
+        display_basis,
         session_pct,
         session_text,
         weekly_pct,
@@ -3155,6 +3619,7 @@ fn paint(hdc: HDC, hwnd: HWND) {
             Some(s) => (
                 s.is_dark,
                 s.language.strings(),
+                s.display_basis,
                 s.session_percent,
                 s.session_text.clone(),
                 s.weekly_percent,
@@ -3218,6 +3683,7 @@ fn paint(hdc: HDC, hwnd: HWND) {
             &accent,
             &track,
             strings,
+            display_basis,
             session_pct,
             &session_text,
             weekly_pct,
@@ -3245,6 +3711,89 @@ fn paint(hdc: HDC, hwnd: HWND) {
     }
 }
 
+/// Draws the provider-name header row: one text label per active provider
+/// column, aligned with the same `model_x` positions `draw_row` uses for its
+/// bars, so a provider is identifiable by its full localized name rather
+/// than by accent color or an invented abbreviation.
+fn draw_provider_header_row(
+    hdc: HDC,
+    x: i32,
+    y: i32,
+    text_color: &Color,
+    strings: Strings,
+    show_claude_code: bool,
+    show_codex: bool,
+    show_antigravity: bool,
+) {
+    let active_models = active_model_count(show_claude_code, show_codex, show_antigravity);
+    let segment_count = row_bar_segment_count(active_models);
+    let column_width = model_usage_width(segment_count);
+
+    unsafe {
+        let _ = SetTextColor(hdc, COLORREF(text_color.to_colorref()));
+        let mut model_x = x + sc(LABEL_WIDTH) + sc(LABEL_RIGHT_MARGIN);
+        if show_claude_code {
+            draw_header_label(hdc, model_x, y, column_width, strings.claude_code_model);
+            model_x += column_width + sc(MODEL_RIGHT_MARGIN);
+        }
+        if show_codex {
+            draw_header_label(hdc, model_x, y, column_width, strings.codex_model);
+            model_x += column_width + sc(MODEL_RIGHT_MARGIN);
+        }
+        if show_antigravity {
+            draw_header_label(hdc, model_x, y, column_width, strings.antigravity_model);
+        }
+    }
+}
+
+fn draw_header_label(hdc: HDC, x: i32, y: i32, width: i32, label: &str) {
+    unsafe {
+        let mut label_wide: Vec<u16> = label.encode_utf16().collect();
+        let mut label_rect = RECT {
+            left: x,
+            top: y,
+            right: x + width,
+            bottom: y + sc(HEADER_ROW_H),
+        };
+        let _ = DrawTextW(
+            hdc,
+            &mut label_wide,
+            &mut label_rect,
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE,
+        );
+    }
+}
+
+/// Draws the display-basis label ("Used %" / "Remaining Allowance", already
+/// resolved by the caller) spanning the full row width. It sits above the
+/// provider-name header row and isn't column-constrained, since it applies
+/// to every column at once rather than identifying a single provider.
+fn draw_basis_label_row(
+    hdc: HDC,
+    x: i32,
+    y: i32,
+    right_edge: i32,
+    text_color: &Color,
+    label: &str,
+) {
+    unsafe {
+        let _ = SetTextColor(hdc, COLORREF(text_color.to_colorref()));
+        let mut label_wide: Vec<u16> = label.encode_utf16().collect();
+        let mut label_rect = RECT {
+            left: x,
+            top: y,
+            right: right_edge,
+            bottom: y + sc(HEADER_ROW_H),
+        };
+        let _ = DrawTextW(
+            hdc,
+            &mut label_wide,
+            &mut label_rect,
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE,
+        );
+    }
+}
+
 fn draw_row(
     hdc: HDC,
     x: i32,
@@ -3252,11 +3801,11 @@ fn draw_row(
     is_dark: bool,
     text_color: &Color,
     label: &str,
-    claude_percent: f64,
+    claude_percent: Option<f64>,
     claude_text: &str,
-    codex_percent: f64,
+    codex_percent: Option<f64>,
     codex_text: &str,
-    antigravity_percent: f64,
+    antigravity_percent: Option<f64>,
     antigravity_text: &str,
     show_claude_code: bool,
     show_codex: bool,
@@ -3353,12 +3902,18 @@ fn model_usage_width(segment_count: i32) -> i32 {
         + sc(TEXT_WIDTH)
 }
 
+/// `percent` is `None` for any cell without a real current value (loading,
+/// error, unconfigured, not-available). In that case no segment — neither
+/// filled nor empty track — is drawn, so the bar area is left blank rather
+/// than rendering what would look like an ordinary 0% bar; the status word
+/// in `text` is the only thing shown for that cell. This is the one place
+/// `CellDisplay::bar_percent` actually reaches the screen.
 fn draw_usage_bar(
     hdc: HDC,
     bar_x: i32,
     y: i32,
     segment_count: i32,
-    percent: f64,
+    percent: Option<f64>,
     text: &str,
     accent: &Color,
     track: &Color,
@@ -3370,50 +3925,52 @@ fn draw_usage_bar(
     let corner_r = sc(CORNER_RADIUS);
 
     unsafe {
-        let percent_clamped = percent.clamp(0.0, 100.0);
-        let segment_percent = 100.0 / segment_count as f64;
+        if let Some(percent) = percent {
+            let percent_clamped = percent.clamp(0.0, 100.0);
+            let segment_percent = 100.0 / segment_count as f64;
 
-        for i in 0..segment_count {
-            let seg_x = bar_x + i * (seg_w + seg_gap);
-            let seg_start = (i as f64) * segment_percent;
-            let seg_end = seg_start + segment_percent;
+            for i in 0..segment_count {
+                let seg_x = bar_x + i * (seg_w + seg_gap);
+                let seg_start = (i as f64) * segment_percent;
+                let seg_end = seg_start + segment_percent;
 
-            let seg_rect = RECT {
-                left: seg_x,
-                top: y,
-                right: seg_x + seg_w,
-                bottom: y + seg_h,
-            };
+                let seg_rect = RECT {
+                    left: seg_x,
+                    top: y,
+                    right: seg_x + seg_w,
+                    bottom: y + seg_h,
+                };
 
-            if percent_clamped >= seg_end {
-                draw_rounded_rect(hdc, &seg_rect, accent, corner_r);
-            } else if percent_clamped <= seg_start {
-                draw_rounded_rect(hdc, &seg_rect, track, corner_r);
-            } else {
-                draw_rounded_rect(hdc, &seg_rect, track, corner_r);
-                let fraction = (percent_clamped - seg_start) / segment_percent;
-                let fill_width = (seg_w as f64 * fraction) as i32;
-                if fill_width > 0 {
-                    let fill_rect = RECT {
-                        left: seg_x,
-                        top: y,
-                        right: seg_x + fill_width,
-                        bottom: y + seg_h,
-                    };
-                    let rgn = CreateRoundRectRgn(
-                        seg_rect.left,
-                        seg_rect.top,
-                        seg_rect.right + 1,
-                        seg_rect.bottom + 1,
-                        corner_r * 2,
-                        corner_r * 2,
-                    );
-                    let _ = SelectClipRgn(hdc, rgn);
-                    let brush = CreateSolidBrush(COLORREF(accent.to_colorref()));
-                    FillRect(hdc, &fill_rect, brush);
-                    let _ = DeleteObject(brush);
-                    let _ = SelectClipRgn(hdc, HRGN::default());
-                    let _ = DeleteObject(rgn);
+                if percent_clamped >= seg_end {
+                    draw_rounded_rect(hdc, &seg_rect, accent, corner_r);
+                } else if percent_clamped <= seg_start {
+                    draw_rounded_rect(hdc, &seg_rect, track, corner_r);
+                } else {
+                    draw_rounded_rect(hdc, &seg_rect, track, corner_r);
+                    let fraction = (percent_clamped - seg_start) / segment_percent;
+                    let fill_width = (seg_w as f64 * fraction) as i32;
+                    if fill_width > 0 {
+                        let fill_rect = RECT {
+                            left: seg_x,
+                            top: y,
+                            right: seg_x + fill_width,
+                            bottom: y + seg_h,
+                        };
+                        let rgn = CreateRoundRectRgn(
+                            seg_rect.left,
+                            seg_rect.top,
+                            seg_rect.right + 1,
+                            seg_rect.bottom + 1,
+                            corner_r * 2,
+                            corner_r * 2,
+                        );
+                        let _ = SelectClipRgn(hdc, rgn);
+                        let brush = CreateSolidBrush(COLORREF(accent.to_colorref()));
+                        FillRect(hdc, &fill_rect, brush);
+                        let _ = DeleteObject(brush);
+                        let _ = SelectClipRgn(hdc, HRGN::default());
+                        let _ = DeleteObject(rgn);
+                    }
                 }
             }
         }
@@ -3562,5 +4119,203 @@ mod tests {
         };
         let value = serde_json::to_value(&settings).expect("settings should serialize");
         assert_eq!(value["always_on_top"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn display_basis_default_is_used_percentage() {
+        assert_eq!(DisplayBasis::default(), DisplayBasis::UsedPercentage);
+    }
+
+    #[test]
+    fn display_value_used_percentage_passes_through() {
+        assert_eq!(display_value(DisplayBasis::UsedPercentage, 64.0), 64.0);
+    }
+
+    #[test]
+    fn display_value_remaining_allowance_is_the_complement() {
+        assert_eq!(display_value(DisplayBasis::RemainingAllowance, 64.0), 36.0);
+    }
+
+    #[test]
+    fn display_value_clamps_outside_zero_to_hundred() {
+        assert_eq!(display_value(DisplayBasis::UsedPercentage, -5.0), 0.0);
+        assert_eq!(display_value(DisplayBasis::UsedPercentage, 150.0), 100.0);
+        assert_eq!(display_value(DisplayBasis::RemainingAllowance, -5.0), 100.0);
+        assert_eq!(display_value(DisplayBasis::RemainingAllowance, 150.0), 0.0);
+    }
+
+    #[test]
+    fn render_cell_normal_zero_percent_is_some_zero_not_none() {
+        let strings = LanguageId::English.strings();
+        let section = UsageSection {
+            percentage: 0.0,
+            resets_at: None,
+        };
+        let display = render_cell(
+            CellState::Ok,
+            Some(&section),
+            DisplayBasis::UsedPercentage,
+            strings,
+        );
+        // A real 0% must be distinguishable from "no value at all": Some(0.0),
+        // never None, so the bar can legitimately render as empty for a
+        // genuine zero without being confused with a failed/loading cell.
+        assert_eq!(display.bar_percent, Some(0.0));
+    }
+
+    #[test]
+    fn render_cell_non_ok_states_never_produce_a_bar_percent() {
+        let strings = LanguageId::English.strings();
+        for state in [
+            CellState::Loading,
+            CellState::FetchFailed,
+            CellState::Retrying,
+            CellState::NotConfigured,
+            CellState::NotAvailable,
+        ] {
+            let display = render_cell(state, None, DisplayBasis::UsedPercentage, strings);
+            assert_eq!(display.bar_percent, None);
+        }
+    }
+
+    #[test]
+    fn legacy_settings_without_display_basis_default_to_used_percentage() {
+        let settings: SettingsFile =
+            serde_json::from_str("{}").expect("legacy settings should deserialize");
+        assert_eq!(settings.display_basis, DisplayBasis::UsedPercentage);
+    }
+
+    #[test]
+    fn settings_with_unrecognized_display_basis_falls_back_without_failing_the_whole_file() {
+        let settings: SettingsFile =
+            serde_json::from_str(r#"{"display_basis":"some_future_value","tray_offset":7}"#)
+                .expect("an unrecognized display_basis must not fail the whole settings file");
+        assert_eq!(settings.display_basis, DisplayBasis::UsedPercentage);
+        assert_eq!(settings.tray_offset, 7);
+    }
+
+    #[test]
+    fn settings_serialization_uses_snake_case_display_basis() {
+        let settings = SettingsFile {
+            display_basis: DisplayBasis::RemainingAllowance,
+            ..SettingsFile::default()
+        };
+        let value = serde_json::to_value(&settings).expect("settings should serialize");
+        assert_eq!(
+            value["display_basis"],
+            serde_json::json!("remaining_allowance")
+        );
+    }
+
+    #[test]
+    fn countdown_text_is_none_when_resets_at_is_none() {
+        let strings = LanguageId::English.strings();
+        assert_eq!(countdown_text(None, strings), None);
+    }
+
+    #[test]
+    fn countdown_text_uses_now_word_after_reset_has_passed() {
+        let strings = LanguageId::English.strings();
+        let past = SystemTime::now() - Duration::from_secs(5);
+        assert_eq!(
+            countdown_text(Some(past), strings),
+            Some(strings.now.to_string())
+        );
+    }
+
+    #[test]
+    fn countdown_text_just_under_one_hour_shows_minutes() {
+        let strings = LanguageId::English.strings();
+        let reset = SystemTime::now() + Duration::from_secs(3599);
+        let text = countdown_text(Some(reset), strings).unwrap();
+        assert!(text.ends_with(strings.minute_suffix));
+    }
+
+    #[test]
+    fn countdown_text_just_over_one_hour_shows_hours() {
+        let strings = LanguageId::English.strings();
+        let reset = SystemTime::now() + Duration::from_secs(3605);
+        let text = countdown_text(Some(reset), strings).unwrap();
+        assert!(text.ends_with(strings.hour_suffix));
+    }
+
+    fn usage_data_with_session_percent(percentage: f64) -> UsageData {
+        let mut usage = UsageData::default();
+        usage.set_session(UsageSection {
+            percentage,
+            resets_at: None,
+        });
+        usage
+    }
+
+    #[test]
+    fn merge_successful_providers_updates_only_this_polls_successes() {
+        // Previous poll cached Claude at 10% and Codex at 20%.
+        let mut cached: Option<AppUsageData> = Some({
+            let mut data = AppUsageData::default();
+            data.claude_code = Some(usage_data_with_session_percent(10.0));
+            data.codex = Some(usage_data_with_session_percent(20.0));
+            data
+        });
+
+        // This poll: Claude succeeds fresh at 70%, Codex errors (transient).
+        let report = poller::PollReport {
+            claude_code: poller::ProviderPollOutcome::Success {
+                source: poller::ProviderPollSource::AnthropicOauthUsage,
+                attempted_at: SystemTime::now(),
+                acquired_at: SystemTime::now(),
+                usage: usage_data_with_session_percent(70.0),
+            },
+            codex: poller::ProviderPollOutcome::Error {
+                source: poller::ProviderPollSource::ChatgptWhamUsage,
+                attempted_at: SystemTime::now(),
+                error: poller::PollError::RequestFailed,
+            },
+            antigravity: poller::ProviderPollOutcome::Disabled,
+        };
+
+        merge_successful_providers(&mut cached, &report);
+        let merged = cached.expect("merge must not drop the cache");
+        let claude = merged
+            .claude_code
+            .as_ref()
+            .expect("claude succeeded this poll");
+        assert_eq!(claude.session.percentage, 70.0);
+
+        // Codex didn't succeed this poll, so its cache is left as-is (still
+        // the previous 20%) — merge only overwrites providers that actually
+        // succeeded this round.
+        let codex = merged
+            .codex
+            .as_ref()
+            .expect("previous Codex cache should remain untouched by merge");
+        assert_eq!(codex.session.percentage, 20.0);
+
+        // Rendering with the states this same report would produce (as
+        // do_poll does) must show Claude's fresh value, and must never show
+        // a bar for Codex — even though a real (stale) Codex section exists
+        // in the cache and is explicitly passed in here, `CellState::Retrying`
+        // (derived from the same report's `Error` outcome) must make
+        // `render_cell` ignore it rather than display the old 20% as current.
+        let strings = LanguageId::English.strings();
+        let (claude_session_state, _) = poll_cell_states(&report.claude_code);
+        let claude_display = render_cell(
+            claude_session_state,
+            Some(&claude.session),
+            DisplayBasis::UsedPercentage,
+            strings,
+        );
+        assert_eq!(claude_display.bar_percent, Some(70.0));
+
+        let (codex_session_state, _) = poll_cell_states(&report.codex);
+        assert_eq!(codex_session_state, CellState::Retrying);
+        let codex_display = render_cell(
+            codex_session_state,
+            Some(&codex.session),
+            DisplayBasis::UsedPercentage,
+            strings,
+        );
+        assert_eq!(codex_display.bar_percent, None);
+        assert_eq!(codex_display.text, strings.retrying);
     }
 }

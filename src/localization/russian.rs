@@ -48,4 +48,13 @@ pub(super) const STRINGS: Strings = Strings {
     antigravity_token_expired_body: "Откройте Antigravity и войдите снова. После этого обновите или перезапустите приложение.",
     codex_window_title: "Монитор использования Codex",
     antigravity_window_title: "Монитор использования Antigravity",
+    usage_display_basis: "Способ отображения",
+    used_percentage: "Использовано, %",
+    remaining_allowance: "Остаток лимита",
+    reset_in: "Сброс через",
+    loading: "Загрузка",
+    fetch_failed: "Ошибка получения",
+    retrying: "Повтор попытки",
+    not_configured: "Не настроено",
+    not_available: "Недоступно",
 };
