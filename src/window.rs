@@ -4073,23 +4073,23 @@ mod tests {
 
     #[test]
     fn drag_handle_hit_area_includes_x_zero_at_96_dpi() {
-        assert!(is_drag_handle_point(0, 20));
+        assert!(is_drag_handle_point(0, 40));
     }
 
     #[test]
     fn drag_handle_hit_area_includes_x_nine_at_96_dpi() {
-        assert!(is_drag_handle_point(9, 20));
+        assert!(is_drag_handle_point(9, 40));
     }
 
     #[test]
     fn drag_handle_hit_area_excludes_x_ten_at_96_dpi() {
-        assert!(!is_drag_handle_point(10, 20));
+        assert!(!is_drag_handle_point(10, 40));
     }
 
     #[test]
     fn drag_handle_hit_area_excludes_points_outside_vertical_range() {
-        assert!(!is_drag_handle_point(5, 0));
-        assert!(!is_drag_handle_point(5, 40));
+        assert!(!is_drag_handle_point(5, 25));
+        assert!(!is_drag_handle_point(5, 51));
     }
 
     #[test]
