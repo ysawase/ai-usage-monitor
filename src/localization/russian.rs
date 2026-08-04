@@ -16,6 +16,7 @@ pub(super) const STRINGS: Strings = Strings {
     antigravity_model: "Antigravity",
     settings: "Настройки",
     start_with_windows: "Запускать вместе с Windows",
+    always_on_top: "Всегда поверх других окон",
     reset_position: "Сбросить позицию",
     language: "Язык",
     system_default: "Системный по умолчанию",

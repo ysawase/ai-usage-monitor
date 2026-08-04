@@ -1,5 +1,8 @@
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{BOOL, HWND, LPARAM, RECT};
+use windows::Win32::Graphics::Gdi::{
+    GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+};
 use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
 use windows::Win32::UI::Shell::{SHAppBarMessage, ABM_GETTASKBARPOS, APPBARDATA};
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -99,6 +102,23 @@ pub fn get_taskbar_rect(taskbar_hwnd: HWND) -> Option<RECT> {
             return None;
         }
         Some(abd.rc)
+    }
+}
+
+/// Get the work area (screen area excluding taskbars/app bars) of the
+/// monitor nearest to the given window, in virtual-screen coordinates.
+pub fn get_monitor_work_area(hwnd: HWND) -> Option<RECT> {
+    unsafe {
+        let hmonitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        let mut info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if GetMonitorInfoW(hmonitor, &mut info).0 != 0 {
+            Some(info.rcWork)
+        } else {
+            None
+        }
     }
 }
 

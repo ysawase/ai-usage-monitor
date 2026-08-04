@@ -16,6 +16,7 @@ pub(super) const STRINGS: Strings = Strings {
     antigravity_model: "Antigravity",
     settings: "设置",
     start_with_windows: "开机时启动",
+    always_on_top: "始终置顶",
     reset_position: "重置位置",
     language: "语言",
     system_default: "系统默认",

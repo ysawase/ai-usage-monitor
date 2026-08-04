@@ -96,6 +96,7 @@ struct AppState {
     drag_start_offset: i32,
 
     widget_visible: bool,
+    always_on_top: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -120,6 +121,7 @@ const IDM_FREQ_5MIN: u16 = 11;
 const IDM_FREQ_15MIN: u16 = 12;
 const IDM_FREQ_1HOUR: u16 = 13;
 const IDM_START_WITH_WINDOWS: u16 = 20;
+const IDM_ALWAYS_ON_TOP: u16 = 32;
 const IDM_RESET_POSITION: u16 = 30;
 #[cfg(feature = "self-update")]
 const IDM_VERSION_ACTION: u16 = 31;
@@ -189,12 +191,14 @@ const ENV_LAST_RELAUNCH_UNIX: &str = "CCUM_LAST_RELAUNCH_UNIX";
 
 /// Relaunch the widget as a fresh process after explorer.exe has restarted.
 ///
-/// When the shell restarts it destroys our embedded child window outright (the
-/// window is gone, not merely orphaned - `IsWindow` returns false) and leaves
-/// the UI thread parked in `GetMessage` with no window to recreate in place.
-/// Spawning a clean new process - which re-embeds into the freshly created
-/// taskbar - and exiting this one is the robust recovery. The child is flagged
-/// via `ENV_RELAUNCH` so it waits for this instance's single-instance mutex to
+/// The popup window itself is top-level and survives an explorer.exe
+/// restart, but the taskbar/tray notification area it was tracking does
+/// not: the system tray icon needs to be re-added, and the taskbar anchor
+/// (used for tray-relative X positioning) needs to be re-resolved against
+/// the freshly created taskbar. Spawning a clean new process - which
+/// re-registers the tray icon and re-selects the taskbar anchor on startup
+/// - is the simplest robust recovery. The child is flagged via
+/// `ENV_RELAUNCH` so it waits for this instance's single-instance mutex to
 /// be released before taking over (see the guard in `run`).
 fn relaunch_self() {
     // Back off if we are relaunching very soon after the relaunch that spawned
@@ -236,10 +240,11 @@ fn relaunch_self() {
 
 /// Detect explorer.exe restarts and recover from them.
 ///
-/// Once explorer destroys the taskbar, our embedded child window is destroyed
-/// and the UI message loop is dead, so recovery cannot happen in-process. This
-/// dedicated thread (independent of the dead message loop) polls the taskbar
-/// handle and, when it changes, relaunches the widget as a fresh process.
+/// When explorer.exe restarts, the old taskbar HWND becomes invalid and a
+/// new one is created; our tray icon registration and taskbar anchor go
+/// stale along with it. This dedicated thread polls the taskbar handle and,
+/// when it changes, relaunches the widget as a fresh process to re-register
+/// the tray icon and re-select the taskbar anchor.
 fn spawn_taskbar_watchdog() {
     std::thread::spawn(move || loop {
         std::thread::sleep(Duration::from_secs(TASKBAR_WATCH_INTERVAL_SECS));
@@ -247,7 +252,7 @@ fn spawn_taskbar_watchdog() {
             let state = lock_state();
             state.as_ref().and_then(|s| s.taskbar_hwnd)
         };
-        // Only relevant once we have embedded into a taskbar at least once.
+        // Only relevant once we have selected a taskbar anchor at least once.
         let Some(old) = stored else {
             continue;
         };
@@ -319,6 +324,8 @@ struct SettingsFile {
     last_update_check_unix: Option<u64>,
     #[serde(default = "default_widget_visible")]
     widget_visible: bool,
+    #[serde(default)]
+    always_on_top: bool,
     #[serde(default = "default_show_claude_code")]
     show_claude_code: bool,
     #[serde(default = "default_show_codex")]
@@ -336,6 +343,7 @@ impl Default for SettingsFile {
             language: None,
             last_update_check_unix: None,
             widget_visible: true,
+            always_on_top: false,
             show_claude_code: true,
             show_codex: false,
             show_antigravity: false,
@@ -401,6 +409,7 @@ fn save_state_settings() {
                 .map(|language| language.code().to_string()),
             last_update_check_unix: s.last_update_check_unix,
             widget_visible: s.widget_visible,
+            always_on_top: s.always_on_top,
             show_claude_code: s.show_claude_code,
             show_codex: s.show_codex,
             show_antigravity: s.show_antigravity,
@@ -485,12 +494,34 @@ fn sync_tray_icons(hwnd: HWND) {
     tray_icon::sync(hwnd, &icons);
 }
 
+/// Apply (or remove) the topmost z-order per the "always on top" preference.
+/// Always explicit about both directions (TOPMOST/NOTOPMOST) so an OFF
+/// preference can't leave a stale topmost z-order in place.
+fn apply_always_on_top(hwnd: HWND, always_on_top: bool) {
+    let insert_after = if always_on_top {
+        HWND_TOPMOST
+    } else {
+        HWND_NOTOPMOST
+    };
+    unsafe {
+        let _ = SetWindowPos(
+            hwnd,
+            insert_after,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        );
+    }
+}
+
 fn toggle_widget_visibility(hwnd: HWND) {
-    let new_visible = {
+    let (new_visible, always_on_top) = {
         let mut state = lock_state();
         if let Some(s) = state.as_mut() {
             s.widget_visible = !s.widget_visible;
-            s.widget_visible
+            (s.widget_visible, s.always_on_top)
         } else {
             return;
         }
@@ -500,6 +531,7 @@ fn toggle_widget_visibility(hwnd: HWND) {
         if new_visible {
             position_at_taskbar();
             let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            apply_always_on_top(hwnd, always_on_top);
             render_layered();
         } else {
             let _ = ShowWindow(hwnd, SW_HIDE);
@@ -507,10 +539,14 @@ fn toggle_widget_visibility(hwnd: HWND) {
     }
 }
 
-fn attach_to_taskbar(hwnd: HWND, requested_index: usize) -> bool {
+/// Locate the taskbar to anchor the top-level popup against (tray-relative
+/// X position, work-area-relative Y position). This does not reparent the
+/// window or change its style - the popup always remains a top-level,
+/// topmost window positioned above the taskbar.
+fn select_taskbar_anchor(requested_index: usize) -> bool {
     let taskbars = native_interop::find_taskbars();
     if taskbars.is_empty() {
-        diagnose::log("taskbar not found; using fallback popup window");
+        diagnose::log("no taskbar found; popup will use its default position");
         return false;
     }
 
@@ -533,8 +569,6 @@ fn attach_to_taskbar(hwnd: HWND, requested_index: usize) -> bool {
     if let Some(hook) = old_hook {
         native_interop::unhook_win_event(hook);
     }
-
-    native_interop::embed_in_taskbar(hwnd, taskbar.hwnd);
 
     let tray_notify = native_interop::find_child_window(taskbar.hwnd, "TrayNotifyWnd");
     if tray_notify.is_some() {
@@ -559,7 +593,6 @@ fn attach_to_taskbar(hwnd: HWND, requested_index: usize) -> bool {
         s.tray_notify_hwnd = tray_notify;
         s.win_event_hook = hook;
         s.taskbar_index = index;
-        s.embedded = true;
     }
     true
 }
@@ -1074,6 +1107,9 @@ const SEGMENT_COUNT: i32 = 10;
 const CORNER_RADIUS: i32 = 2;
 
 const LEFT_DIVIDER_W: i32 = 3;
+/// Wider than the visible divider so the drag handle is easier to grab;
+/// purely a hit-test width, does not affect drawing.
+const DRAG_HANDLE_HIT_W: i32 = 10;
 const DIVIDER_RIGHT_MARGIN: i32 = 10;
 const LABEL_WIDTH: i32 = 18;
 const LABEL_RIGHT_MARGIN: i32 = 10;
@@ -1087,7 +1123,7 @@ fn is_drag_handle_point(client_x: i32, client_y: i32) -> bool {
     let divider_h = sc(25);
     let divider_top = (sc(WIDGET_HEIGHT) - divider_h) / 2;
     client_x >= 0
-        && client_x < sc(LEFT_DIVIDER_W)
+        && client_x < sc(DRAG_HANDLE_HIT_W)
         && client_y >= divider_top
         && client_y < divider_top + divider_h
 }
@@ -1261,7 +1297,7 @@ pub fn run() {
         let language = localization::resolve_language(language_override);
         let install_channel = updater::current_install_channel();
 
-        // Create as layered popup (will be reparented into taskbar)
+        // Create as a top-level layered popup, anchored above the taskbar.
         let title = native_interop::wide_str(language.strings().window_title);
         let initial_model_count = active_model_count(
             settings.show_claude_code,
@@ -1304,7 +1340,6 @@ pub fn run() {
         diagnose::log(format!("main window created hwnd={:?}", hwnd));
 
         let is_dark = theme::is_dark_mode();
-        let mut embedded = false;
 
         {
             let mut state = lock_state();
@@ -1350,27 +1385,19 @@ pub fn run() {
                 drag_start_client_x: 0,
                 drag_start_offset: 0,
                 widget_visible: settings.widget_visible,
+                always_on_top: settings.always_on_top,
             });
         }
 
-        // Try to embed in taskbar
-        if attach_to_taskbar(hwnd, settings.taskbar_index) {
-            embedded = true;
-        }
+        // Locate the taskbar to anchor the popup against; this does not
+        // reparent the window. Regardless of whether a taskbar is found,
+        // the window is always initialized as a top-level popup.
+        select_taskbar_anchor(settings.taskbar_index);
 
-        // If not embedded, fall back to topmost popup with SetLayeredWindowAttributes
-        if !embedded {
-            let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA);
-            let _ = SetWindowPos(
-                hwnd,
-                HWND_TOPMOST,
-                0,
-                0,
-                0,
-                0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-            );
-        }
+        let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA);
+        // Explicitly apply NOTOPMOST (not just skip TOPMOST) when the saved
+        // preference is off, so no stale topmost z-order can linger.
+        apply_always_on_top(hwnd, settings.always_on_top);
 
         // Register system tray icon(s)
         sync_tray_icons(hwnd);
@@ -1395,11 +1422,10 @@ pub fn run() {
         };
         SetTimer(hwnd, TIMER_POLL, initial_poll_ms, None);
 
-        // Watch for explorer.exe restarts so we can re-embed and re-add the tray
-        // icon (the shell discards tray registrations when it restarts). This
-        // runs on a dedicated thread, NOT a window timer: once explorer destroys
-        // the taskbar, our embedded child window stops receiving all messages
-        // (WM_TIMER included), so a timer would never fire again.
+        // Watch for explorer.exe restarts so we can re-add the tray icon and
+        // re-select the taskbar anchor (the shell discards tray registrations
+        // when it restarts). Runs on a dedicated thread, independent of the
+        // window's own message loop.
         spawn_taskbar_watchdog();
 
         // Initial poll
@@ -2136,7 +2162,7 @@ fn position_at_taskbar() {
     refresh_dpi();
     // Drop the app-state lock before any Win32 call that may synchronously
     // re-enter our window procedure.
-    let (hwnd, embedded, tray_offset, taskbar_hwnd) = {
+    let (hwnd, tray_offset, taskbar_hwnd) = {
         let state = lock_state();
         let s = match state.as_ref() {
             Some(s) => s,
@@ -2156,7 +2182,7 @@ fn position_at_taskbar() {
             }
         };
 
-        (s.hwnd.to_hwnd(), s.embedded, s.tray_offset, taskbar_hwnd)
+        (s.hwnd.to_hwnd(), s.tray_offset, taskbar_hwnd)
     };
 
     let taskbar_rect = match native_interop::get_taskbar_rect(taskbar_hwnd) {
@@ -2167,10 +2193,18 @@ fn position_at_taskbar() {
         }
     };
 
-    let taskbar_height = taskbar_rect.bottom - taskbar_rect.top;
+    // The popup's usable bounds: the monitor's work area (screen minus the
+    // taskbar), so the popup never overlaps the taskbar. If the work area
+    // can't be queried, fall back to "everything above the taskbar,
+    // unbounded at the top" rather than treating it as (0, 0).
+    let work_area = native_interop::get_monitor_work_area(taskbar_hwnd).unwrap_or(RECT {
+        left: taskbar_rect.left,
+        top: i32::MIN / 2,
+        right: taskbar_rect.right,
+        bottom: taskbar_rect.top,
+    });
+
     let mut tray_left = taskbar_rect.right;
-    let anchor_top = taskbar_rect.top;
-    let anchor_height = taskbar_height;
 
     if let Some(tray_hwnd) = native_interop::find_child_window(taskbar_hwnd, "TrayNotifyWnd") {
         if let Some(tray_rect) = native_interop::get_window_rect_safe(tray_hwnd) {
@@ -2199,28 +2233,36 @@ fn position_at_taskbar() {
     }
 
     let widget_height = sc(WIDGET_HEIGHT);
-    let y = compute_anchor_y(anchor_top, anchor_height, widget_height);
-    if embedded {
-        // Child window: coordinates relative to parent (taskbar)
-        let x = tray_left - taskbar_rect.left - widget_width - tray_offset;
-        native_interop::move_window(hwnd, x, y - taskbar_rect.top, widget_width, widget_height);
-        diagnose::log(format!(
-            "positioned embedded widget at x={x} y={} w={widget_width} h={widget_height}",
-            y - taskbar_rect.top
-        ));
-    } else {
-        // Topmost popup: screen coordinates
-        let x = tray_left - widget_width - tray_offset;
-        native_interop::move_window(hwnd, x, y, widget_width, widget_height);
-        diagnose::log(format!(
-            "positioned fallback widget at x={x} y={y} w={widget_width} h={widget_height}"
-        ));
-    }
+    let y = compute_popup_y(work_area.top, work_area.bottom, widget_height);
+    let desired_x = tray_left - widget_width - tray_offset;
+    let x = clamp_popup_x(desired_x, work_area.left, work_area.right, widget_width);
+    native_interop::move_window(hwnd, x, y, widget_width, widget_height);
+    diagnose::log(format!(
+        "positioned popup at x={x} y={y} w={widget_width} h={widget_height}"
+    ));
 }
 
-fn compute_anchor_y(anchor_top: i32, anchor_height: i32, widget_height: i32) -> i32 {
-    let anchor_bottom = anchor_top + anchor_height;
-    (anchor_bottom - widget_height).max(anchor_top)
+/// Compute the popup's top-left Y so its bottom edge sits flush with
+/// `work_area_bottom` (the taskbar's top edge, for a bottom-docked
+/// taskbar), extending upward into the work area. If the popup is taller
+/// than the work area itself, `work_area_top` wins (the popup may then
+/// extend past `work_area_bottom` as an unavoidable last resort - there is
+/// no space above the taskbar tall enough to fit it).
+fn compute_popup_y(work_area_top: i32, work_area_bottom: i32, popup_height: i32) -> i32 {
+    (work_area_bottom - popup_height).max(work_area_top)
+}
+
+/// Clamp the popup's desired X so it stays within the work area
+/// horizontally. If the popup is wider than the work area itself,
+/// `work_area_left` wins (mirrors `compute_popup_y`'s last-resort rule).
+fn clamp_popup_x(
+    desired_x: i32,
+    work_area_left: i32,
+    work_area_right: i32,
+    popup_width: i32,
+) -> i32 {
+    let max_x = (work_area_right - popup_width).max(work_area_left);
+    desired_x.clamp(work_area_left, max_x)
 }
 
 /// WinEvent callback for tray icon location changes
@@ -2458,7 +2500,6 @@ unsafe extern "system" fn wnd_proc(
                     }
 
                     let taskbar_hwnd = s.taskbar_hwnd;
-                    let embedded = s.embedded;
                     let hwnd_val = s.hwnd.to_hwnd();
 
                     // Clamp: don't go past left edge of taskbar
@@ -2482,25 +2523,23 @@ unsafe extern "system" fn wnd_proc(
 
                             s.tray_offset = new_offset;
 
-                            let taskbar_height = taskbar_rect.bottom - taskbar_rect.top;
-                            let anchor_top = taskbar_rect.top;
-                            let anchor_height = taskbar_height;
+                            let work_area = native_interop::get_monitor_work_area(taskbar_hwnd)
+                                .unwrap_or(RECT {
+                                    left: taskbar_rect.left,
+                                    top: i32::MIN / 2,
+                                    right: taskbar_rect.right,
+                                    bottom: taskbar_rect.top,
+                                });
                             let widget_height = sc(WIDGET_HEIGHT);
-                            let y = compute_anchor_y(anchor_top, anchor_height, widget_height);
-                            let x = if embedded {
-                                tray_left - taskbar_rect.left - widget_width - new_offset
-                            } else {
-                                tray_left - widget_width - new_offset
-                            };
-                            Some((
-                                hwnd_val,
-                                embedded,
-                                x,
-                                y,
-                                taskbar_rect.top,
+                            let y = compute_popup_y(work_area.top, work_area.bottom, widget_height);
+                            let desired_x = tray_left - widget_width - new_offset;
+                            let x = clamp_popup_x(
+                                desired_x,
+                                work_area.left,
+                                work_area.right,
                                 widget_width,
-                                widget_height,
-                            ))
+                            );
+                            Some((hwnd_val, x, y, widget_width, widget_height))
                         } else {
                             s.tray_offset = new_offset;
                             None
@@ -2511,20 +2550,8 @@ unsafe extern "system" fn wnd_proc(
                     }
                 };
 
-                if let Some((hwnd_val, embedded, x, y, taskbar_top, widget_width, widget_height)) =
-                    move_target
-                {
-                    if embedded {
-                        native_interop::move_window(
-                            hwnd_val,
-                            x,
-                            y - taskbar_top,
-                            widget_width,
-                            widget_height,
-                        );
-                    } else {
-                        native_interop::move_window(hwnd_val, x, y, widget_width, widget_height);
-                    }
+                if let Some((hwnd_val, x, y, widget_width, widget_height)) = move_target {
+                    native_interop::move_window(hwnd_val, x, y, widget_width, widget_height);
                 }
             }
             LRESULT(0)
@@ -2561,7 +2588,7 @@ unsafe extern "system" fn wnd_proc(
                                 s.tray_offset = new_offset;
                             }
                         }
-                        if attach_to_taskbar(hwnd, target_index) {
+                        if select_taskbar_anchor(target_index) {
                             position_at_taskbar();
                             render_layered();
                         }
@@ -2650,6 +2677,21 @@ unsafe extern "system" fn wnd_proc(
                 }
                 IDM_START_WITH_WINDOWS => {
                     set_startup_enabled(!is_startup_enabled());
+                }
+                IDM_ALWAYS_ON_TOP => {
+                    let always_on_top = {
+                        let mut state = lock_state();
+                        if let Some(s) = state.as_mut() {
+                            s.always_on_top = !s.always_on_top;
+                            Some(s.always_on_top)
+                        } else {
+                            None
+                        }
+                    };
+                    if let Some(always_on_top) = always_on_top {
+                        save_state_settings();
+                        apply_always_on_top(hwnd, always_on_top);
+                    }
                 }
                 IDM_FREQ_1MIN | IDM_FREQ_5MIN | IDM_FREQ_15MIN | IDM_FREQ_1HOUR => {
                     let new_interval = match id {
@@ -2809,6 +2851,7 @@ fn show_context_menu(hwnd: HWND) {
             install_channel,
             update_status,
             widget_visible,
+            always_on_top,
             show_claude_code,
             show_codex,
             show_antigravity,
@@ -2823,6 +2866,7 @@ fn show_context_menu(hwnd: HWND) {
                     s.install_channel,
                     s.update_status.clone(),
                     s.widget_visible,
+                    s.always_on_top,
                     s.show_claude_code,
                     s.show_codex,
                     s.show_antigravity,
@@ -2835,6 +2879,7 @@ fn show_context_menu(hwnd: HWND) {
                     InstallChannel::Portable,
                     UpdateStatus::Idle,
                     true,
+                    false,
                     true,
                     false,
                     false,
@@ -2949,6 +2994,19 @@ fn show_context_menu(hwnd: HWND) {
             startup_flags,
             IDM_START_WITH_WINDOWS as usize,
             PCWSTR::from_raw(startup_str.as_ptr()),
+        );
+
+        let always_on_top_str = native_interop::wide_str(strings.always_on_top);
+        let always_on_top_flags = if always_on_top {
+            MF_CHECKED
+        } else {
+            MENU_ITEM_FLAGS(0)
+        };
+        let _ = AppendMenuW(
+            settings_menu,
+            always_on_top_flags,
+            IDM_ALWAYS_ON_TOP as usize,
+            PCWSTR::from_raw(always_on_top_str.as_ptr()),
         );
 
         let reset_pos_str = native_interop::wide_str(strings.reset_position);
@@ -3392,5 +3450,117 @@ fn draw_rounded_rect(hdc: HDC, rect: &RECT, color: &Color, radius: i32) {
         let _ = FillRgn(hdc, rgn, brush);
         let _ = DeleteObject(rgn);
         let _ = DeleteObject(brush);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn popup_sits_above_a_normal_bottom_taskbar() {
+        // work area 0..1040, popup height 46
+        assert_eq!(compute_popup_y(0, 1040, 46), 994);
+    }
+
+    #[test]
+    fn popup_sits_above_a_small_bottom_taskbar() {
+        // work area 0..1050 (taskbar shorter than the popup itself)
+        assert_eq!(compute_popup_y(0, 1050, 46), 1004);
+    }
+
+    #[test]
+    fn popup_y_is_correct_on_a_negative_coordinate_monitor() {
+        // e.g. a secondary monitor positioned above/left of the primary
+        assert_eq!(compute_popup_y(-1040, -40, 46), -86);
+    }
+
+    #[test]
+    fn popup_taller_than_work_area_clamps_to_work_area_top() {
+        // Physically cannot fit above the taskbar; work_area_top wins as a
+        // last resort, even though the popup then extends past
+        // work_area_bottom (unavoidable given the height constraint).
+        let y = compute_popup_y(1030, 1040, 46);
+        assert_eq!(y, 1030);
+    }
+
+    #[test]
+    fn popup_bottom_never_exceeds_work_area_bottom_in_normal_cases() {
+        for (top, bottom, height) in [(0, 1040, 46), (0, 1050, 46), (-1040, -40, 46)] {
+            let y = compute_popup_y(top, bottom, height);
+            assert!(y + height <= bottom);
+        }
+    }
+
+    #[test]
+    fn popup_x_within_work_area_is_unchanged() {
+        assert_eq!(clamp_popup_x(500, 0, 1920, 300), 500);
+    }
+
+    #[test]
+    fn popup_x_clamps_to_left_edge_of_work_area() {
+        assert_eq!(clamp_popup_x(-50, 0, 1920, 300), 0);
+    }
+
+    #[test]
+    fn popup_x_clamps_to_right_edge_of_work_area() {
+        assert_eq!(clamp_popup_x(1800, 0, 1920, 300), 1620);
+    }
+
+    #[test]
+    fn popup_wider_than_work_area_clamps_to_left_without_panicking() {
+        // popup_width (2000) > work area width (1920): must not panic on
+        // clamp(min, max) with min > max, and must fall back to the left edge.
+        assert_eq!(clamp_popup_x(500, 0, 1920, 2000), 0);
+    }
+
+    #[test]
+    fn drag_handle_hit_area_includes_x_zero_at_96_dpi() {
+        assert!(is_drag_handle_point(0, 20));
+    }
+
+    #[test]
+    fn drag_handle_hit_area_includes_x_nine_at_96_dpi() {
+        assert!(is_drag_handle_point(9, 20));
+    }
+
+    #[test]
+    fn drag_handle_hit_area_excludes_x_ten_at_96_dpi() {
+        assert!(!is_drag_handle_point(10, 20));
+    }
+
+    #[test]
+    fn drag_handle_hit_area_excludes_points_outside_vertical_range() {
+        assert!(!is_drag_handle_point(5, 0));
+        assert!(!is_drag_handle_point(5, 40));
+    }
+
+    #[test]
+    fn settings_default_has_always_on_top_disabled() {
+        assert!(!SettingsFile::default().always_on_top);
+    }
+
+    #[test]
+    fn settings_without_always_on_top_field_defaults_to_false() {
+        let settings: SettingsFile =
+            serde_json::from_str("{}").expect("legacy settings should deserialize");
+        assert!(!settings.always_on_top);
+    }
+
+    #[test]
+    fn settings_with_always_on_top_true_deserializes_true() {
+        let settings: SettingsFile =
+            serde_json::from_str(r#"{"always_on_top":true}"#).expect("settings should deserialize");
+        assert!(settings.always_on_top);
+    }
+
+    #[test]
+    fn settings_serialization_includes_always_on_top() {
+        let settings = SettingsFile {
+            always_on_top: true,
+            ..SettingsFile::default()
+        };
+        let value = serde_json::to_value(&settings).expect("settings should serialize");
+        assert_eq!(value["always_on_top"], serde_json::json!(true));
     }
 }

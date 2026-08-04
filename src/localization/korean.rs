@@ -16,6 +16,7 @@ pub(super) const STRINGS: Strings = Strings {
     antigravity_model: "Antigravity",
     settings: "설정",
     start_with_windows: "Windows 시작 시 자동 실행",
+    always_on_top: "항상 위에 표시",
     reset_position: "위치 초기화",
     language: "언어",
     system_default: "시스템 기본값",

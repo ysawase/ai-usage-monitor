@@ -16,6 +16,7 @@ pub(super) const STRINGS: Strings = Strings {
     antigravity_model: "Antigravity",
     settings: "Paramètres",
     start_with_windows: "Démarrer avec Windows",
+    always_on_top: "Toujours au premier plan",
     reset_position: "Réinitialiser la position",
     language: "Langue",
     system_default: "Par défaut du système",
