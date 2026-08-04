@@ -309,6 +309,208 @@ fn merge_successful_providers(data: &mut Option<AppUsageData>, report: &poller::
     }
 }
 
+// ── Weekly pace guidance (AUM-PACE-GUIDANCE-01) ───────────────────────────
+//
+// This section is pure logic only: no popup drawing, settings, or
+// localization are wired to it yet.
+
+/// Fixed window durations. `UsageSection` only carries `percentage` and an
+/// absolute `resets_at`, never a window start time, so pace/guidance math
+/// treats these as constants — the same assumption the existing "5h"/"7d"
+/// row labels already make for every provider.
+const SESSION_WINDOW_SECS: u64 = 5 * 3600;
+const WEEKLY_WINDOW_SECS: u64 = 7 * 24 * 3600;
+
+/// How far past a window's nominal length `resets_at` is still trusted as
+/// "the window just started" (elapsed = 0) rather than rejected outright.
+/// Covers small clock/poll skew between client and server without
+/// pretending to know a real elapsed time beyond the window boundary.
+const WINDOW_TIME_TOLERANCE_SECS: u64 = 5 * 60;
+
+/// Below this much elapsed time into the window, pace is considered too
+/// noisy to judge.
+const PACE_JUDGING_MIN_ELAPSED_SECS: u64 = 6 * 3600;
+/// pace_diff (used% − elapsed%) boundaries, in percentage points.
+const PACE_UNDER_PACE_MAX_PT: f64 = -10.0;
+const PACE_ON_TRACK_MAX_PT: f64 = 10.0;
+const PACE_SLIGHTLY_OVER_MAX_PT: f64 = 25.0;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WeeklyPaceStatus {
+    Judging,
+    UnderPace,
+    OnTrack,
+    SlightlyOverpacing,
+    Overpacing,
+}
+
+/// Seconds remaining until `resets_at`, or `None` if it's missing or already
+/// past (can't safely derive elapsed/remaining from a stale or absent reset).
+fn remaining_secs_at(resets_at: Option<SystemTime>, now: SystemTime) -> Option<u64> {
+    let reset = resets_at?;
+    reset.duration_since(now).ok().map(|d| d.as_secs())
+}
+
+/// Elapsed time into a fixed-length window, derived from time remaining
+/// until reset:
+/// - `remaining_secs <= window_secs`: the ordinary case.
+/// - up to `WINDOW_TIME_TOLERANCE_SECS` past `window_secs`: treated as
+///   elapsed = 0 (the window just started; small clock/poll skew).
+/// - beyond that tolerance: `None` — not a value a real window can produce,
+///   so no elapsed time is guessed.
+fn elapsed_secs_in_window(remaining_secs: u64, window_secs: u64) -> Option<u64> {
+    if remaining_secs <= window_secs {
+        return Some(window_secs - remaining_secs);
+    }
+    let tolerated_max = window_secs.saturating_add(WINDOW_TIME_TOLERANCE_SECS);
+    if remaining_secs <= tolerated_max {
+        return Some(0);
+    }
+    None
+}
+
+/// `pace_diff = used% − elapsed%`, judged against fixed point-boundaries.
+/// Always resolves to a concrete status (`Judging` included) given valid
+/// elapsed/window/used inputs; callers gate on missing/unsafe reset data
+/// themselves (via `remaining_secs_at`/`elapsed_secs_in_window`) before ever
+/// calling this.
+fn weekly_pace_status(elapsed_secs: u64, window_secs: u64, used_percent: f64) -> WeeklyPaceStatus {
+    if window_secs == 0 || elapsed_secs < PACE_JUDGING_MIN_ELAPSED_SECS {
+        return WeeklyPaceStatus::Judging;
+    }
+    let elapsed_fraction = (elapsed_secs as f64 / window_secs as f64).clamp(0.0, 1.0);
+    let pace_diff = used_percent.clamp(0.0, 100.0) - elapsed_fraction * 100.0;
+
+    if pace_diff <= PACE_UNDER_PACE_MAX_PT {
+        WeeklyPaceStatus::UnderPace
+    } else if pace_diff <= PACE_ON_TRACK_MAX_PT {
+        WeeklyPaceStatus::OnTrack
+    } else if pace_diff <= PACE_SLIGHTLY_OVER_MAX_PT {
+        WeeklyPaceStatus::SlightlyOverpacing
+    } else {
+        WeeklyPaceStatus::Overpacing
+    }
+}
+
+/// Below this much time left, guidance switches from "%/day" to "%/hour".
+/// Remaining time only ever counts down within a window (it jumps back up
+/// once, at reset, to a fresh window) so this threshold is crossed at most
+/// once per window — not something that flaps back and forth on its own.
+const FUTURE_PACE_HOURLY_THRESHOLD_SECS: u64 = 24 * 3600;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FuturePaceUnit {
+    PerDay,
+    PerHour,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct FuturePaceGuidance {
+    value: f64,
+    unit: FuturePaceUnit,
+}
+
+/// "Remaining allowance ÷ time left", regardless of the user's chosen
+/// display basis — this is a budget/burn-rate figure ("how much room is
+/// left, spread over how much time is left"), not a restatement of the
+/// current value, so it does not flip with `DisplayBasis`.
+fn future_pace_guidance(used_percent: f64, remaining_secs: u64) -> Option<FuturePaceGuidance> {
+    if remaining_secs == 0 {
+        return None;
+    }
+    let remaining_percent = (100.0 - used_percent.clamp(0.0, 100.0)).max(0.0);
+    if remaining_secs < FUTURE_PACE_HOURLY_THRESHOLD_SECS {
+        let remaining_hours = remaining_secs as f64 / 3600.0;
+        Some(FuturePaceGuidance {
+            value: remaining_percent / remaining_hours,
+            unit: FuturePaceUnit::PerHour,
+        })
+    } else {
+        let remaining_days = remaining_secs as f64 / 86400.0;
+        Some(FuturePaceGuidance {
+            value: remaining_percent / remaining_days,
+            unit: FuturePaceUnit::PerDay,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ShortWindowAlertSensitivity {
+    Sensitive,
+    Standard,
+    Relaxed,
+}
+
+impl Default for ShortWindowAlertSensitivity {
+    fn default() -> Self {
+        ShortWindowAlertSensitivity::Standard
+    }
+}
+
+struct ShortWindowAlertThresholds {
+    grace_secs: u64,
+    min_used_percent: f64,
+    exhaustion_lead_secs: u64,
+}
+
+impl ShortWindowAlertSensitivity {
+    fn thresholds(self) -> ShortWindowAlertThresholds {
+        match self {
+            ShortWindowAlertSensitivity::Sensitive => ShortWindowAlertThresholds {
+                grace_secs: 20 * 60,
+                min_used_percent: 30.0,
+                exhaustion_lead_secs: 30 * 60,
+            },
+            ShortWindowAlertSensitivity::Standard => ShortWindowAlertThresholds {
+                grace_secs: 30 * 60,
+                min_used_percent: 40.0,
+                exhaustion_lead_secs: 45 * 60,
+            },
+            ShortWindowAlertSensitivity::Relaxed => ShortWindowAlertThresholds {
+                grace_secs: 45 * 60,
+                min_used_percent: 50.0,
+                exhaustion_lead_secs: 75 * 60,
+            },
+        }
+    }
+}
+
+/// True only when all three conditions hold: past the grace period, past
+/// the minimum used%, and — projecting the current average pace
+/// (`used% / elapsed`) linearly forward — 100% is reached with at least
+/// `exhaustion_lead_secs` to spare before the actual reset (boundary
+/// inclusive throughout: `>=`, not `>`). Division is only reached once
+/// `used > 0.0` is established; `used >= 100.0` is handled directly
+/// (already exhausted, so overpacing iff at least `exhaustion_lead_secs`
+/// remain in the window) without going through the projection at all.
+fn short_window_is_overpacing(
+    elapsed_secs: u64,
+    remaining_secs: u64,
+    used_percent: f64,
+    sensitivity: ShortWindowAlertSensitivity,
+) -> bool {
+    let t = sensitivity.thresholds();
+
+    if elapsed_secs < t.grace_secs {
+        return false;
+    }
+    let used = used_percent.clamp(0.0, 100.0);
+    if used < t.min_used_percent {
+        return false;
+    }
+    if used >= 100.0 {
+        return remaining_secs >= t.exhaustion_lead_secs;
+    }
+
+    let secs_to_exhaustion = (100.0 - used) * elapsed_secs as f64 / used;
+    if !secs_to_exhaustion.is_finite() || secs_to_exhaustion < 0.0 {
+        return false;
+    }
+
+    (remaining_secs as f64 - secs_to_exhaustion) >= t.exhaustion_lead_secs as f64
+}
+
 const RETRY_BASE_MS: u32 = 30_000; // 30 seconds
 
 const POLL_1_MIN: u32 = 60_000;
@@ -4317,5 +4519,305 @@ mod tests {
         );
         assert_eq!(codex_display.bar_percent, None);
         assert_eq!(codex_display.text, strings.retrying);
+    }
+
+    // ── remaining_secs_at ──────────────────────────────────────────────
+
+    #[test]
+    fn remaining_secs_at_is_none_without_resets_at() {
+        assert_eq!(remaining_secs_at(None, SystemTime::now()), None);
+    }
+
+    #[test]
+    fn remaining_secs_at_is_none_when_reset_is_in_the_past() {
+        let now = SystemTime::now();
+        let past = now - Duration::from_secs(5);
+        assert_eq!(remaining_secs_at(Some(past), now), None);
+    }
+
+    #[test]
+    fn remaining_secs_at_is_zero_when_reset_is_exactly_now() {
+        let now = SystemTime::now();
+        assert_eq!(remaining_secs_at(Some(now), now), Some(0));
+    }
+
+    // ── elapsed_secs_in_window ─────────────────────────────────────────
+
+    #[test]
+    fn elapsed_secs_in_window_at_exact_window_length_is_zero() {
+        assert_eq!(
+            elapsed_secs_in_window(WEEKLY_WINDOW_SECS, WEEKLY_WINDOW_SECS),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn elapsed_secs_in_window_within_tolerance_past_window_length_is_zero() {
+        assert_eq!(
+            elapsed_secs_in_window(
+                WEEKLY_WINDOW_SECS + WINDOW_TIME_TOLERANCE_SECS,
+                WEEKLY_WINDOW_SECS
+            ),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn elapsed_secs_in_window_beyond_tolerance_is_none() {
+        assert_eq!(
+            elapsed_secs_in_window(
+                WEEKLY_WINDOW_SECS + WINDOW_TIME_TOLERANCE_SECS + 1,
+                WEEKLY_WINDOW_SECS
+            ),
+            None
+        );
+    }
+
+    // ── weekly_pace_status ─────────────────────────────────────────────
+
+    #[test]
+    fn weekly_pace_status_before_judging_window_is_judging() {
+        assert_eq!(
+            weekly_pace_status(PACE_JUDGING_MIN_ELAPSED_SECS - 1, WEEKLY_WINDOW_SECS, 50.0),
+            WeeklyPaceStatus::Judging
+        );
+    }
+
+    #[test]
+    fn weekly_pace_status_at_judging_boundary_exits_judging() {
+        assert_ne!(
+            weekly_pace_status(PACE_JUDGING_MIN_ELAPSED_SECS, WEEKLY_WINDOW_SECS, 0.0),
+            WeeklyPaceStatus::Judging
+        );
+    }
+
+    #[test]
+    fn weekly_pace_status_under_pace_boundary() {
+        let elapsed = WEEKLY_WINDOW_SECS / 2; // elapsed% = 50
+        let used_at_boundary = 50.0 + PACE_UNDER_PACE_MAX_PT; // pace_diff == -10.0
+        assert_eq!(
+            weekly_pace_status(elapsed, WEEKLY_WINDOW_SECS, used_at_boundary),
+            WeeklyPaceStatus::UnderPace
+        );
+        assert_eq!(
+            weekly_pace_status(elapsed, WEEKLY_WINDOW_SECS, used_at_boundary + 0.1),
+            WeeklyPaceStatus::OnTrack
+        );
+    }
+
+    #[test]
+    fn weekly_pace_status_on_track_upper_boundary() {
+        let elapsed = WEEKLY_WINDOW_SECS / 2;
+        let used_at_boundary = 50.0 + PACE_ON_TRACK_MAX_PT; // pace_diff == 10.0
+        assert_eq!(
+            weekly_pace_status(elapsed, WEEKLY_WINDOW_SECS, used_at_boundary),
+            WeeklyPaceStatus::OnTrack
+        );
+        assert_eq!(
+            weekly_pace_status(elapsed, WEEKLY_WINDOW_SECS, used_at_boundary + 0.1),
+            WeeklyPaceStatus::SlightlyOverpacing
+        );
+    }
+
+    #[test]
+    fn weekly_pace_status_slightly_overpacing_upper_boundary() {
+        let elapsed = WEEKLY_WINDOW_SECS / 2;
+        let used_at_boundary = 50.0 + PACE_SLIGHTLY_OVER_MAX_PT; // pace_diff == 25.0
+        assert_eq!(
+            weekly_pace_status(elapsed, WEEKLY_WINDOW_SECS, used_at_boundary),
+            WeeklyPaceStatus::SlightlyOverpacing
+        );
+        assert_eq!(
+            weekly_pace_status(elapsed, WEEKLY_WINDOW_SECS, used_at_boundary + 0.1),
+            WeeklyPaceStatus::Overpacing
+        );
+    }
+
+    #[test]
+    fn weekly_pace_status_used_zero_percent() {
+        let elapsed = WEEKLY_WINDOW_SECS / 2;
+        assert_eq!(
+            weekly_pace_status(elapsed, WEEKLY_WINDOW_SECS, 0.0),
+            WeeklyPaceStatus::UnderPace
+        );
+    }
+
+    #[test]
+    fn weekly_pace_status_used_hundred_percent() {
+        let elapsed = WEEKLY_WINDOW_SECS / 2;
+        assert_eq!(
+            weekly_pace_status(elapsed, WEEKLY_WINDOW_SECS, 100.0),
+            WeeklyPaceStatus::Overpacing
+        );
+    }
+
+    // ── future_pace_guidance ───────────────────────────────────────────
+
+    #[test]
+    fn future_pace_guidance_uses_per_day_at_or_above_threshold() {
+        let guidance = future_pace_guidance(60.0, FUTURE_PACE_HOURLY_THRESHOLD_SECS)
+            .expect("remaining_secs > 0 must produce guidance");
+        assert_eq!(guidance.unit, FuturePaceUnit::PerDay);
+        assert!((guidance.value - 40.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn future_pace_guidance_uses_per_hour_below_threshold() {
+        let guidance = future_pace_guidance(60.0, FUTURE_PACE_HOURLY_THRESHOLD_SECS - 1)
+            .expect("remaining_secs > 0 must produce guidance");
+        assert_eq!(guidance.unit, FuturePaceUnit::PerHour);
+    }
+
+    #[test]
+    fn future_pace_guidance_is_none_when_remaining_is_zero() {
+        assert_eq!(future_pace_guidance(50.0, 0), None);
+    }
+
+    // ── ShortWindowAlertSensitivity::thresholds ─────────────────────────
+
+    #[test]
+    fn short_window_sensitivity_thresholds_match_spec() {
+        let sensitive = ShortWindowAlertSensitivity::Sensitive.thresholds();
+        assert_eq!(sensitive.grace_secs, 20 * 60);
+        assert_eq!(sensitive.min_used_percent, 30.0);
+        assert_eq!(sensitive.exhaustion_lead_secs, 30 * 60);
+
+        let standard = ShortWindowAlertSensitivity::Standard.thresholds();
+        assert_eq!(standard.grace_secs, 30 * 60);
+        assert_eq!(standard.min_used_percent, 40.0);
+        assert_eq!(standard.exhaustion_lead_secs, 45 * 60);
+
+        let relaxed = ShortWindowAlertSensitivity::Relaxed.thresholds();
+        assert_eq!(relaxed.grace_secs, 45 * 60);
+        assert_eq!(relaxed.min_used_percent, 50.0);
+        assert_eq!(relaxed.exhaustion_lead_secs, 75 * 60);
+    }
+
+    // ── short_window_is_overpacing ───────────────────────────────────────
+
+    #[test]
+    fn short_window_just_before_grace_is_never_overpacing() {
+        let sensitivity = ShortWindowAlertSensitivity::Standard;
+        let t = sensitivity.thresholds();
+        assert!(!short_window_is_overpacing(
+            t.grace_secs - 1,
+            100_000,
+            99.0,
+            sensitivity
+        ));
+    }
+
+    #[test]
+    fn short_window_grace_boundary_allows_evaluation() {
+        let sensitivity = ShortWindowAlertSensitivity::Standard;
+        let t = sensitivity.thresholds();
+        let elapsed = t.grace_secs; // exactly at the grace boundary
+        let used = 50.0;
+        let secs_to_exhaustion = (100.0 - used) * elapsed as f64 / used;
+        let remaining_at_boundary = secs_to_exhaustion as u64 + t.exhaustion_lead_secs;
+
+        assert!(short_window_is_overpacing(
+            elapsed,
+            remaining_at_boundary,
+            used,
+            sensitivity
+        ));
+        assert!(!short_window_is_overpacing(
+            elapsed,
+            remaining_at_boundary - 1,
+            used,
+            sensitivity
+        ));
+    }
+
+    #[test]
+    fn short_window_min_used_percent_boundary() {
+        let sensitivity = ShortWindowAlertSensitivity::Standard;
+        let t = sensitivity.thresholds();
+        let elapsed = t.grace_secs + 100; // comfortably past grace
+
+        assert!(!short_window_is_overpacing(
+            elapsed,
+            100_000,
+            t.min_used_percent - 0.1,
+            sensitivity
+        ));
+
+        let used = t.min_used_percent;
+        let secs_to_exhaustion = (100.0 - used) * elapsed as f64 / used;
+        let remaining = secs_to_exhaustion as u64 + t.exhaustion_lead_secs;
+        assert!(short_window_is_overpacing(
+            elapsed,
+            remaining,
+            used,
+            sensitivity
+        ));
+    }
+
+    #[test]
+    fn short_window_exhaustion_lead_boundary() {
+        let sensitivity = ShortWindowAlertSensitivity::Standard;
+        let t = sensitivity.thresholds();
+        let elapsed = t.grace_secs + 600;
+        let used = 60.0;
+        let secs_to_exhaustion = (100.0 - used) * elapsed as f64 / used;
+        let remaining_at_lead = secs_to_exhaustion as u64 + t.exhaustion_lead_secs;
+
+        assert!(short_window_is_overpacing(
+            elapsed,
+            remaining_at_lead,
+            used,
+            sensitivity
+        ));
+        assert!(!short_window_is_overpacing(
+            elapsed,
+            remaining_at_lead - 1,
+            used,
+            sensitivity
+        ));
+    }
+
+    #[test]
+    fn short_window_hundred_percent_used_lead_boundary() {
+        let sensitivity = ShortWindowAlertSensitivity::Standard;
+        let t = sensitivity.thresholds();
+        let elapsed = t.grace_secs + 1;
+
+        assert!(short_window_is_overpacing(
+            elapsed,
+            t.exhaustion_lead_secs,
+            100.0,
+            sensitivity
+        ));
+        assert!(!short_window_is_overpacing(
+            elapsed,
+            t.exhaustion_lead_secs - 1,
+            100.0,
+            sensitivity
+        ));
+    }
+
+    #[test]
+    fn short_window_each_sensitivity_agrees_with_its_own_thresholds() {
+        for sensitivity in [
+            ShortWindowAlertSensitivity::Sensitive,
+            ShortWindowAlertSensitivity::Standard,
+            ShortWindowAlertSensitivity::Relaxed,
+        ] {
+            let t = sensitivity.thresholds();
+            let elapsed = t.grace_secs + 60;
+            let used = t.min_used_percent + 10.0;
+            let secs_to_exhaustion = (100.0 - used) * elapsed as f64 / used;
+            let remaining_at_boundary = secs_to_exhaustion as u64 + t.exhaustion_lead_secs;
+
+            assert!(
+                short_window_is_overpacing(elapsed, remaining_at_boundary, used, sensitivity),
+                "{sensitivity:?} should be overpacing exactly at its own lead boundary"
+            );
+            assert!(
+                !short_window_is_overpacing(elapsed, remaining_at_boundary - 1, used, sensitivity),
+                "{sensitivity:?} should not be overpacing just inside its own lead boundary"
+            );
+        }
     }
 }
