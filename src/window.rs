@@ -406,17 +406,28 @@ fn elapsed_secs_in_window(remaining_secs: u64, window_secs: u64) -> Option<u64> 
     None
 }
 
-/// `pace_diff = used% − elapsed%`, judged against fixed point-boundaries.
-/// Always resolves to a concrete status (`Judging` included) given valid
-/// elapsed/window/used inputs; callers gate on missing/unsafe reset data
-/// themselves (via `remaining_secs_at`/`elapsed_secs_in_window`) before ever
-/// calling this.
+/// `pace_diff = used% − elapsed%`, in percentage points. `0.0` when
+/// `window_secs` is `0` (never a real window; callers that care already
+/// guard on this before/alongside calling). Exposed separately from
+/// `weekly_pace_status` so the "予定との差" (Detailed density) display can
+/// show the raw point value without recomputing it.
+fn weekly_pace_diff_pt(elapsed_secs: u64, window_secs: u64, used_percent: f64) -> f64 {
+    if window_secs == 0 {
+        return 0.0;
+    }
+    let elapsed_fraction = (elapsed_secs as f64 / window_secs as f64).clamp(0.0, 1.0);
+    used_percent.clamp(0.0, 100.0) - elapsed_fraction * 100.0
+}
+
+/// Judged against fixed point-boundaries. Always resolves to a concrete
+/// status (`Judging` included) given valid elapsed/window/used inputs;
+/// callers gate on missing/unsafe reset data themselves (via
+/// `remaining_secs_at`/`elapsed_secs_in_window`) before ever calling this.
 fn weekly_pace_status(elapsed_secs: u64, window_secs: u64, used_percent: f64) -> WeeklyPaceStatus {
     if window_secs == 0 || elapsed_secs < PACE_JUDGING_MIN_ELAPSED_SECS {
         return WeeklyPaceStatus::Judging;
     }
-    let elapsed_fraction = (elapsed_secs as f64 / window_secs as f64).clamp(0.0, 1.0);
-    let pace_diff = used_percent.clamp(0.0, 100.0) - elapsed_fraction * 100.0;
+    let pace_diff = weekly_pace_diff_pt(elapsed_secs, window_secs, used_percent);
 
     if pace_diff <= PACE_UNDER_PACE_MAX_PT {
         WeeklyPaceStatus::UnderPace
@@ -521,6 +532,25 @@ impl ShortWindowAlertSensitivity {
 /// `used > 0.0` is established; `used >= 100.0` is handled directly
 /// (already exhausted, so overpacing iff at least `exhaustion_lead_secs`
 /// remain in the window) without going through the projection at all.
+/// Linear projection of "how many seconds from now until 100%, if the
+/// current average pace (`used% / elapsed`) continues". `None` when the
+/// projection isn't meaningful/safe: no usage yet or already at/over 100%
+/// (`used` outside `(0, 100)`), no elapsed time to average over, or a
+/// non-finite/negative result (clock skew, bad data). Shared by
+/// `short_window_is_overpacing` (5h alert) and `weekly_exhaustion_lead_secs`
+/// (7d Detailed-density display) so the projection math exists in one place.
+fn projected_secs_to_exhaustion(elapsed_secs: u64, used_percent: f64) -> Option<f64> {
+    let used = used_percent.clamp(0.0, 100.0);
+    if used <= 0.0 || used >= 100.0 || elapsed_secs == 0 {
+        return None;
+    }
+    let secs_to_exhaustion = (100.0 - used) * elapsed_secs as f64 / used;
+    if !secs_to_exhaustion.is_finite() || secs_to_exhaustion < 0.0 {
+        return None;
+    }
+    Some(secs_to_exhaustion)
+}
+
 fn short_window_is_overpacing(
     elapsed_secs: u64,
     remaining_secs: u64,
@@ -540,12 +570,314 @@ fn short_window_is_overpacing(
         return remaining_secs >= t.exhaustion_lead_secs;
     }
 
-    let secs_to_exhaustion = (100.0 - used) * elapsed_secs as f64 / used;
-    if !secs_to_exhaustion.is_finite() || secs_to_exhaustion < 0.0 {
+    let Some(secs_to_exhaustion) = projected_secs_to_exhaustion(elapsed_secs, used_percent) else {
         return false;
-    }
+    };
 
     (remaining_secs as f64 - secs_to_exhaustion) >= t.exhaustion_lead_secs as f64
+}
+
+// ── Pace-guidance display model (AUM-PACE-GUIDANCE-01) ─────────────────────
+//
+// Pure text generation only: no Win32 types, no drawing calls, no
+// `SystemTime::now()` (always taken as a `now` parameter). Not yet wired to
+// `draw_row`/`paint_content` — a later unit passes the finished
+// `PaceGuidanceLines` to drawing code.
+
+fn weekly_pace_status_text(status: WeeklyPaceStatus, strings: Strings) -> &'static str {
+    match status {
+        WeeklyPaceStatus::Judging => strings.weekly_pace_judging,
+        WeeklyPaceStatus::UnderPace => strings.weekly_pace_under_pace,
+        WeeklyPaceStatus::OnTrack => strings.weekly_pace_on_track,
+        WeeklyPaceStatus::SlightlyOverpacing => strings.weekly_pace_slightly_overpacing,
+        WeeklyPaceStatus::Overpacing => strings.weekly_pace_overpacing,
+    }
+}
+
+/// Two-unit duration text (e.g. "2日18時間" / "3時間10分" / "5分30秒"),
+/// reusing the existing day/hour/minute/second suffixes. More precise than
+/// `countdown_text`'s single-largest-unit style, which is intentionally
+/// terse for the existing 5h/7d bar rows this display model doesn't touch.
+fn format_remaining_duration(remaining_secs: u64, strings: Strings) -> String {
+    let days = remaining_secs / 86400;
+    let hours = (remaining_secs % 86400) / 3600;
+    let minutes = (remaining_secs % 3600) / 60;
+    if days >= 1 {
+        format!("{days}{}{hours}{}", strings.day_suffix, strings.hour_suffix)
+    } else if hours >= 1 {
+        format!(
+            "{hours}{}{minutes}{}",
+            strings.hour_suffix, strings.minute_suffix
+        )
+    } else {
+        let seconds = remaining_secs % 60;
+        format!(
+            "{minutes}{}{seconds}{}",
+            strings.minute_suffix, strings.second_suffix
+        )
+    }
+}
+
+/// 10+ as an integer, [1, 10) to one decimal, (0, 1) to two decimals —
+/// keeps small rates (e.g. "0.35%/hour") from collapsing to "0" while
+/// avoiding false precision on larger ones.
+fn format_pace_rate_value(value: f64) -> String {
+    if value >= 10.0 {
+        format!("{value:.0}")
+    } else if value >= 1.0 {
+        format!("{value:.1}")
+    } else {
+        format!("{value:.2}")
+    }
+}
+
+/// `None` for any non-finite or negative value — `future_pace_guidance`
+/// should never actually produce one, but this is the last line of defense
+/// against ever displaying "NaN%/day" or "-3%/day".
+fn format_future_pace_guidance(guidance: &FuturePaceGuidance, strings: Strings) -> Option<String> {
+    if !guidance.value.is_finite() || guidance.value < 0.0 {
+        return None;
+    }
+    let unit_suffix = match guidance.unit {
+        FuturePaceUnit::PerDay => strings.per_day_suffix,
+        FuturePaceUnit::PerHour => strings.per_hour_suffix,
+    };
+    Some(format!(
+        "{}%/{unit_suffix}",
+        format_pace_rate_value(guidance.value)
+    ))
+}
+
+/// "+19pt" / "-12pt" / "0pt". Rounds to whole points and normalizes a
+/// rounded `-0.0` to `0.0` first so a near-zero negative `pace_diff` can
+/// never print as "-0pt". `None` for non-finite input.
+fn format_pace_diff_pt(pace_diff: f64) -> Option<String> {
+    if !pace_diff.is_finite() {
+        return None;
+    }
+    let mut rounded = pace_diff.round();
+    if rounded == 0.0 {
+        rounded = 0.0; // collapses -0.0 to +0.0 (IEEE 754 equality treats them equal)
+    }
+    Some(if rounded > 0.0 {
+        format!("+{rounded:.0}pt")
+    } else {
+        format!("{rounded:.0}pt")
+    })
+}
+
+/// For the Detailed-density weekly line: how long before the actual reset
+/// the window is projected to hit 100%, if the current average pace
+/// continues. `None` whenever this can't be shown safely — before the
+/// pace-judging window opens, at 0% or 100%+ usage (nothing meaningful to
+/// project, or already covered by the "使いすぎ" status word instead), or
+/// when the projected exhaustion would land at/after the reset (not a
+/// "before reset" warning scenario).
+fn weekly_exhaustion_lead_secs(
+    elapsed_secs: u64,
+    remaining_secs: u64,
+    used_percent: f64,
+) -> Option<u64> {
+    if elapsed_secs < PACE_JUDGING_MIN_ELAPSED_SECS {
+        return None;
+    }
+    let secs_to_exhaustion = projected_secs_to_exhaustion(elapsed_secs, used_percent)?;
+    let remaining = remaining_secs as f64;
+    if secs_to_exhaustion >= remaining {
+        return None;
+    }
+    Some((remaining - secs_to_exhaustion).round() as u64)
+}
+
+fn format_exhaustion_text(lead_secs: u64, strings: Strings) -> String {
+    let duration = format_remaining_duration(lead_secs, strings);
+    let before_reset = strings
+        .exhaustion_before_reset
+        .replace("{duration}", &duration);
+    format!("{} {before_reset}", strings.exhaustion_label)
+}
+
+/// A ready-to-draw text block for one usage window's pace-guidance display.
+/// Purely data — no Win32 types, no drawing. `is_warning` flags text that
+/// should be visually distinguished later (currently only ever `true` for
+/// the 5h window's overpacing line); it doesn't change what text is
+/// produced here.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PaceGuidanceLines {
+    primary: String,
+    secondary: Option<String>,
+    detail: Option<String>,
+    is_warning: bool,
+}
+
+fn pace_basis_prefix(basis: DisplayBasis, strings: Strings) -> &'static str {
+    match basis {
+        DisplayBasis::UsedPercentage => strings.pace_used_prefix,
+        DisplayBasis::RemainingAllowance => strings.pace_remaining_prefix,
+    }
+}
+
+/// Builds the weekly (7d) window's pace-guidance display, or `None` when
+/// `used_percent` itself is unknown or non-finite (nothing to show at all —
+/// distinct from a known value with unusable reset data, which still shows
+/// the current value alone). `now` is a parameter, never read internally.
+fn weekly_pace_guidance_lines(
+    used_percent: Option<f64>,
+    resets_at: Option<SystemTime>,
+    now: SystemTime,
+    basis: DisplayBasis,
+    density: DisplayDensity,
+    strings: Strings,
+) -> Option<PaceGuidanceLines> {
+    let used_percent = used_percent?;
+    if !used_percent.is_finite() {
+        return None;
+    }
+    let used_percent = used_percent.clamp(0.0, 100.0);
+
+    let display_pct = display_value(basis, used_percent);
+    let pct_text = format!("{} {display_pct:.0}%", pace_basis_prefix(basis, strings));
+    let window_label = strings.weekly_window_label;
+
+    let remaining_secs = remaining_secs_at(resets_at, now);
+    let elapsed_secs = remaining_secs.and_then(|r| elapsed_secs_in_window(r, WEEKLY_WINDOW_SECS));
+
+    let (Some(remaining_secs), Some(elapsed_secs)) = (remaining_secs, elapsed_secs) else {
+        // Missing/past/out-of-range reset data: current value only,
+        // regardless of density.
+        return Some(PaceGuidanceLines {
+            primary: format!("{window_label} {pct_text}"),
+            secondary: None,
+            detail: None,
+            is_warning: false,
+        });
+    };
+
+    let reset_text = format!(
+        "{} {}",
+        strings.reset_in,
+        format_remaining_duration(remaining_secs, strings)
+    );
+
+    if density == DisplayDensity::Compact {
+        return Some(PaceGuidanceLines {
+            primary: format!("{window_label} {pct_text} \u{00b7} {reset_text}"),
+            secondary: None,
+            detail: None,
+            is_warning: false,
+        });
+    }
+
+    let status = weekly_pace_status(elapsed_secs, WEEKLY_WINDOW_SECS, used_percent);
+    let status_text = weekly_pace_status_text(status, strings);
+    let primary = format!("{window_label} {pct_text} {status_text}");
+
+    let future_pace_text = future_pace_guidance(used_percent, remaining_secs)
+        .and_then(|guidance| format_future_pace_guidance(&guidance, strings));
+    let secondary = Some(match future_pace_text {
+        Some(future_text) => format!(
+            "{reset_text}\u{ff5c}{} {future_text}",
+            strings.future_pace_label
+        ),
+        None => reset_text,
+    });
+
+    if density == DisplayDensity::Standard {
+        return Some(PaceGuidanceLines {
+            primary,
+            secondary,
+            detail: None,
+            is_warning: false,
+        });
+    }
+
+    // Detailed: append the pace-diff and/or exhaustion projection, when
+    // each can be computed safely; omit whichever can't rather than
+    // guessing.
+    let pace_diff = weekly_pace_diff_pt(elapsed_secs, WEEKLY_WINDOW_SECS, used_percent);
+    let diff_text =
+        format_pace_diff_pt(pace_diff).map(|d| format!("{} {d}", strings.pace_diff_label));
+    let exhaustion_text = weekly_exhaustion_lead_secs(elapsed_secs, remaining_secs, used_percent)
+        .map(|lead_secs| format_exhaustion_text(lead_secs, strings));
+
+    let detail = match (diff_text, exhaustion_text) {
+        (Some(d), Some(e)) => Some(format!("{d}\u{ff5c}{e}")),
+        (Some(d), None) => Some(d),
+        (None, Some(e)) => Some(e),
+        (None, None) => None,
+    };
+
+    Some(PaceGuidanceLines {
+        primary,
+        secondary,
+        detail,
+        is_warning: false,
+    })
+}
+
+/// Builds the short (5h) window's pace-guidance display, or `None` when it
+/// should not be shown at all this poll — either `used_percent` is unknown,
+/// `visibility` is `Hidden`, or `visibility` is `WarningOnly` and the window
+/// isn't currently overpacing. Never shows `UnderPace`/`OnTrack`/
+/// `SlightlyOverpacing` wording, matching the "5時間枠には...を表示しない"
+/// requirement — only a plain value, or (when warranted) the same
+/// "使いすぎ"/Overpacing word the weekly line uses.
+fn short_window_pace_guidance_lines(
+    used_percent: Option<f64>,
+    resets_at: Option<SystemTime>,
+    now: SystemTime,
+    basis: DisplayBasis,
+    visibility: ShortWindowVisibility,
+    sensitivity: ShortWindowAlertSensitivity,
+    strings: Strings,
+) -> Option<PaceGuidanceLines> {
+    if visibility == ShortWindowVisibility::Hidden {
+        return None;
+    }
+    let used_percent = used_percent?;
+    if !used_percent.is_finite() {
+        return None;
+    }
+    let used_percent = used_percent.clamp(0.0, 100.0);
+
+    let remaining_secs = remaining_secs_at(resets_at, now);
+    let elapsed_secs = remaining_secs.and_then(|r| elapsed_secs_in_window(r, SESSION_WINDOW_SECS));
+
+    let is_overpacing = match (elapsed_secs, remaining_secs) {
+        (Some(elapsed), Some(remaining)) => {
+            short_window_is_overpacing(elapsed, remaining, used_percent, sensitivity)
+        }
+        _ => false,
+    };
+
+    if visibility == ShortWindowVisibility::WarningOnly && !is_overpacing {
+        return None;
+    }
+
+    let display_pct = display_value(basis, used_percent);
+    let pct_text = format!("{} {display_pct:.0}%", pace_basis_prefix(basis, strings));
+    let status_suffix = if is_overpacing {
+        format!(" {}", strings.weekly_pace_overpacing)
+    } else {
+        String::new()
+    };
+    let window_label = strings.session_window_label;
+
+    let primary = match remaining_secs {
+        Some(remaining) => format!(
+            "{window_label} {pct_text}{status_suffix} \u{00b7} {} {}",
+            strings.reset_in,
+            format_remaining_duration(remaining, strings)
+        ),
+        None => format!("{window_label} {pct_text}{status_suffix}"),
+    };
+
+    Some(PaceGuidanceLines {
+        primary,
+        secondary: None,
+        detail: None,
+        is_warning: is_overpacing,
+    })
 }
 
 const RETRY_BASE_MS: u32 = 30_000; // 30 seconds
@@ -5133,6 +5465,479 @@ mod tests {
             assert!(!strings.short_window_alert_sensitivity_sensitive.is_empty());
             assert!(!strings.short_window_alert_sensitivity_relaxed.is_empty());
         }
+    }
+
+    // ── AUM-PACE-GUIDANCE-01: popup display model (text generation only) ───
+
+    #[test]
+    fn weekly_pace_status_text_maps_each_status() {
+        let strings = LanguageId::English.strings();
+        assert_eq!(
+            weekly_pace_status_text(WeeklyPaceStatus::Judging, strings),
+            strings.weekly_pace_judging
+        );
+        assert_eq!(
+            weekly_pace_status_text(WeeklyPaceStatus::UnderPace, strings),
+            strings.weekly_pace_under_pace
+        );
+        assert_eq!(
+            weekly_pace_status_text(WeeklyPaceStatus::OnTrack, strings),
+            strings.weekly_pace_on_track
+        );
+        assert_eq!(
+            weekly_pace_status_text(WeeklyPaceStatus::SlightlyOverpacing, strings),
+            strings.weekly_pace_slightly_overpacing
+        );
+        assert_eq!(
+            weekly_pace_status_text(WeeklyPaceStatus::Overpacing, strings),
+            strings.weekly_pace_overpacing
+        );
+    }
+
+    #[test]
+    fn all_languages_have_non_empty_pace_guidance_strings() {
+        for language in LanguageId::ALL {
+            let strings = language.strings();
+            assert!(!strings.weekly_pace_judging.is_empty());
+            assert!(!strings.weekly_pace_under_pace.is_empty());
+            assert!(!strings.weekly_pace_on_track.is_empty());
+            assert!(!strings.weekly_pace_slightly_overpacing.is_empty());
+            assert!(!strings.weekly_pace_overpacing.is_empty());
+            assert!(!strings.future_pace_label.is_empty());
+            assert!(!strings.pace_diff_label.is_empty());
+            assert!(!strings.exhaustion_label.is_empty());
+            assert!(!strings.exhaustion_before_reset.is_empty());
+            assert!(!strings.session_window_label.is_empty());
+            assert!(!strings.weekly_window_label.is_empty());
+            assert!(!strings.per_day_suffix.is_empty());
+            assert!(!strings.per_hour_suffix.is_empty());
+            assert!(!strings.pace_used_prefix.is_empty());
+            assert!(!strings.pace_remaining_prefix.is_empty());
+        }
+    }
+
+    #[test]
+    fn weekly_pace_guidance_compact_shows_only_value_and_reset() {
+        let now = SystemTime::now();
+        let elapsed = WEEKLY_WINDOW_SECS / 2;
+        let remaining = WEEKLY_WINDOW_SECS - elapsed;
+        let resets_at = Some(now + Duration::from_secs(remaining));
+        let strings = LanguageId::English.strings();
+
+        let lines = weekly_pace_guidance_lines(
+            Some(69.0),
+            resets_at,
+            now,
+            DisplayBasis::UsedPercentage,
+            DisplayDensity::Compact,
+            strings,
+        )
+        .expect("known value with valid reset data should produce lines");
+
+        assert!(lines.primary.contains("69%"));
+        assert!(lines.primary.contains(strings.reset_in));
+        assert_eq!(lines.secondary, None);
+        assert_eq!(lines.detail, None);
+        assert!(!lines.is_warning);
+    }
+
+    #[test]
+    fn weekly_pace_guidance_standard_shows_status_and_future_pace() {
+        let now = SystemTime::now();
+        let elapsed = WEEKLY_WINDOW_SECS / 2;
+        let remaining = WEEKLY_WINDOW_SECS - elapsed;
+        let resets_at = Some(now + Duration::from_secs(remaining));
+        let strings = LanguageId::English.strings();
+
+        let lines = weekly_pace_guidance_lines(
+            Some(69.0),
+            resets_at,
+            now,
+            DisplayBasis::UsedPercentage,
+            DisplayDensity::Standard,
+            strings,
+        )
+        .expect("known value with valid reset data should produce lines");
+
+        assert!(lines
+            .primary
+            .contains(strings.weekly_pace_slightly_overpacing));
+        let secondary = lines
+            .secondary
+            .expect("standard density should produce a secondary line");
+        assert!(secondary.contains(strings.future_pace_label));
+        assert!(secondary.contains("%/"));
+        assert_eq!(lines.detail, None);
+    }
+
+    #[test]
+    fn weekly_pace_guidance_detailed_shows_pace_diff() {
+        let now = SystemTime::now();
+        let elapsed = WEEKLY_WINDOW_SECS / 2;
+        let remaining = WEEKLY_WINDOW_SECS - elapsed;
+        let resets_at = Some(now + Duration::from_secs(remaining));
+        let strings = LanguageId::English.strings();
+
+        let lines = weekly_pace_guidance_lines(
+            Some(69.0),
+            resets_at,
+            now,
+            DisplayBasis::UsedPercentage,
+            DisplayDensity::Detailed,
+            strings,
+        )
+        .expect("known value with valid reset data should produce lines");
+
+        let detail = lines
+            .detail
+            .expect("detailed density should produce a detail line");
+        assert!(detail.contains(strings.pace_diff_label));
+        assert!(detail.contains("+19pt"));
+    }
+
+    #[test]
+    fn weekly_pace_guidance_detailed_omits_exhaustion_when_projected_after_reset() {
+        let now = SystemTime::now();
+        let elapsed = WEEKLY_WINDOW_SECS / 2;
+        let remaining = WEEKLY_WINDOW_SECS - elapsed;
+        let resets_at = Some(now + Duration::from_secs(remaining));
+        let strings = LanguageId::English.strings();
+
+        // used=20% at 50% elapsed projects exhaustion far beyond the
+        // remaining time in this window.
+        let lines = weekly_pace_guidance_lines(
+            Some(20.0),
+            resets_at,
+            now,
+            DisplayBasis::UsedPercentage,
+            DisplayDensity::Detailed,
+            strings,
+        )
+        .expect("known value with valid reset data should produce lines");
+
+        let detail = lines.detail.expect("pace diff should still be present");
+        assert!(!detail.contains(strings.exhaustion_label));
+    }
+
+    #[test]
+    fn weekly_pace_guidance_detailed_shows_exhaustion_lead_time_before_reset() {
+        let now = SystemTime::now();
+        let elapsed = WEEKLY_WINDOW_SECS / 2;
+        let remaining = WEEKLY_WINDOW_SECS - elapsed;
+        let resets_at = Some(now + Duration::from_secs(remaining));
+        let strings = LanguageId::English.strings();
+
+        // used=69% at 50% elapsed projects exhaustion well before this
+        // window's reset.
+        let lines = weekly_pace_guidance_lines(
+            Some(69.0),
+            resets_at,
+            now,
+            DisplayBasis::UsedPercentage,
+            DisplayDensity::Detailed,
+            strings,
+        )
+        .expect("known value with valid reset data should produce lines");
+
+        let detail = lines.detail.expect("exhaustion text should be present");
+        assert!(detail.contains(strings.exhaustion_label));
+    }
+
+    #[test]
+    fn weekly_pace_guidance_never_shows_both_basis_values_at_once() {
+        let now = SystemTime::now();
+        let elapsed = WEEKLY_WINDOW_SECS / 2;
+        let remaining = WEEKLY_WINDOW_SECS - elapsed;
+        let resets_at = Some(now + Duration::from_secs(remaining));
+        let strings = LanguageId::English.strings();
+
+        let used_lines = weekly_pace_guidance_lines(
+            Some(69.0),
+            resets_at,
+            now,
+            DisplayBasis::UsedPercentage,
+            DisplayDensity::Compact,
+            strings,
+        )
+        .unwrap();
+        let remaining_lines = weekly_pace_guidance_lines(
+            Some(69.0),
+            resets_at,
+            now,
+            DisplayBasis::RemainingAllowance,
+            DisplayDensity::Compact,
+            strings,
+        )
+        .unwrap();
+
+        assert!(used_lines.primary.contains("69%"));
+        assert!(!used_lines.primary.contains("31%"));
+        assert!(remaining_lines.primary.contains("31%"));
+        assert!(!remaining_lines.primary.contains("69%"));
+    }
+
+    #[test]
+    fn weekly_pace_guidance_with_unknown_reset_shows_current_value_only() {
+        let now = SystemTime::now();
+        let strings = LanguageId::English.strings();
+        let lines = weekly_pace_guidance_lines(
+            Some(69.0),
+            None,
+            now,
+            DisplayBasis::UsedPercentage,
+            DisplayDensity::Detailed,
+            strings,
+        )
+        .unwrap();
+        assert!(lines.primary.contains("69%"));
+        assert_eq!(lines.secondary, None);
+        assert_eq!(lines.detail, None);
+    }
+
+    #[test]
+    fn weekly_pace_guidance_with_past_reset_does_not_panic() {
+        let now = SystemTime::now();
+        let resets_at = Some(now - Duration::from_secs(5));
+        let strings = LanguageId::English.strings();
+        let lines = weekly_pace_guidance_lines(
+            Some(69.0),
+            resets_at,
+            now,
+            DisplayBasis::UsedPercentage,
+            DisplayDensity::Standard,
+            strings,
+        )
+        .unwrap();
+        assert!(lines.primary.contains("69%"));
+        assert_eq!(lines.secondary, None);
+    }
+
+    #[test]
+    fn weekly_pace_guidance_standard_shows_judging_before_min_elapsed() {
+        let now = SystemTime::now();
+        // Elapsed well under `PACE_JUDGING_MIN_ELAPSED_SECS` (6h): pace is
+        // too noisy to judge yet, regardless of `used_percent`.
+        let elapsed = PACE_JUDGING_MIN_ELAPSED_SECS - 3600;
+        let remaining = WEEKLY_WINDOW_SECS - elapsed;
+        let resets_at = Some(now + Duration::from_secs(remaining));
+        let strings = LanguageId::English.strings();
+
+        let lines = weekly_pace_guidance_lines(
+            Some(5.0),
+            resets_at,
+            now,
+            DisplayBasis::UsedPercentage,
+            DisplayDensity::Standard,
+            strings,
+        )
+        .expect("known value with valid reset data should produce lines");
+
+        assert!(lines.primary.contains(strings.weekly_pace_judging));
+    }
+
+    #[test]
+    fn format_future_pace_guidance_per_day() {
+        let strings = LanguageId::English.strings();
+        let guidance = FuturePaceGuidance {
+            value: 14.0,
+            unit: FuturePaceUnit::PerDay,
+        };
+        let text = format_future_pace_guidance(&guidance, strings).unwrap();
+        assert_eq!(text, format!("14%/{}", strings.per_day_suffix));
+    }
+
+    #[test]
+    fn format_future_pace_guidance_per_hour() {
+        let strings = LanguageId::English.strings();
+        let guidance = FuturePaceGuidance {
+            value: 3.0,
+            unit: FuturePaceUnit::PerHour,
+        };
+        let text = format_future_pace_guidance(&guidance, strings).unwrap();
+        // 3.0 falls in `format_pace_rate_value`'s [1, 10) bucket, which keeps
+        // one decimal place — not "3%/hr".
+        assert_eq!(text, format!("3.0%/{}", strings.per_hour_suffix));
+    }
+
+    #[test]
+    fn format_pace_diff_pt_normalizes_negative_zero() {
+        assert_eq!(format_pace_diff_pt(-0.0), Some("0pt".to_string()));
+        assert_eq!(format_pace_diff_pt(0.0), Some("0pt".to_string()));
+    }
+
+    #[test]
+    fn format_pace_rate_value_rounds_by_magnitude_bucket() {
+        // (0, 1): two decimal places.
+        assert_eq!(format_pace_rate_value(0.75), "0.75");
+        // [1, 10): one decimal place, lower boundary inclusive.
+        assert_eq!(format_pace_rate_value(1.0), "1.0");
+        assert_eq!(format_pace_rate_value(9.5), "9.5");
+        // [10, ..): integer, lower boundary inclusive.
+        assert_eq!(format_pace_rate_value(10.0), "10");
+    }
+
+    #[test]
+    fn short_window_pace_guidance_always_shows_normal_window() {
+        let now = SystemTime::now();
+        let resets_at = Some(now + Duration::from_secs(SESSION_WINDOW_SECS / 2));
+        let strings = LanguageId::English.strings();
+        let lines = short_window_pace_guidance_lines(
+            Some(24.0),
+            resets_at,
+            now,
+            DisplayBasis::UsedPercentage,
+            ShortWindowVisibility::Always,
+            ShortWindowAlertSensitivity::Standard,
+            strings,
+        );
+        assert!(lines.is_some());
+    }
+
+    #[test]
+    fn short_window_pace_guidance_warning_only_hides_normal_window() {
+        let now = SystemTime::now();
+        let resets_at = Some(now + Duration::from_secs(SESSION_WINDOW_SECS / 2));
+        let strings = LanguageId::English.strings();
+        let lines = short_window_pace_guidance_lines(
+            Some(24.0),
+            resets_at,
+            now,
+            DisplayBasis::UsedPercentage,
+            ShortWindowVisibility::WarningOnly,
+            ShortWindowAlertSensitivity::Standard,
+            strings,
+        );
+        assert_eq!(lines, None);
+    }
+
+    #[test]
+    fn short_window_pace_guidance_warning_only_shows_overpacing_window() {
+        let now = SystemTime::now();
+        // elapsed = 3600s (past the 1800s Standard grace period); used=60%
+        // projects exhaustion well before this window's reset.
+        let remaining = SESSION_WINDOW_SECS - 3600;
+        let resets_at = Some(now + Duration::from_secs(remaining));
+        let strings = LanguageId::English.strings();
+        let lines = short_window_pace_guidance_lines(
+            Some(60.0),
+            resets_at,
+            now,
+            DisplayBasis::UsedPercentage,
+            ShortWindowVisibility::WarningOnly,
+            ShortWindowAlertSensitivity::Standard,
+            strings,
+        )
+        .expect("overpacing window should be shown even under WarningOnly");
+        assert!(lines.is_warning);
+        // Also covers "5時間枠の警告表示に「使いすぎ」が含まれる".
+        assert!(lines.primary.contains(strings.weekly_pace_overpacing));
+    }
+
+    #[test]
+    fn short_window_pace_guidance_hidden_never_shows_even_when_overpacing() {
+        let now = SystemTime::now();
+        let remaining = SESSION_WINDOW_SECS - 3600;
+        let resets_at = Some(now + Duration::from_secs(remaining));
+        let strings = LanguageId::English.strings();
+        let lines = short_window_pace_guidance_lines(
+            Some(60.0),
+            resets_at,
+            now,
+            DisplayBasis::UsedPercentage,
+            ShortWindowVisibility::Hidden,
+            ShortWindowAlertSensitivity::Standard,
+            strings,
+        );
+        assert_eq!(lines, None);
+    }
+
+    #[test]
+    fn short_window_pace_guidance_normal_display_has_no_pace_status_wording() {
+        let now = SystemTime::now();
+        let resets_at = Some(now + Duration::from_secs(SESSION_WINDOW_SECS / 2));
+        let strings = LanguageId::English.strings();
+        let lines = short_window_pace_guidance_lines(
+            Some(24.0),
+            resets_at,
+            now,
+            DisplayBasis::UsedPercentage,
+            ShortWindowVisibility::Always,
+            ShortWindowAlertSensitivity::Standard,
+            strings,
+        )
+        .unwrap();
+        assert!(!lines.primary.contains(strings.weekly_pace_under_pace));
+        assert!(!lines.primary.contains(strings.weekly_pace_on_track));
+        assert!(!lines
+            .primary
+            .contains(strings.weekly_pace_slightly_overpacing));
+        assert!(!lines.primary.contains(strings.weekly_pace_overpacing));
+        assert!(!lines.is_warning);
+    }
+
+    #[test]
+    fn pace_guidance_handles_nan_infinite_and_extreme_inputs_without_panicking() {
+        let now = SystemTime::now();
+        let strings = LanguageId::English.strings();
+
+        assert_eq!(
+            weekly_pace_guidance_lines(
+                Some(f64::NAN),
+                None,
+                now,
+                DisplayBasis::UsedPercentage,
+                DisplayDensity::Detailed,
+                strings
+            ),
+            None
+        );
+        assert_eq!(
+            weekly_pace_guidance_lines(
+                Some(f64::INFINITY),
+                None,
+                now,
+                DisplayBasis::UsedPercentage,
+                DisplayDensity::Detailed,
+                strings
+            ),
+            None
+        );
+        assert_eq!(
+            short_window_pace_guidance_lines(
+                Some(f64::NAN),
+                None,
+                now,
+                DisplayBasis::UsedPercentage,
+                ShortWindowVisibility::Always,
+                ShortWindowAlertSensitivity::Standard,
+                strings
+            ),
+            None
+        );
+
+        // Absurdly-far-future reset (clock skew / bad server data): falls
+        // back to current-value-only rather than panicking or misreporting
+        // elapsed.
+        let far_future = Some(now + Duration::from_secs(WEEKLY_WINDOW_SECS * 1000));
+        let lines = weekly_pace_guidance_lines(
+            Some(50.0),
+            far_future,
+            now,
+            DisplayBasis::UsedPercentage,
+            DisplayDensity::Detailed,
+            strings,
+        )
+        .expect("a known value should still produce a current-value-only line");
+        assert_eq!(lines.secondary, None);
+
+        // Pure-formatter guards, directly.
+        assert_eq!(format_pace_diff_pt(f64::NAN), None);
+        assert_eq!(format_pace_diff_pt(f64::INFINITY), None);
+        let bad_guidance = FuturePaceGuidance {
+            value: f64::NAN,
+            unit: FuturePaceUnit::PerDay,
+        };
+        assert_eq!(format_future_pace_guidance(&bad_guidance, strings), None);
     }
 
     #[test]

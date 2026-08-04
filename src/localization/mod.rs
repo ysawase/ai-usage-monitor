@@ -210,6 +210,24 @@ pub struct Strings {
     pub short_window_alert_sensitivity: &'static str,
     pub short_window_alert_sensitivity_sensitive: &'static str,
     pub short_window_alert_sensitivity_relaxed: &'static str,
+    pub weekly_pace_judging: &'static str,
+    pub weekly_pace_under_pace: &'static str,
+    pub weekly_pace_on_track: &'static str,
+    pub weekly_pace_slightly_overpacing: &'static str,
+    pub weekly_pace_overpacing: &'static str,
+    pub future_pace_label: &'static str,
+    pub pace_diff_label: &'static str,
+    pub exhaustion_label: &'static str,
+    /// Template with a literal `{duration}` placeholder, e.g.
+    /// "リセットの約{duration}前" — replaced (not positional formatting)
+    /// since this is combined with `exhaustion_label` at call sites.
+    pub exhaustion_before_reset: &'static str,
+    pub session_window_label: &'static str,
+    pub weekly_window_label: &'static str,
+    pub per_day_suffix: &'static str,
+    pub per_hour_suffix: &'static str,
+    pub pace_used_prefix: &'static str,
+    pub pace_remaining_prefix: &'static str,
 }
 
 pub fn resolve_language(language_override: Option<LanguageId>) -> LanguageId {
