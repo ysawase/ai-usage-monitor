@@ -63,6 +63,9 @@ struct AppState {
     install_channel: InstallChannel,
 
     display_basis: DisplayBasis,
+    display_density: DisplayDensity,
+    short_window_visibility: ShortWindowVisibility,
+    short_window_alert_sensitivity: ShortWindowAlertSensitivity,
 
     session_state: CellState,
     session_percent: Option<f64>,
@@ -132,6 +135,40 @@ enum DisplayBasis {
 impl Default for DisplayBasis {
     fn default() -> Self {
         DisplayBasis::UsedPercentage
+    }
+}
+
+/// How much pace/guidance detail the popup shows alongside each window's
+/// percentage. Not yet connected to any drawing code — see
+/// AUM-PACE-GUIDANCE-01's later units.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum DisplayDensity {
+    Compact,
+    Standard,
+    Detailed,
+}
+
+impl Default for DisplayDensity {
+    fn default() -> Self {
+        Self::Standard
+    }
+}
+
+/// Whether the 5h window is always shown, only shown while it's in an
+/// overpacing warning state, or never shown. Not yet connected to any
+/// drawing code — see AUM-PACE-GUIDANCE-01's later units.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ShortWindowVisibility {
+    Always,
+    WarningOnly,
+    Hidden,
+}
+
+impl Default for ShortWindowVisibility {
+    fn default() -> Self {
+        Self::WarningOnly
     }
 }
 
@@ -739,6 +776,15 @@ struct SettingsFile {
     show_antigravity: bool,
     #[serde(default, deserialize_with = "deserialize_display_basis")]
     display_basis: DisplayBasis,
+    #[serde(default, deserialize_with = "deserialize_display_density")]
+    display_density: DisplayDensity,
+    #[serde(default, deserialize_with = "deserialize_short_window_visibility")]
+    short_window_visibility: ShortWindowVisibility,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_short_window_alert_sensitivity"
+    )]
+    short_window_alert_sensitivity: ShortWindowAlertSensitivity,
 }
 
 impl Default for SettingsFile {
@@ -755,6 +801,9 @@ impl Default for SettingsFile {
             show_codex: false,
             show_antigravity: false,
             display_basis: DisplayBasis::default(),
+            display_density: DisplayDensity::default(),
+            short_window_visibility: ShortWindowVisibility::default(),
+            short_window_alert_sensitivity: ShortWindowAlertSensitivity::default(),
         }
     }
 }
@@ -770,6 +819,45 @@ where
     Ok(serde_json::Value::deserialize(deserializer)
         .ok()
         .and_then(|value| serde_json::from_value::<DisplayBasis>(value).ok())
+        .unwrap_or_default())
+}
+
+/// Same lenient fallback as `deserialize_display_basis`, for `DisplayDensity`.
+fn deserialize_display_density<'de, D>(deserializer: D) -> Result<DisplayDensity, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(serde_json::Value::deserialize(deserializer)
+        .ok()
+        .and_then(|value| serde_json::from_value::<DisplayDensity>(value).ok())
+        .unwrap_or_default())
+}
+
+/// Same lenient fallback as `deserialize_display_basis`, for
+/// `ShortWindowVisibility`.
+fn deserialize_short_window_visibility<'de, D>(
+    deserializer: D,
+) -> Result<ShortWindowVisibility, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(serde_json::Value::deserialize(deserializer)
+        .ok()
+        .and_then(|value| serde_json::from_value::<ShortWindowVisibility>(value).ok())
+        .unwrap_or_default())
+}
+
+/// Same lenient fallback as `deserialize_display_basis`, for
+/// `ShortWindowAlertSensitivity`.
+fn deserialize_short_window_alert_sensitivity<'de, D>(
+    deserializer: D,
+) -> Result<ShortWindowAlertSensitivity, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(serde_json::Value::deserialize(deserializer)
+        .ok()
+        .and_then(|value| serde_json::from_value::<ShortWindowAlertSensitivity>(value).ok())
         .unwrap_or_default())
 }
 
@@ -836,6 +924,9 @@ fn save_state_settings() {
             show_codex: s.show_codex,
             show_antigravity: s.show_antigravity,
             display_basis: s.display_basis,
+            display_density: s.display_density,
+            short_window_visibility: s.short_window_visibility,
+            short_window_alert_sensitivity: s.short_window_alert_sensitivity,
         });
     }
 }
@@ -1910,6 +2001,9 @@ pub fn run() {
                 language,
                 install_channel,
                 display_basis: settings.display_basis,
+                display_density: settings.display_density,
+                short_window_visibility: settings.short_window_visibility,
+                short_window_alert_sensitivity: settings.short_window_alert_sensitivity,
                 session_state: CellState::Loading,
                 session_percent: None,
                 session_text: String::new(),
@@ -4406,6 +4500,257 @@ mod tests {
         assert_eq!(
             value["display_basis"],
             serde_json::json!("remaining_allowance")
+        );
+    }
+
+    // ── AUM-PACE-GUIDANCE-01: display settings (type/default/persistence) ──
+
+    #[test]
+    fn display_density_default_is_standard() {
+        assert_eq!(DisplayDensity::default(), DisplayDensity::Standard);
+    }
+
+    #[test]
+    fn short_window_visibility_default_is_warning_only() {
+        assert_eq!(
+            ShortWindowVisibility::default(),
+            ShortWindowVisibility::WarningOnly
+        );
+    }
+
+    #[test]
+    fn short_window_alert_sensitivity_default_is_standard() {
+        assert_eq!(
+            ShortWindowAlertSensitivity::default(),
+            ShortWindowAlertSensitivity::Standard
+        );
+    }
+
+    #[test]
+    fn display_density_serializes_to_expected_snake_case() {
+        assert_eq!(
+            serde_json::to_value(DisplayDensity::Compact).unwrap(),
+            serde_json::json!("compact")
+        );
+        assert_eq!(
+            serde_json::to_value(DisplayDensity::Standard).unwrap(),
+            serde_json::json!("standard")
+        );
+        assert_eq!(
+            serde_json::to_value(DisplayDensity::Detailed).unwrap(),
+            serde_json::json!("detailed")
+        );
+    }
+
+    #[test]
+    fn short_window_visibility_serializes_to_expected_snake_case() {
+        assert_eq!(
+            serde_json::to_value(ShortWindowVisibility::Always).unwrap(),
+            serde_json::json!("always")
+        );
+        assert_eq!(
+            serde_json::to_value(ShortWindowVisibility::WarningOnly).unwrap(),
+            serde_json::json!("warning_only")
+        );
+        assert_eq!(
+            serde_json::to_value(ShortWindowVisibility::Hidden).unwrap(),
+            serde_json::json!("hidden")
+        );
+    }
+
+    #[test]
+    fn short_window_alert_sensitivity_serializes_to_expected_snake_case() {
+        assert_eq!(
+            serde_json::to_value(ShortWindowAlertSensitivity::Sensitive).unwrap(),
+            serde_json::json!("sensitive")
+        );
+        assert_eq!(
+            serde_json::to_value(ShortWindowAlertSensitivity::Standard).unwrap(),
+            serde_json::json!("standard")
+        );
+        assert_eq!(
+            serde_json::to_value(ShortWindowAlertSensitivity::Relaxed).unwrap(),
+            serde_json::json!("relaxed")
+        );
+    }
+
+    #[test]
+    fn pace_settings_deserialize_from_expected_snake_case_strings() {
+        let density: DisplayDensity =
+            serde_json::from_value(serde_json::json!("detailed")).unwrap();
+        assert_eq!(density, DisplayDensity::Detailed);
+
+        let visibility: ShortWindowVisibility =
+            serde_json::from_value(serde_json::json!("hidden")).unwrap();
+        assert_eq!(visibility, ShortWindowVisibility::Hidden);
+
+        let sensitivity: ShortWindowAlertSensitivity =
+            serde_json::from_value(serde_json::json!("relaxed")).unwrap();
+        assert_eq!(sensitivity, ShortWindowAlertSensitivity::Relaxed);
+    }
+
+    #[test]
+    fn legacy_settings_without_pace_display_keys_deserialize_successfully() {
+        let settings: SettingsFile = serde_json::from_str("{}")
+            .expect("legacy settings without the new keys should still deserialize");
+        assert_eq!(settings.display_density, DisplayDensity::Standard);
+        assert_eq!(
+            settings.short_window_visibility,
+            ShortWindowVisibility::WarningOnly
+        );
+        assert_eq!(
+            settings.short_window_alert_sensitivity,
+            ShortWindowAlertSensitivity::Standard
+        );
+    }
+
+    #[test]
+    fn new_format_settings_load_the_saved_pace_display_values() {
+        let json = r#"{
+            "display_density": "detailed",
+            "short_window_visibility": "always",
+            "short_window_alert_sensitivity": "relaxed"
+        }"#;
+        let settings: SettingsFile =
+            serde_json::from_str(json).expect("new-format settings should deserialize");
+        assert_eq!(settings.display_density, DisplayDensity::Detailed);
+        assert_eq!(
+            settings.short_window_visibility,
+            ShortWindowVisibility::Always
+        );
+        assert_eq!(
+            settings.short_window_alert_sensitivity,
+            ShortWindowAlertSensitivity::Relaxed
+        );
+    }
+
+    #[test]
+    fn settings_serialization_includes_all_pace_display_keys() {
+        let value =
+            serde_json::to_value(SettingsFile::default()).expect("settings should serialize");
+        assert_eq!(value["display_density"], serde_json::json!("standard"));
+        assert_eq!(
+            value["short_window_visibility"],
+            serde_json::json!("warning_only")
+        );
+        assert_eq!(
+            value["short_window_alert_sensitivity"],
+            serde_json::json!("standard")
+        );
+    }
+
+    #[test]
+    fn pace_display_settings_round_trip_through_serialization() {
+        let settings = SettingsFile {
+            display_density: DisplayDensity::Compact,
+            short_window_visibility: ShortWindowVisibility::Hidden,
+            short_window_alert_sensitivity: ShortWindowAlertSensitivity::Sensitive,
+            ..SettingsFile::default()
+        };
+        let json = serde_json::to_string(&settings).expect("settings should serialize");
+        let round_tripped: SettingsFile =
+            serde_json::from_str(&json).expect("round trip should deserialize");
+        assert_eq!(round_tripped.display_density, DisplayDensity::Compact);
+        assert_eq!(
+            round_tripped.short_window_visibility,
+            ShortWindowVisibility::Hidden
+        );
+        assert_eq!(
+            round_tripped.short_window_alert_sensitivity,
+            ShortWindowAlertSensitivity::Sensitive
+        );
+    }
+
+    #[test]
+    fn existing_display_basis_survives_round_trip_alongside_new_pace_settings() {
+        let settings = SettingsFile {
+            display_basis: DisplayBasis::RemainingAllowance,
+            display_density: DisplayDensity::Detailed,
+            ..SettingsFile::default()
+        };
+        let json = serde_json::to_string(&settings).expect("settings should serialize");
+        let round_tripped: SettingsFile =
+            serde_json::from_str(&json).expect("round trip should deserialize");
+        assert_eq!(
+            round_tripped.display_basis,
+            DisplayBasis::RemainingAllowance
+        );
+        assert_eq!(round_tripped.display_density, DisplayDensity::Detailed);
+    }
+
+    #[test]
+    fn other_existing_settings_are_not_lost_when_pace_settings_are_present() {
+        let settings = SettingsFile {
+            tray_offset: 42,
+            taskbar_index: 3,
+            show_codex: true,
+            show_claude_code: false,
+            display_density: DisplayDensity::Compact,
+            ..SettingsFile::default()
+        };
+        let json = serde_json::to_string(&settings).expect("settings should serialize");
+        let round_tripped: SettingsFile =
+            serde_json::from_str(&json).expect("round trip should deserialize");
+        assert_eq!(round_tripped.tray_offset, 42);
+        assert_eq!(round_tripped.taskbar_index, 3);
+        assert!(round_tripped.show_codex);
+        assert!(!round_tripped.show_claude_code);
+    }
+
+    #[test]
+    fn settings_with_unrecognized_display_density_falls_back_without_failing_the_whole_file() {
+        let settings: SettingsFile =
+            serde_json::from_str(r#"{"display_density":"ultra_compact","tray_offset":9}"#)
+                .expect("an unrecognized display_density must not fail the whole settings file");
+        assert_eq!(settings.display_density, DisplayDensity::Standard);
+        assert_eq!(settings.tray_offset, 9);
+    }
+
+    #[test]
+    fn settings_with_unrecognized_short_window_visibility_falls_back_without_failing_the_whole_file(
+    ) {
+        let settings: SettingsFile =
+            serde_json::from_str(r#"{"short_window_visibility":"sometimes","tray_offset":9}"#)
+                .expect(
+                    "an unrecognized short_window_visibility must not fail the whole settings file",
+                );
+        assert_eq!(
+            settings.short_window_visibility,
+            ShortWindowVisibility::WarningOnly
+        );
+        assert_eq!(settings.tray_offset, 9);
+    }
+
+    #[test]
+    fn settings_with_unrecognized_short_window_alert_sensitivity_falls_back_without_failing_the_whole_file(
+    ) {
+        let settings: SettingsFile = serde_json::from_str(
+            r#"{"short_window_alert_sensitivity":"extreme","tray_offset":9}"#,
+        )
+        .expect(
+            "an unrecognized short_window_alert_sensitivity must not fail the whole settings file",
+        );
+        assert_eq!(
+            settings.short_window_alert_sensitivity,
+            ShortWindowAlertSensitivity::Standard
+        );
+        assert_eq!(settings.tray_offset, 9);
+    }
+
+    #[test]
+    fn one_unrecognized_pace_display_value_does_not_affect_the_other_two() {
+        let settings: SettingsFile = serde_json::from_str(
+            r#"{"display_density":"bogus","short_window_visibility":"hidden","short_window_alert_sensitivity":"relaxed"}"#,
+        )
+        .expect("an unrecognized display_density must not fail the whole settings file");
+        assert_eq!(settings.display_density, DisplayDensity::Standard);
+        assert_eq!(
+            settings.short_window_visibility,
+            ShortWindowVisibility::Hidden
+        );
+        assert_eq!(
+            settings.short_window_alert_sensitivity,
+            ShortWindowAlertSensitivity::Relaxed
         );
     }
 
