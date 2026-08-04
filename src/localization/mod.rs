@@ -199,6 +199,17 @@ pub struct Strings {
     pub retrying: &'static str,
     pub not_configured: &'static str,
     pub not_available: &'static str,
+    pub display_density: &'static str,
+    pub display_density_compact: &'static str,
+    pub standard_level: &'static str,
+    pub display_density_detailed: &'static str,
+    pub short_window_visibility: &'static str,
+    pub short_window_visibility_always: &'static str,
+    pub short_window_visibility_warning_only: &'static str,
+    pub short_window_visibility_hidden: &'static str,
+    pub short_window_alert_sensitivity: &'static str,
+    pub short_window_alert_sensitivity_sensitive: &'static str,
+    pub short_window_alert_sensitivity_relaxed: &'static str,
 }
 
 pub fn resolve_language(language_override: Option<LanguageId>) -> LanguageId {

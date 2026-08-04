@@ -581,8 +581,56 @@ const IDM_MODEL_CLAUDE_CODE: u16 = 60;
 const IDM_MODEL_CODEX: u16 = 61;
 #[cfg(feature = "antigravity")]
 const IDM_MODEL_ANTIGRAVITY: u16 = 62;
-const IDM_DISPLAY_BASIS_USED: u16 = 70;
-const IDM_DISPLAY_BASIS_REMAINING: u16 = 71;
+// 70 is `tray_icon::IDM_TOGGLE_WIDGET`, not redefined here — it shares the
+// same `WM_COMMAND` id space as every constant in this block, so it must be
+// treated as already taken (71 is skipped too, to leave no ambiguity next
+// to it). See `wm_command_menu_ids_are_globally_unique` for the test that
+// checks this across both files.
+const IDM_DISPLAY_BASIS_USED: u16 = 72;
+const IDM_DISPLAY_BASIS_REMAINING: u16 = 73;
+// 74-79 intentionally left free.
+const IDM_DISPLAY_DENSITY_COMPACT: u16 = 80;
+const IDM_DISPLAY_DENSITY_STANDARD: u16 = 81;
+const IDM_DISPLAY_DENSITY_DETAILED: u16 = 82;
+const IDM_SHORT_WINDOW_VISIBILITY_ALWAYS: u16 = 83;
+const IDM_SHORT_WINDOW_VISIBILITY_WARNING_ONLY: u16 = 84;
+const IDM_SHORT_WINDOW_VISIBILITY_HIDDEN: u16 = 85;
+const IDM_SHORT_WINDOW_ALERT_SENSITIVITY_SENSITIVE: u16 = 86;
+const IDM_SHORT_WINDOW_ALERT_SENSITIVITY_STANDARD: u16 = 87;
+const IDM_SHORT_WINDOW_ALERT_SENSITIVITY_RELAXED: u16 = 88;
+
+/// Pure `menu ID -> enum value` lookups, shared by `show_context_menu`
+/// (which sets which item starts checked) and the `WM_COMMAND` handler
+/// (which applies the selection). Kept separate from any Win32 call so both
+/// directions of the ID/value mapping can be unit tested without a window.
+fn display_density_for_menu_id(id: u16) -> Option<DisplayDensity> {
+    match id {
+        IDM_DISPLAY_DENSITY_COMPACT => Some(DisplayDensity::Compact),
+        IDM_DISPLAY_DENSITY_STANDARD => Some(DisplayDensity::Standard),
+        IDM_DISPLAY_DENSITY_DETAILED => Some(DisplayDensity::Detailed),
+        _ => None,
+    }
+}
+
+fn short_window_visibility_for_menu_id(id: u16) -> Option<ShortWindowVisibility> {
+    match id {
+        IDM_SHORT_WINDOW_VISIBILITY_ALWAYS => Some(ShortWindowVisibility::Always),
+        IDM_SHORT_WINDOW_VISIBILITY_WARNING_ONLY => Some(ShortWindowVisibility::WarningOnly),
+        IDM_SHORT_WINDOW_VISIBILITY_HIDDEN => Some(ShortWindowVisibility::Hidden),
+        _ => None,
+    }
+}
+
+fn short_window_alert_sensitivity_for_menu_id(id: u16) -> Option<ShortWindowAlertSensitivity> {
+    match id {
+        IDM_SHORT_WINDOW_ALERT_SENSITIVITY_SENSITIVE => {
+            Some(ShortWindowAlertSensitivity::Sensitive)
+        }
+        IDM_SHORT_WINDOW_ALERT_SENSITIVITY_STANDARD => Some(ShortWindowAlertSensitivity::Standard),
+        IDM_SHORT_WINDOW_ALERT_SENSITIVITY_RELAXED => Some(ShortWindowAlertSensitivity::Relaxed),
+        _ => None,
+    }
+}
 
 const WM_DPICHANGED_MSG: u32 = 0x02E0;
 #[cfg(feature = "self-update")]
@@ -3409,6 +3457,42 @@ unsafe extern "system" fn wnd_proc(
                     render_layered();
                     sync_tray_icons(hwnd);
                 }
+                IDM_DISPLAY_DENSITY_COMPACT
+                | IDM_DISPLAY_DENSITY_STANDARD
+                | IDM_DISPLAY_DENSITY_DETAILED => {
+                    // Not yet consumed by any drawing code, so unlike the
+                    // display-basis handler above there is nothing to
+                    // recompute or redraw here — just persist the choice.
+                    if let Some(new_density) = display_density_for_menu_id(id) {
+                        let mut state = lock_state();
+                        if let Some(s) = state.as_mut() {
+                            s.display_density = new_density;
+                        }
+                    }
+                    save_state_settings();
+                }
+                IDM_SHORT_WINDOW_VISIBILITY_ALWAYS
+                | IDM_SHORT_WINDOW_VISIBILITY_WARNING_ONLY
+                | IDM_SHORT_WINDOW_VISIBILITY_HIDDEN => {
+                    if let Some(new_visibility) = short_window_visibility_for_menu_id(id) {
+                        let mut state = lock_state();
+                        if let Some(s) = state.as_mut() {
+                            s.short_window_visibility = new_visibility;
+                        }
+                    }
+                    save_state_settings();
+                }
+                IDM_SHORT_WINDOW_ALERT_SENSITIVITY_SENSITIVE
+                | IDM_SHORT_WINDOW_ALERT_SENSITIVITY_STANDARD
+                | IDM_SHORT_WINDOW_ALERT_SENSITIVITY_RELAXED => {
+                    if let Some(new_sensitivity) = short_window_alert_sensitivity_for_menu_id(id) {
+                        let mut state = lock_state();
+                        if let Some(s) = state.as_mut() {
+                            s.short_window_alert_sensitivity = new_sensitivity;
+                        }
+                    }
+                    save_state_settings();
+                }
                 IDM_FREQ_1MIN | IDM_FREQ_5MIN | IDM_FREQ_15MIN | IDM_FREQ_1HOUR => {
                     let new_interval = match id {
                         IDM_FREQ_1MIN => POLL_1_MIN,
@@ -3574,6 +3658,9 @@ fn show_context_menu(hwnd: HWND) {
             show_codex,
             show_antigravity,
             display_basis,
+            display_density,
+            short_window_visibility,
+            short_window_alert_sensitivity,
         ) = {
             let state = lock_state();
             match state.as_ref() {
@@ -3590,6 +3677,9 @@ fn show_context_menu(hwnd: HWND) {
                     s.show_codex,
                     s.show_antigravity,
                     s.display_basis,
+                    s.display_density,
+                    s.short_window_visibility,
+                    s.short_window_alert_sensitivity,
                 ),
                 None => (
                     POLL_15_MIN,
@@ -3604,6 +3694,9 @@ fn show_context_menu(hwnd: HWND) {
                     false,
                     false,
                     DisplayBasis::default(),
+                    DisplayDensity::default(),
+                    ShortWindowVisibility::default(),
+                    ShortWindowAlertSensitivity::default(),
                 ),
             }
         };
@@ -3824,6 +3917,133 @@ fn show_context_menu(hwnd: HWND) {
             MF_POPUP,
             display_basis_menu.0 as usize,
             PCWSTR::from_raw(display_basis_label.as_ptr()),
+        );
+
+        // Display density submenu: mutually exclusive, radio-style, same
+        // pattern as the display-basis submenu above. Not yet connected to
+        // any drawing code — see AUM-PACE-GUIDANCE-01's later units.
+        let display_density_menu = CreatePopupMenu().unwrap();
+        let display_density_items: [(u16, DisplayDensity, &str); 3] = [
+            (
+                IDM_DISPLAY_DENSITY_COMPACT,
+                DisplayDensity::Compact,
+                strings.display_density_compact,
+            ),
+            (
+                IDM_DISPLAY_DENSITY_STANDARD,
+                DisplayDensity::Standard,
+                strings.standard_level,
+            ),
+            (
+                IDM_DISPLAY_DENSITY_DETAILED,
+                DisplayDensity::Detailed,
+                strings.display_density_detailed,
+            ),
+        ];
+        for (id, value, label) in display_density_items {
+            let label_str = native_interop::wide_str(label);
+            let flags = if value == display_density {
+                MF_CHECKED
+            } else {
+                MENU_ITEM_FLAGS(0)
+            };
+            let _ = AppendMenuW(
+                display_density_menu,
+                flags,
+                id as usize,
+                PCWSTR::from_raw(label_str.as_ptr()),
+            );
+        }
+        let display_density_label = native_interop::wide_str(strings.display_density);
+        let _ = AppendMenuW(
+            settings_menu,
+            MF_POPUP,
+            display_density_menu.0 as usize,
+            PCWSTR::from_raw(display_density_label.as_ptr()),
+        );
+
+        // Short-window (5h) visibility submenu.
+        let short_window_visibility_menu = CreatePopupMenu().unwrap();
+        let short_window_visibility_items: [(u16, ShortWindowVisibility, &str); 3] = [
+            (
+                IDM_SHORT_WINDOW_VISIBILITY_ALWAYS,
+                ShortWindowVisibility::Always,
+                strings.short_window_visibility_always,
+            ),
+            (
+                IDM_SHORT_WINDOW_VISIBILITY_WARNING_ONLY,
+                ShortWindowVisibility::WarningOnly,
+                strings.short_window_visibility_warning_only,
+            ),
+            (
+                IDM_SHORT_WINDOW_VISIBILITY_HIDDEN,
+                ShortWindowVisibility::Hidden,
+                strings.short_window_visibility_hidden,
+            ),
+        ];
+        for (id, value, label) in short_window_visibility_items {
+            let label_str = native_interop::wide_str(label);
+            let flags = if value == short_window_visibility {
+                MF_CHECKED
+            } else {
+                MENU_ITEM_FLAGS(0)
+            };
+            let _ = AppendMenuW(
+                short_window_visibility_menu,
+                flags,
+                id as usize,
+                PCWSTR::from_raw(label_str.as_ptr()),
+            );
+        }
+        let short_window_visibility_label =
+            native_interop::wide_str(strings.short_window_visibility);
+        let _ = AppendMenuW(
+            settings_menu,
+            MF_POPUP,
+            short_window_visibility_menu.0 as usize,
+            PCWSTR::from_raw(short_window_visibility_label.as_ptr()),
+        );
+
+        // Short-window (5h) alert sensitivity submenu.
+        let short_window_alert_sensitivity_menu = CreatePopupMenu().unwrap();
+        let short_window_alert_sensitivity_items: [(u16, ShortWindowAlertSensitivity, &str); 3] = [
+            (
+                IDM_SHORT_WINDOW_ALERT_SENSITIVITY_SENSITIVE,
+                ShortWindowAlertSensitivity::Sensitive,
+                strings.short_window_alert_sensitivity_sensitive,
+            ),
+            (
+                IDM_SHORT_WINDOW_ALERT_SENSITIVITY_STANDARD,
+                ShortWindowAlertSensitivity::Standard,
+                strings.standard_level,
+            ),
+            (
+                IDM_SHORT_WINDOW_ALERT_SENSITIVITY_RELAXED,
+                ShortWindowAlertSensitivity::Relaxed,
+                strings.short_window_alert_sensitivity_relaxed,
+            ),
+        ];
+        for (id, value, label) in short_window_alert_sensitivity_items {
+            let label_str = native_interop::wide_str(label);
+            let flags = if value == short_window_alert_sensitivity {
+                MF_CHECKED
+            } else {
+                MENU_ITEM_FLAGS(0)
+            };
+            let _ = AppendMenuW(
+                short_window_alert_sensitivity_menu,
+                flags,
+                id as usize,
+                PCWSTR::from_raw(label_str.as_ptr()),
+            );
+        }
+        let short_window_alert_sensitivity_label =
+            native_interop::wide_str(strings.short_window_alert_sensitivity);
+        let _ = AppendMenuW(
+            settings_menu,
+            MF_POPUP,
+            short_window_alert_sensitivity_menu.0 as usize,
+            PCWSTR::from_raw(short_window_alert_sensitivity_label.as_ptr()),
         );
 
         #[cfg(feature = "self-update")]
@@ -4752,6 +4972,167 @@ mod tests {
             settings.short_window_alert_sensitivity,
             ShortWindowAlertSensitivity::Relaxed
         );
+    }
+
+    // ── AUM-PACE-GUIDANCE-01: settings menu (IDs, mapping, localization) ───
+
+    #[test]
+    fn display_density_for_menu_id_maps_each_known_id() {
+        assert_eq!(
+            display_density_for_menu_id(IDM_DISPLAY_DENSITY_COMPACT),
+            Some(DisplayDensity::Compact)
+        );
+        assert_eq!(
+            display_density_for_menu_id(IDM_DISPLAY_DENSITY_STANDARD),
+            Some(DisplayDensity::Standard)
+        );
+        assert_eq!(
+            display_density_for_menu_id(IDM_DISPLAY_DENSITY_DETAILED),
+            Some(DisplayDensity::Detailed)
+        );
+    }
+
+    #[test]
+    fn short_window_visibility_for_menu_id_maps_each_known_id() {
+        assert_eq!(
+            short_window_visibility_for_menu_id(IDM_SHORT_WINDOW_VISIBILITY_ALWAYS),
+            Some(ShortWindowVisibility::Always)
+        );
+        assert_eq!(
+            short_window_visibility_for_menu_id(IDM_SHORT_WINDOW_VISIBILITY_WARNING_ONLY),
+            Some(ShortWindowVisibility::WarningOnly)
+        );
+        assert_eq!(
+            short_window_visibility_for_menu_id(IDM_SHORT_WINDOW_VISIBILITY_HIDDEN),
+            Some(ShortWindowVisibility::Hidden)
+        );
+    }
+
+    #[test]
+    fn short_window_alert_sensitivity_for_menu_id_maps_each_known_id() {
+        assert_eq!(
+            short_window_alert_sensitivity_for_menu_id(
+                IDM_SHORT_WINDOW_ALERT_SENSITIVITY_SENSITIVE
+            ),
+            Some(ShortWindowAlertSensitivity::Sensitive)
+        );
+        assert_eq!(
+            short_window_alert_sensitivity_for_menu_id(IDM_SHORT_WINDOW_ALERT_SENSITIVITY_STANDARD),
+            Some(ShortWindowAlertSensitivity::Standard)
+        );
+        assert_eq!(
+            short_window_alert_sensitivity_for_menu_id(IDM_SHORT_WINDOW_ALERT_SENSITIVITY_RELAXED),
+            Some(ShortWindowAlertSensitivity::Relaxed)
+        );
+    }
+
+    #[test]
+    fn unknown_menu_id_maps_to_none_for_each_pace_display_group() {
+        assert_eq!(display_density_for_menu_id(9999), None);
+        assert_eq!(short_window_visibility_for_menu_id(9999), None);
+        assert_eq!(short_window_alert_sensitivity_for_menu_id(9999), None);
+    }
+
+    #[test]
+    fn new_pace_display_menu_ids_are_pairwise_distinct() {
+        let ids = [
+            IDM_DISPLAY_DENSITY_COMPACT,
+            IDM_DISPLAY_DENSITY_STANDARD,
+            IDM_DISPLAY_DENSITY_DETAILED,
+            IDM_SHORT_WINDOW_VISIBILITY_ALWAYS,
+            IDM_SHORT_WINDOW_VISIBILITY_WARNING_ONLY,
+            IDM_SHORT_WINDOW_VISIBILITY_HIDDEN,
+            IDM_SHORT_WINDOW_ALERT_SENSITIVITY_SENSITIVE,
+            IDM_SHORT_WINDOW_ALERT_SENSITIVITY_STANDARD,
+            IDM_SHORT_WINDOW_ALERT_SENSITIVITY_RELAXED,
+        ];
+        for i in 0..ids.len() {
+            for j in (i + 1)..ids.len() {
+                assert_ne!(
+                    ids[i], ids[j],
+                    "duplicate pace-display menu ID at indices {i} and {j}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn wm_command_menu_ids_are_globally_unique() {
+        // Every value dispatched through the main window's `WM_COMMAND`
+        // handler, across both `window.rs` and `tray_icon.rs` (the tray
+        // icon's own action reaches the same handler via
+        // `tray_icon::IDM_TOGGLE_WIDGET`). `1`/`2` are the literal, unnamed
+        // IDs `show_context_menu` uses directly for "Refresh"/"Exit" — kept
+        // here as plain values since they aren't named constants.
+        let mut ids: Vec<u16> = vec![
+            1,
+            2,
+            IDM_FREQ_1MIN,
+            IDM_FREQ_5MIN,
+            IDM_FREQ_15MIN,
+            IDM_FREQ_1HOUR,
+            IDM_START_WITH_WINDOWS,
+            IDM_ALWAYS_ON_TOP,
+            IDM_RESET_POSITION,
+            IDM_LANG_SYSTEM,
+            IDM_LANG_ENGLISH,
+            IDM_LANG_DUTCH,
+            IDM_LANG_SPANISH,
+            IDM_LANG_FRENCH,
+            IDM_LANG_GERMAN,
+            IDM_LANG_JAPANESE,
+            IDM_LANG_KOREAN,
+            IDM_LANG_TRADITIONAL_CHINESE,
+            IDM_LANG_RUSSIAN,
+            IDM_LANG_PORTUGUESE_BRAZIL,
+            IDM_LANG_SIMPLIFIED_CHINESE,
+            IDM_MODEL_CLAUDE_CODE,
+            IDM_MODEL_CODEX,
+            IDM_DISPLAY_BASIS_USED,
+            IDM_DISPLAY_BASIS_REMAINING,
+            IDM_DISPLAY_DENSITY_COMPACT,
+            IDM_DISPLAY_DENSITY_STANDARD,
+            IDM_DISPLAY_DENSITY_DETAILED,
+            IDM_SHORT_WINDOW_VISIBILITY_ALWAYS,
+            IDM_SHORT_WINDOW_VISIBILITY_WARNING_ONLY,
+            IDM_SHORT_WINDOW_VISIBILITY_HIDDEN,
+            IDM_SHORT_WINDOW_ALERT_SENSITIVITY_SENSITIVE,
+            IDM_SHORT_WINDOW_ALERT_SENSITIVITY_STANDARD,
+            IDM_SHORT_WINDOW_ALERT_SENSITIVITY_RELAXED,
+            tray_icon::IDM_TOGGLE_WIDGET,
+        ];
+        #[cfg(feature = "self-update")]
+        ids.push(IDM_VERSION_ACTION);
+        #[cfg(feature = "antigravity")]
+        ids.push(IDM_MODEL_ANTIGRAVITY);
+
+        for i in 0..ids.len() {
+            for j in (i + 1)..ids.len() {
+                assert_ne!(
+                    ids[i], ids[j],
+                    "duplicate WM_COMMAND menu ID {} at indices {i} and {j}",
+                    ids[i]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn all_languages_have_non_empty_pace_display_menu_strings() {
+        for language in LanguageId::ALL {
+            let strings = language.strings();
+            assert!(!strings.display_density.is_empty());
+            assert!(!strings.display_density_compact.is_empty());
+            assert!(!strings.standard_level.is_empty());
+            assert!(!strings.display_density_detailed.is_empty());
+            assert!(!strings.short_window_visibility.is_empty());
+            assert!(!strings.short_window_visibility_always.is_empty());
+            assert!(!strings.short_window_visibility_warning_only.is_empty());
+            assert!(!strings.short_window_visibility_hidden.is_empty());
+            assert!(!strings.short_window_alert_sensitivity.is_empty());
+            assert!(!strings.short_window_alert_sensitivity_sensitive.is_empty());
+            assert!(!strings.short_window_alert_sensitivity_relaxed.is_empty());
+        }
     }
 
     #[test]
