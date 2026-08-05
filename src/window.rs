@@ -5413,12 +5413,30 @@ fn model_usage_width(segment_count: i32) -> i32 {
         + sc(TEXT_WIDTH)
 }
 
+/// A usage-bar cell has nothing to draw when there's no percentage *and* no
+/// status text either. Before `session_cell_decision` (AUM-PACE-GUIDANCE-01)
+/// existed, `percent = None` always came with a non-empty status word (e.g.
+/// "Loading"), so `draw_usage_bar` never saw `(None, "")`. `session_cell_decision`
+/// can now return exactly that combination for a provider whose session row
+/// is suppressed this poll, while the provider's column is still shown —
+/// `draw_row` has no per-cell "skip" signal, so it calls `draw_usage_bar`
+/// regardless. An empty `&str` turned into a `Vec<u16>` via
+/// `encode_utf16().collect()` is a zero-length allocation with no real
+/// backing memory (Rust gives it a dangling, merely-aligned pointer); handing
+/// that pointer+len to `DrawTextW` is what crashed here.
+fn usage_bar_has_content(percent: Option<f64>, text: &str) -> bool {
+    percent.is_some() || !text.is_empty()
+}
+
 /// `percent` is `None` for any cell without a real current value (loading,
 /// error, unconfigured, not-available). In that case no segment — neither
 /// filled nor empty track — is drawn, so the bar area is left blank rather
 /// than rendering what would look like an ordinary 0% bar; the status word
 /// in `text` is the only thing shown for that cell. This is the one place
-/// `CellDisplay::bar_percent` actually reaches the screen.
+/// `CellDisplay::bar_percent` actually reaches the screen. When there is
+/// neither a percentage nor status text (`usage_bar_has_content` is false —
+/// see its doc comment), nothing is drawn at all: the cell's column position
+/// is simply left blank rather than attempting to draw empty content.
 fn draw_usage_bar(
     hdc: HDC,
     bar_x: i32,
@@ -5430,6 +5448,9 @@ fn draw_usage_bar(
     track: &Color,
     text_color: &Color,
 ) {
+    if !usage_bar_has_content(percent, text) {
+        return;
+    }
     let seg_w = sc(SEGMENT_W);
     let seg_h = sc(SEGMENT_H);
     let seg_gap = sc(SEGMENT_GAP);
@@ -5495,12 +5516,19 @@ fn draw_usage_bar(
             bottom: y + seg_h,
         };
         let _ = SetTextColor(hdc, COLORREF(text_color.to_colorref()));
-        let _ = DrawTextW(
-            hdc,
-            &mut text_wide,
-            &mut text_rect,
-            DT_LEFT | DT_VCENTER | DT_SINGLELINE,
-        );
+        // A zero-length `text_wide` (empty `text`) has no real backing
+        // allocation — see `usage_bar_has_content`'s doc comment — so never
+        // hand it to `DrawTextW`. Independent from the whole-cell skip
+        // above: also covers a future `Some(percent)` with empty `text`
+        // (bar segments still draw; only this text-draw step is skipped).
+        if !text_wide.is_empty() {
+            let _ = DrawTextW(
+                hdc,
+                &mut text_wide,
+                &mut text_rect,
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE,
+            );
+        }
     }
 }
 
@@ -5524,6 +5552,26 @@ fn draw_rounded_rect(hdc: HDC, rect: &RECT, color: &Color, radius: i32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn usage_bar_has_content_is_false_for_no_percent_and_empty_text() {
+        assert!(!usage_bar_has_content(None, ""));
+    }
+
+    #[test]
+    fn usage_bar_has_content_is_true_for_no_percent_with_status_text() {
+        assert!(usage_bar_has_content(None, "N/A"));
+    }
+
+    #[test]
+    fn usage_bar_has_content_is_true_for_percent_with_empty_text() {
+        assert!(usage_bar_has_content(Some(50.0), ""));
+    }
+
+    #[test]
+    fn usage_bar_has_content_is_true_for_percent_with_text() {
+        assert!(usage_bar_has_content(Some(50.0), "50%"));
+    }
 
     #[test]
     fn popup_sits_above_a_normal_bottom_taskbar() {
