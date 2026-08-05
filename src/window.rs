@@ -70,21 +70,27 @@ struct AppState {
     session_state: CellState,
     session_percent: Option<f64>,
     session_text: String,
+    session_pace: Option<PaceGuidanceLines>,
     weekly_state: CellState,
     weekly_percent: Option<f64>,
     weekly_text: String,
+    weekly_pace: Option<PaceGuidanceLines>,
     codex_session_state: CellState,
     codex_session_percent: Option<f64>,
     codex_session_text: String,
+    codex_session_pace: Option<PaceGuidanceLines>,
     codex_weekly_state: CellState,
     codex_weekly_percent: Option<f64>,
     codex_weekly_text: String,
+    codex_weekly_pace: Option<PaceGuidanceLines>,
     antigravity_session_state: CellState,
     antigravity_session_percent: Option<f64>,
     antigravity_session_text: String,
+    antigravity_session_pace: Option<PaceGuidanceLines>,
     antigravity_weekly_state: CellState,
     antigravity_weekly_percent: Option<f64>,
     antigravity_weekly_text: String,
+    antigravity_weekly_pace: Option<PaceGuidanceLines>,
     show_claude_code: bool,
     show_codex: bool,
     show_antigravity: bool,
@@ -139,8 +145,8 @@ impl Default for DisplayBasis {
 }
 
 /// How much pace/guidance detail the popup shows alongside each window's
-/// percentage. Not yet connected to any drawing code — see
-/// AUM-PACE-GUIDANCE-01's later units.
+/// percentage — see `paint_content`'s weekly secondary/detail lines
+/// (AUM-PACE-GUIDANCE-01).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum DisplayDensity {
@@ -156,8 +162,8 @@ impl Default for DisplayDensity {
 }
 
 /// Whether the 5h window is always shown, only shown while it's in an
-/// overpacing warning state, or never shown. Not yet connected to any
-/// drawing code — see AUM-PACE-GUIDANCE-01's later units.
+/// overpacing warning state, or never shown — see `paint_content`'s
+/// standalone 5h pace row (AUM-PACE-GUIDANCE-01).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum ShortWindowVisibility {
@@ -580,9 +586,10 @@ fn short_window_is_overpacing(
 // ── Pace-guidance display model (AUM-PACE-GUIDANCE-01) ─────────────────────
 //
 // Pure text generation only: no Win32 types, no drawing calls, no
-// `SystemTime::now()` (always taken as a `now` parameter). Not yet wired to
-// `draw_row`/`paint_content` — a later unit passes the finished
-// `PaceGuidanceLines` to drawing code.
+// `SystemTime::now()` (always taken as a `now` parameter). The resulting
+// `PaceGuidanceLines` is drawn by `paint_content` (weekly secondary/detail
+// lines and the standalone 5h pace row) — see the connection unit's
+// completion report.
 
 fn weekly_pace_status_text(status: WeeklyPaceStatus, strings: Strings) -> &'static str {
     match status {
@@ -737,7 +744,6 @@ fn weekly_pace_guidance_lines(
 
     let display_pct = display_value(basis, used_percent);
     let pct_text = format!("{} {display_pct:.0}%", pace_basis_prefix(basis, strings));
-    let window_label = strings.weekly_window_label;
 
     let remaining_secs = remaining_secs_at(resets_at, now);
     let elapsed_secs = remaining_secs.and_then(|r| elapsed_secs_in_window(r, WEEKLY_WINDOW_SECS));
@@ -746,7 +752,7 @@ fn weekly_pace_guidance_lines(
         // Missing/past/out-of-range reset data: current value only,
         // regardless of density.
         return Some(PaceGuidanceLines {
-            primary: format!("{window_label} {pct_text}"),
+            primary: pct_text,
             secondary: None,
             detail: None,
             is_warning: false,
@@ -761,7 +767,7 @@ fn weekly_pace_guidance_lines(
 
     if density == DisplayDensity::Compact {
         return Some(PaceGuidanceLines {
-            primary: format!("{window_label} {pct_text} \u{00b7} {reset_text}"),
+            primary: format!("{pct_text} \u{00b7} {reset_text}"),
             secondary: None,
             detail: None,
             is_warning: false,
@@ -770,7 +776,7 @@ fn weekly_pace_guidance_lines(
 
     let status = weekly_pace_status(elapsed_secs, WEEKLY_WINDOW_SECS, used_percent);
     let status_text = weekly_pace_status_text(status, strings);
-    let primary = format!("{window_label} {pct_text} {status_text}");
+    let primary = format!("{pct_text} {status_text}");
 
     let future_pace_text = future_pace_guidance(used_percent, remaining_secs)
         .and_then(|guidance| format_future_pace_guidance(&guidance, strings));
@@ -861,15 +867,14 @@ fn short_window_pace_guidance_lines(
     } else {
         String::new()
     };
-    let window_label = strings.session_window_label;
 
     let primary = match remaining_secs {
         Some(remaining) => format!(
-            "{window_label} {pct_text}{status_suffix} \u{00b7} {} {}",
+            "{pct_text}{status_suffix} \u{00b7} {} {}",
             strings.reset_in,
             format_remaining_duration(remaining, strings)
         ),
-        None => format!("{window_label} {pct_text}{status_suffix}"),
+        None => format!("{pct_text}{status_suffix}"),
     };
 
     Some(PaceGuidanceLines {
@@ -878,6 +883,58 @@ fn short_window_pace_guidance_lines(
         detail: None,
         is_warning: is_overpacing,
     })
+}
+
+/// Weekly pace guidance for one provider's cell, gated the same way
+/// `render_cell` gates its bar: only `(CellState::Ok, Some(section))`
+/// produces anything. A cached `section` surviving under a non-`Ok` state
+/// (loading/error/unconfigured/not-available — see
+/// `merge_successful_providers`) must never reach the guidance text, same as
+/// it never reaches the bar.
+fn weekly_pace_for_cell(
+    state: CellState,
+    section: Option<&UsageSection>,
+    now: SystemTime,
+    basis: DisplayBasis,
+    density: DisplayDensity,
+    strings: Strings,
+) -> Option<PaceGuidanceLines> {
+    match (state, section) {
+        (CellState::Ok, Some(section)) => weekly_pace_guidance_lines(
+            Some(section.percentage),
+            section.resets_at,
+            now,
+            basis,
+            density,
+            strings,
+        ),
+        _ => None,
+    }
+}
+
+/// Short (5h) window pace guidance for one provider's cell — same
+/// `CellState::Ok`-gating as `weekly_pace_for_cell`.
+fn session_pace_for_cell(
+    state: CellState,
+    section: Option<&UsageSection>,
+    now: SystemTime,
+    basis: DisplayBasis,
+    visibility: ShortWindowVisibility,
+    sensitivity: ShortWindowAlertSensitivity,
+    strings: Strings,
+) -> Option<PaceGuidanceLines> {
+    match (state, section) {
+        (CellState::Ok, Some(section)) => short_window_pace_guidance_lines(
+            Some(section.percentage),
+            section.resets_at,
+            now,
+            basis,
+            visibility,
+            sensitivity,
+            strings,
+        ),
+        _ => None,
+    }
 }
 
 const RETRY_BASE_MS: u32 = 30_000; // 30 seconds
@@ -1674,6 +1731,15 @@ fn schedule_auto_update_check(hwnd: HWND) {
 fn refresh_usage_texts(state: &mut AppState) {
     let strings = state.language.strings();
     let basis = state.display_basis;
+    let density = state.display_density;
+    let visibility = state.short_window_visibility;
+    let sensitivity = state.short_window_alert_sensitivity;
+    // Captured once so the weekly/5h pace guidance for every provider in
+    // this refresh agrees on "now" — see AUM-PACE-GUIDANCE-01's
+    // `weekly_pace_guidance_lines`/`short_window_pace_guidance_lines`, which
+    // deliberately take `now` as a parameter rather than reading the clock
+    // themselves.
+    let now = SystemTime::now();
     let data = state.data.as_ref();
 
     let claude_code = data.and_then(|d| d.claude_code.as_ref());
@@ -1685,6 +1751,15 @@ fn refresh_usage_texts(state: &mut AppState) {
     );
     state.session_percent = session.bar_percent;
     state.session_text = session.text;
+    state.session_pace = session_pace_for_cell(
+        state.session_state,
+        claude_code.map(|u| &u.session),
+        now,
+        basis,
+        visibility,
+        sensitivity,
+        strings,
+    );
     let weekly = render_cell(
         state.weekly_state,
         claude_code.map(|u| &u.weekly),
@@ -1693,6 +1768,14 @@ fn refresh_usage_texts(state: &mut AppState) {
     );
     state.weekly_percent = weekly.bar_percent;
     state.weekly_text = weekly.text;
+    state.weekly_pace = weekly_pace_for_cell(
+        state.weekly_state,
+        claude_code.map(|u| &u.weekly),
+        now,
+        basis,
+        density,
+        strings,
+    );
 
     let codex = data.and_then(|d| d.codex.as_ref());
     let codex_session = render_cell(
@@ -1703,6 +1786,15 @@ fn refresh_usage_texts(state: &mut AppState) {
     );
     state.codex_session_percent = codex_session.bar_percent;
     state.codex_session_text = codex_session.text;
+    state.codex_session_pace = session_pace_for_cell(
+        state.codex_session_state,
+        codex.map(|u| &u.session),
+        now,
+        basis,
+        visibility,
+        sensitivity,
+        strings,
+    );
     let codex_weekly = render_cell(
         state.codex_weekly_state,
         codex.map(|u| &u.weekly),
@@ -1711,6 +1803,14 @@ fn refresh_usage_texts(state: &mut AppState) {
     );
     state.codex_weekly_percent = codex_weekly.bar_percent;
     state.codex_weekly_text = codex_weekly.text;
+    state.codex_weekly_pace = weekly_pace_for_cell(
+        state.codex_weekly_state,
+        codex.map(|u| &u.weekly),
+        now,
+        basis,
+        density,
+        strings,
+    );
 
     let antigravity = data.and_then(|d| d.antigravity.as_ref());
     let antigravity_session = render_cell(
@@ -1721,6 +1821,15 @@ fn refresh_usage_texts(state: &mut AppState) {
     );
     state.antigravity_session_percent = antigravity_session.bar_percent;
     state.antigravity_session_text = antigravity_session.text;
+    state.antigravity_session_pace = session_pace_for_cell(
+        state.antigravity_session_state,
+        antigravity.map(|u| &u.session),
+        now,
+        basis,
+        visibility,
+        sensitivity,
+        strings,
+    );
     let antigravity_weekly = render_cell(
         state.antigravity_weekly_state,
         antigravity.map(|u| &u.weekly),
@@ -1729,6 +1838,14 @@ fn refresh_usage_texts(state: &mut AppState) {
     );
     state.antigravity_weekly_percent = antigravity_weekly.bar_percent;
     state.antigravity_weekly_text = antigravity_weekly.text;
+    state.antigravity_weekly_pace = weekly_pace_for_cell(
+        state.antigravity_weekly_state,
+        antigravity.map(|u| &u.weekly),
+        now,
+        basis,
+        density,
+        strings,
+    );
 }
 
 fn set_window_title(hwnd: HWND, strings: Strings) {
@@ -2141,16 +2258,265 @@ const RIGHT_MARGIN: i32 = 1;
 /// provider names) added above the existing 5h/7d bar rows.
 const HEADER_ROW_H: i32 = 14;
 /// 3px top margin + HEADER_ROW_H (basis label) + 2px + HEADER_ROW_H
-/// (provider names) + 4px + SEGMENT_H (5h row) + 10px + SEGMENT_H (7d row)
-/// + 5px bottom margin = 3+14+2+14+4+13+10+13+5 = 78. The 5h/7d row height
-/// and the 10px gap between them are unchanged from before this feature;
-/// only the two header rows and their margins are new. Not visually
-/// verified on this machine — see completion report.
+/// (provider names) + 4px + SEGMENT_H (weekly row) + 10px + SEGMENT_H (5h
+/// row) + 5px bottom margin = 3+14+2+14+4+13+10+13+5 = 78. The bar row
+/// height and the 10px gap between them (`ROW_GAP_H`) are unchanged from
+/// before this feature; only the two header rows and their margins are new.
+/// The weekly row is drawn above the 5h row (see `pace_row_layout`) —
+/// visual order doesn't change this total. Not visually verified on this
+/// machine — see completion report.
 const WIDGET_HEIGHT: i32 = 78;
 
-fn is_drag_handle_point(client_x: i32, client_y: i32) -> bool {
+/// Height of one additional pace-guidance text line (the weekly row's
+/// secondary/detail lines), reusing the same line-height already used for
+/// the header rows above the bars — see `HEADER_ROW_H`. Not visually
+/// verified on this machine — see completion report.
+const PACE_LINE_H: i32 = HEADER_ROW_H;
+
+/// Logical (pre-DPI-scale) gap between the popup's two main bar rows —
+/// weekly and 5h — reusing the same `10` this widget always used between
+/// them (see `WIDGET_HEIGHT`'s breakdown). Named so `popup_height_logical`
+/// and `pace_row_layout` can each add or remove exactly this much depending
+/// on whether the 5h row has anything to show this poll.
+const ROW_GAP_H: i32 = 10;
+
+/// How many extra lines below the weekly bar this one provider's
+/// pace-guidance block actually needs: `secondary` present adds one,
+/// `detail` present (only ever populated alongside `secondary` — see
+/// `weekly_pace_guidance_lines`) adds another. `None` — not
+/// `CellState::Ok`, or no usable pace data (e.g. reset time unknown) —
+/// needs zero, regardless of `DisplayDensity`.
+fn weekly_pace_extra_lines_for(pace: Option<&PaceGuidanceLines>) -> i32 {
+    match pace {
+        Some(lines) => i32::from(lines.secondary.is_some()) + i32::from(lines.detail.is_some()),
+        None => 0,
+    }
+}
+
+/// Max extra weekly-guidance lines the popup must reserve: the max actually
+/// needed across only the *currently-shown* providers. A hidden provider's
+/// stale pace data (if any lingers in `AppState`) must never affect the
+/// shared popup height, and providers that are shown but not
+/// `CellState::Ok` (loading/error/unconfigured/not-available) contribute
+/// zero via `weekly_pace_extra_lines_for`'s `None` case. Flattened (no
+/// `&AppState`) so both the state-holding call sites below and
+/// `paint_content`'s own already-flattened params share one implementation
+/// instead of two copies of the same predicate, and so this is directly
+/// testable without constructing an `AppState`.
+fn weekly_pace_extra_lines_shown(
+    show_claude_code: bool,
+    weekly_pace: Option<&PaceGuidanceLines>,
+    show_codex: bool,
+    codex_weekly_pace: Option<&PaceGuidanceLines>,
+    show_antigravity: bool,
+    antigravity_weekly_pace: Option<&PaceGuidanceLines>,
+) -> i32 {
+    let mut max_lines = 0;
+    if show_claude_code {
+        max_lines = max_lines.max(weekly_pace_extra_lines_for(weekly_pace));
+    }
+    if show_codex {
+        max_lines = max_lines.max(weekly_pace_extra_lines_for(codex_weekly_pace));
+    }
+    if show_antigravity {
+        max_lines = max_lines.max(weekly_pace_extra_lines_for(antigravity_weekly_pace));
+    }
+    max_lines
+}
+
+fn weekly_pace_extra_lines(state: &AppState) -> i32 {
+    weekly_pace_extra_lines_shown(
+        state.show_claude_code,
+        state.weekly_pace.as_ref(),
+        state.show_codex,
+        state.codex_weekly_pace.as_ref(),
+        state.show_antigravity,
+        state.antigravity_weekly_pace.as_ref(),
+    )
+}
+
+/// One provider's decision for the (repurposed, `ShortWindowVisibility`-
+/// gated) 5h bar row: whether this cell shows anything at all this poll,
+/// and if so, what `percent`/`text` to draw. `text` is `render_cell`'s
+/// output for this cell — the same status word (`Loading`/`FetchFailed`/
+/// `Retrying`/`NotConfigured`/`NotAvailable`) or plain percent+reset text
+/// the cell would have shown before pace guidance existed. Branches on
+/// `state` itself (never on `text`'s content) so a status word never has to
+/// be pattern-matched or string-compared to be recognized as one.
+///
+/// - `Hidden`: never shows anything, regardless of `state` — the user chose
+///   to hide the 5h window entirely, including its error/loading states.
+/// - `pace` is `Some` (`CellState::Ok`, and `Always`/overpacing-`WarningOnly`
+///   warrants a line — see `short_window_pace_guidance_lines`): shows the
+///   pace-guidance `primary` line at the original `percent`.
+/// - `state` is `Ok` with a real current value (`percent` is `Some`, per
+///   `CellDisplay::bar_percent`'s contract) but no `pace` this poll
+///   (`WarningOnly` + not overpacing, or an `Always` non-finite-percent
+///   edge): nothing to show — the row is pace-driven once a cell has a
+///   real value, not a duplicate of the plain number.
+/// - Anything else — `state` is not `Ok`, or is `Ok` but paired with a
+///   missing value (the `render_cell`/`status_text` caller-bug fail-safe,
+///   where `status_text` fails safe to "not available" text) — keeps the
+///   existing status `text`: a suppressed *pace* line must never suppress
+///   the provider's actual poll status.
+fn session_cell_decision<'a>(
+    state: CellState,
+    percent: Option<f64>,
+    text: &'a str,
+    pace: Option<&'a PaceGuidanceLines>,
+    visibility: ShortWindowVisibility,
+) -> (bool, Option<f64>, &'a str) {
+    if visibility == ShortWindowVisibility::Hidden {
+        return (false, None, "");
+    }
+    if let Some(lines) = pace {
+        return (true, percent, lines.primary.as_str());
+    }
+    if state == CellState::Ok && percent.is_some() {
+        return (false, None, "");
+    }
+    (true, percent, text)
+}
+
+/// Whether the 5h bar row has anything to draw at all this poll: at least
+/// one *currently-shown* provider's `session_cell_decision` says to show
+/// something. The `show_*` checks here are the authority — a hidden
+/// provider's decision must never keep the row alive. This is the single
+/// predicate popup height and the row's own draw call must agree on (both
+/// derive their `*_shows` inputs from the same `session_cell_decision`
+/// calls); when `false` the row (and its connecting `ROW_GAP_H`) are
+/// removed from the layout entirely rather than left blank.
+fn session_row_visible(
+    show_claude_code: bool,
+    claude_shows: bool,
+    show_codex: bool,
+    codex_shows: bool,
+    show_antigravity: bool,
+    antigravity_shows: bool,
+) -> bool {
+    (show_claude_code && claude_shows)
+        || (show_codex && codex_shows)
+        || (show_antigravity && antigravity_shows)
+}
+
+fn needs_session_row(state: &AppState) -> bool {
+    let visibility = state.short_window_visibility;
+    let (claude_shows, _, _) = session_cell_decision(
+        state.session_state,
+        state.session_percent,
+        &state.session_text,
+        state.session_pace.as_ref(),
+        visibility,
+    );
+    let (codex_shows, _, _) = session_cell_decision(
+        state.codex_session_state,
+        state.codex_session_percent,
+        &state.codex_session_text,
+        state.codex_session_pace.as_ref(),
+        visibility,
+    );
+    let (antigravity_shows, _, _) = session_cell_decision(
+        state.antigravity_session_state,
+        state.antigravity_session_percent,
+        &state.antigravity_session_text,
+        state.antigravity_session_pace.as_ref(),
+        visibility,
+    );
+    session_row_visible(
+        state.show_claude_code,
+        claude_shows,
+        state.show_codex,
+        codex_shows,
+        state.show_antigravity,
+        antigravity_shows,
+    )
+}
+
+/// Popup height (logical, pre-DPI-scale px) for the current pace-guidance
+/// block. `WIDGET_HEIGHT` already covers both main bar rows (weekly and 5h)
+/// and the `ROW_GAP_H` between them — see its own breakdown comment. When
+/// the 5h row has nothing to show this poll, that row and its connecting
+/// gap are removed from the budget entirely (the weekly block simply moves
+/// down to fill the space) rather than left as blank space. Composed
+/// entirely in logical units — callers apply `sc(...)` once, at the end.
+fn popup_height_logical(weekly_extra_lines: i32, needs_session_row: bool) -> i32 {
+    let base = if needs_session_row {
+        WIDGET_HEIGHT
+    } else {
+        WIDGET_HEIGHT - ROW_GAP_H - SEGMENT_H
+    };
+    base + weekly_extra_lines * PACE_LINE_H
+}
+
+/// Popup height for the current state: the base widget height plus
+/// whatever the pace-guidance block currently needs. Mirrors
+/// `total_widget_width_for_state`'s pattern of a `&AppState`-taking
+/// variant (used where a lock is already held) alongside a self-locking
+/// `widget_height()` convenience wrapper below.
+fn widget_height_for_state(state: &AppState) -> i32 {
+    sc(popup_height_logical(
+        weekly_pace_extra_lines(state),
+        needs_session_row(state),
+    ))
+}
+
+fn widget_height() -> i32 {
+    let state = lock_state();
+    match state.as_ref() {
+        Some(s) => widget_height_for_state(s),
+        None => sc(WIDGET_HEIGHT),
+    }
+}
+
+/// Logical y-coordinates (already DPI-scaled, same convention `paint_content`
+/// uses throughout) for every row in the popup's header + weekly/5h block,
+/// given the popup's total scaled `height` and the same
+/// `weekly_extra_lines`/`needs_session_row` inputs `popup_height_logical`
+/// used to size that `height` in the first place — the two must always
+/// agree, which is why this is the one place either `paint_content` or a
+/// test computes these positions. Order top to bottom: basis label,
+/// provider header, weekly bar, weekly secondary/detail (if any — a single
+/// anchor `weekly_secondary_y`; `draw_weekly_pace_extra_lines` steps detail
+/// down by one more `PACE_LINE_H` internally when present), then the 5h bar
+/// (if shown at all this poll) at the very bottom with a `ROW_GAP_H` gap
+/// above it — the same gap that used to sit between the two main bar rows.
+struct PaceRowLayout {
+    basis_label_y: i32,
+    provider_header_y: i32,
+    weekly_row_y: i32,
+    weekly_secondary_y: Option<i32>,
+    session_row_y: Option<i32>,
+}
+
+fn pace_row_layout(height: i32, weekly_extra_lines: i32, needs_session_row: bool) -> PaceRowLayout {
+    let weekly_extra_h = weekly_extra_lines * sc(PACE_LINE_H);
+    let (session_row_y, weekly_block_bottom) = if needs_session_row {
+        let session_y = height - sc(5) - sc(SEGMENT_H);
+        (Some(session_y), session_y - sc(ROW_GAP_H))
+    } else {
+        (None, height - sc(5))
+    };
+    let weekly_row_y = weekly_block_bottom - weekly_extra_h - sc(SEGMENT_H);
+    let weekly_secondary_y = (weekly_extra_lines >= 1).then_some(weekly_row_y + sc(SEGMENT_H));
+    let provider_header_y = weekly_row_y - sc(4) - sc(HEADER_ROW_H);
+    let basis_label_y = provider_header_y - sc(2) - sc(HEADER_ROW_H);
+    PaceRowLayout {
+        basis_label_y,
+        provider_header_y,
+        weekly_row_y,
+        weekly_secondary_y,
+        session_row_y,
+    }
+}
+
+/// `height` is the popup's *current* total height (now variable — see
+/// `widget_height`/`widget_height_for_state` — rather than the fixed
+/// `WIDGET_HEIGHT` this used before pace guidance could grow it), since the
+/// drag handle stays vertically centered on the popup regardless of how
+/// tall the pace-guidance block currently makes it.
+fn is_drag_handle_point(client_x: i32, client_y: i32, height: i32) -> bool {
     let divider_h = sc(25);
-    let divider_top = (sc(WIDGET_HEIGHT) - divider_h) / 2;
+    let divider_top = (height - divider_h) / 2;
     client_x >= 0
         && client_x < sc(DRAG_HANDLE_HIT_W)
         && client_y >= divider_top
@@ -2163,7 +2529,7 @@ fn cursor_is_on_drag_handle(hwnd: HWND) -> bool {
         if GetCursorPos(&mut pt).is_err() || !ScreenToClient(hwnd, &mut pt).as_bool() {
             return false;
         }
-        is_drag_handle_point(pt.x, pt.y)
+        is_drag_handle_point(pt.x, pt.y, widget_height())
     }
 }
 
@@ -2387,21 +2753,27 @@ pub fn run() {
                 session_state: CellState::Loading,
                 session_percent: None,
                 session_text: String::new(),
+                session_pace: None,
                 weekly_state: CellState::Loading,
                 weekly_percent: None,
                 weekly_text: String::new(),
+                weekly_pace: None,
                 codex_session_state: CellState::Loading,
                 codex_session_percent: None,
                 codex_session_text: String::new(),
+                codex_session_pace: None,
                 codex_weekly_state: CellState::Loading,
                 codex_weekly_percent: None,
                 codex_weekly_text: String::new(),
+                codex_weekly_pace: None,
                 antigravity_session_state: CellState::Loading,
                 antigravity_session_percent: None,
                 antigravity_session_text: String::new(),
+                antigravity_session_pace: None,
                 antigravity_weekly_state: CellState::Loading,
                 antigravity_weekly_percent: None,
                 antigravity_weekly_text: String::new(),
+                antigravity_weekly_pace: None,
                 show_claude_code: settings.show_claude_code,
                 show_codex: settings.show_codex,
                 show_antigravity: settings.show_antigravity,
@@ -2513,21 +2885,32 @@ fn render_layered() {
         embedded,
         strings,
         display_basis,
+        short_window_visibility,
+        session_state,
         session_pct,
         session_text,
+        session_pace,
         weekly_pct,
         weekly_text,
+        weekly_pace,
+        codex_session_state,
         codex_session_pct,
         codex_session_text,
+        codex_session_pace,
         codex_weekly_pct,
         codex_weekly_text,
+        codex_weekly_pace,
+        antigravity_session_state,
         antigravity_session_pct,
         antigravity_session_text,
+        antigravity_session_pace,
         antigravity_weekly_pct,
         antigravity_weekly_text,
+        antigravity_weekly_pace,
         show_claude_code,
         show_codex,
         show_antigravity,
+        height,
     ) = {
         let state = lock_state();
         match state.as_ref() {
@@ -2537,21 +2920,32 @@ fn render_layered() {
                 s.embedded,
                 s.language.strings(),
                 s.display_basis,
+                s.short_window_visibility,
+                s.session_state,
                 s.session_percent,
                 s.session_text.clone(),
+                s.session_pace.clone(),
                 s.weekly_percent,
                 s.weekly_text.clone(),
+                s.weekly_pace.clone(),
+                s.codex_session_state,
                 s.codex_session_percent,
                 s.codex_session_text.clone(),
+                s.codex_session_pace.clone(),
                 s.codex_weekly_percent,
                 s.codex_weekly_text.clone(),
+                s.codex_weekly_pace.clone(),
+                s.antigravity_session_state,
                 s.antigravity_session_percent,
                 s.antigravity_session_text.clone(),
+                s.antigravity_session_pace.clone(),
                 s.antigravity_weekly_percent,
                 s.antigravity_weekly_text.clone(),
+                s.antigravity_weekly_pace.clone(),
                 s.show_claude_code,
                 s.show_codex,
                 s.show_antigravity,
+                widget_height_for_state(s),
             ),
             None => return,
         }
@@ -2568,7 +2962,6 @@ fn render_layered() {
     }
 
     let width = total_widget_width();
-    let height = sc(WIDGET_HEIGHT);
 
     let accent = claude_accent_color();
     let codex_accent = codex_accent_color(is_dark);
@@ -2633,18 +3026,28 @@ fn render_layered() {
             &track,
             strings,
             display_basis,
+            short_window_visibility,
+            session_state,
             session_pct,
             &session_text,
+            session_pace.as_ref(),
             weekly_pct,
             &weekly_text,
+            weekly_pace.as_ref(),
+            codex_session_state,
             codex_session_pct,
             &codex_session_text,
+            codex_session_pace.as_ref(),
             codex_weekly_pct,
             &codex_weekly_text,
+            codex_weekly_pace.as_ref(),
+            antigravity_session_state,
             antigravity_session_pct,
             &antigravity_session_text,
+            antigravity_session_pace.as_ref(),
             antigravity_weekly_pct,
             &antigravity_weekly_text,
+            antigravity_weekly_pace.as_ref(),
             show_claude_code,
             show_codex,
             show_antigravity,
@@ -2710,18 +3113,28 @@ fn paint_content(
     track: &Color,
     strings: Strings,
     display_basis: DisplayBasis,
+    short_window_visibility: ShortWindowVisibility,
+    session_state: CellState,
     session_pct: Option<f64>,
     session_text: &str,
+    session_pace: Option<&PaceGuidanceLines>,
     weekly_pct: Option<f64>,
     weekly_text: &str,
+    weekly_pace: Option<&PaceGuidanceLines>,
+    codex_session_state: CellState,
     codex_session_pct: Option<f64>,
     codex_session_text: &str,
+    codex_session_pace: Option<&PaceGuidanceLines>,
     codex_weekly_pct: Option<f64>,
     codex_weekly_text: &str,
+    codex_weekly_pace: Option<&PaceGuidanceLines>,
+    antigravity_session_state: CellState,
     antigravity_session_pct: Option<f64>,
     antigravity_session_text: &str,
+    antigravity_session_pace: Option<&PaceGuidanceLines>,
     antigravity_weekly_pct: Option<f64>,
     antigravity_weekly_text: &str,
+    antigravity_weekly_pace: Option<&PaceGuidanceLines>,
     show_claude_code: bool,
     show_codex: bool,
     show_antigravity: bool,
@@ -2778,10 +3191,50 @@ fn paint_content(
         let _ = DeleteObject(right_brush);
 
         let content_x = sc(LEFT_DIVIDER_W) + sc(DIVIDER_RIGHT_MARGIN);
-        let row2_y = height - sc(5) - sc(SEGMENT_H);
-        let row1_y = row2_y - sc(10) - sc(SEGMENT_H);
-        let provider_header_y = row1_y - sc(4) - sc(HEADER_ROW_H);
-        let basis_label_y = provider_header_y - sc(2) - sc(HEADER_ROW_H);
+
+        // AUM-PACE-GUIDANCE-01: same predicates as the `&AppState`-based
+        // `weekly_pace_extra_lines`/`needs_session_row` (used for popup
+        // sizing), applied to this function's own flattened params, so the
+        // layout computed here always agrees with what
+        // `widget_height_for_state` sized the popup to.
+        let weekly_lines = weekly_pace_extra_lines_shown(
+            show_claude_code,
+            weekly_pace,
+            show_codex,
+            codex_weekly_pace,
+            show_antigravity,
+            antigravity_weekly_pace,
+        );
+        let claude_session_decision = session_cell_decision(
+            session_state,
+            session_pct,
+            session_text,
+            session_pace,
+            short_window_visibility,
+        );
+        let codex_session_decision = session_cell_decision(
+            codex_session_state,
+            codex_session_pct,
+            codex_session_text,
+            codex_session_pace,
+            short_window_visibility,
+        );
+        let antigravity_session_decision = session_cell_decision(
+            antigravity_session_state,
+            antigravity_session_pct,
+            antigravity_session_text,
+            antigravity_session_pace,
+            short_window_visibility,
+        );
+        let needs_session_row = session_row_visible(
+            show_claude_code,
+            claude_session_decision.0,
+            show_codex,
+            codex_session_decision.0,
+            show_antigravity,
+            antigravity_session_decision.0,
+        );
+        let layout = pace_row_layout(height, weekly_lines, needs_session_row);
 
         let _ = SetBkMode(hdc, TRANSPARENT);
         let _ = SetTextColor(hdc, COLORREF(text_color.to_colorref()));
@@ -2812,7 +3265,7 @@ fn paint_content(
         draw_basis_label_row(
             hdc,
             content_x,
-            basis_label_y,
+            layout.basis_label_y,
             width - sc(RIGHT_MARGIN),
             text_color,
             basis_label,
@@ -2820,7 +3273,7 @@ fn paint_content(
         draw_provider_header_row(
             hdc,
             content_x,
-            provider_header_y,
+            layout.provider_header_y,
             text_color,
             strings,
             show_claude_code,
@@ -2828,40 +3281,35 @@ fn paint_content(
             show_antigravity,
         );
 
+        // AUM-PACE-GUIDANCE-01: when a provider has usable weekly pace
+        // guidance (`CellState::Ok` with a real percentage/reset — see
+        // `weekly_pace_for_cell`), its bar-row text becomes the guidance
+        // `primary` line (percent + basis prefix + pace-status word)
+        // instead of the plain percent+reset text; otherwise the existing
+        // status/plain text is unchanged.
+        let weekly_row_text = weekly_pace
+            .map(|l| l.primary.as_str())
+            .unwrap_or(weekly_text);
+        let codex_weekly_row_text = codex_weekly_pace
+            .map(|l| l.primary.as_str())
+            .unwrap_or(codex_weekly_text);
+        let antigravity_weekly_row_text = antigravity_weekly_pace
+            .map(|l| l.primary.as_str())
+            .unwrap_or(antigravity_weekly_text);
+
         draw_row(
             hdc,
             content_x,
-            row1_y,
-            is_dark,
-            text_color,
-            strings.session_window,
-            session_pct,
-            session_text,
-            codex_session_pct,
-            codex_session_text,
-            antigravity_session_pct,
-            antigravity_session_text,
-            show_claude_code,
-            show_codex,
-            show_antigravity,
-            accent,
-            codex_accent,
-            antigravity_accent,
-            track,
-        );
-        draw_row(
-            hdc,
-            content_x,
-            row2_y,
+            layout.weekly_row_y,
             is_dark,
             text_color,
             strings.weekly_window,
             weekly_pct,
-            weekly_text,
+            weekly_row_text,
             codex_weekly_pct,
-            codex_weekly_text,
+            codex_weekly_row_text,
             antigravity_weekly_pct,
-            antigravity_weekly_text,
+            antigravity_weekly_row_text,
             show_claude_code,
             show_codex,
             show_antigravity,
@@ -2870,6 +3318,90 @@ fn paint_content(
             antigravity_accent,
             track,
         );
+
+        // AUM-PACE-GUIDANCE-01: weekly secondary/detail lines, one column
+        // per shown provider, aligned under that provider's own bar (same
+        // column x positions `draw_row`/`draw_provider_header_row` use).
+        // `None` (not `CellState::Ok`, or no usable pace data) leaves that
+        // provider's column blank for this block rather than showing stale
+        // text.
+        if let Some(secondary_y) = layout.weekly_secondary_y {
+            let (claude_col_x, codex_col_x, antigravity_col_x) = provider_column_x_positions(
+                content_x,
+                show_claude_code,
+                show_codex,
+                show_antigravity,
+            );
+            let pace_column_width = model_usage_width(row_bar_segment_count(active_model_count(
+                show_claude_code,
+                show_codex,
+                show_antigravity,
+            )));
+
+            if show_claude_code {
+                draw_weekly_pace_extra_lines(
+                    hdc,
+                    claude_col_x,
+                    secondary_y,
+                    pace_column_width,
+                    weekly_pace,
+                    text_color,
+                );
+            }
+            if show_codex {
+                draw_weekly_pace_extra_lines(
+                    hdc,
+                    codex_col_x,
+                    secondary_y,
+                    pace_column_width,
+                    codex_weekly_pace,
+                    text_color,
+                );
+            }
+            if show_antigravity {
+                draw_weekly_pace_extra_lines(
+                    hdc,
+                    antigravity_col_x,
+                    secondary_y,
+                    pace_column_width,
+                    antigravity_weekly_pace,
+                    text_color,
+                );
+            }
+        }
+
+        // AUM-PACE-GUIDANCE-01: the 5h bar row is now the sole
+        // `ShortWindowVisibility`-gated 5h display — see
+        // `session_cell_decision`. A provider whose decision says not to
+        // show (suppressed by `Hidden`, or `WarningOnly` with nothing to
+        // warn about) shows a fully blank cell in this row; a provider
+        // that's not `CellState::Ok` keeps its existing status text
+        // instead of going blank. The row itself is skipped entirely (see
+        // `layout.session_row_y`/`needs_session_row`) when no shown
+        // provider's decision says to show anything.
+        if let Some(session_row_y) = layout.session_row_y {
+            draw_row(
+                hdc,
+                content_x,
+                session_row_y,
+                is_dark,
+                text_color,
+                strings.session_window,
+                claude_session_decision.1,
+                claude_session_decision.2,
+                codex_session_decision.1,
+                codex_session_decision.2,
+                antigravity_session_decision.1,
+                antigravity_session_decision.2,
+                show_claude_code,
+                show_codex,
+                show_antigravity,
+                accent,
+                codex_accent,
+                antigravity_accent,
+                track,
+            );
+        }
 
         SelectObject(hdc, old_font);
         let _ = DeleteObject(font);
@@ -3308,7 +3840,7 @@ fn position_at_taskbar() {
         save_state_settings();
     }
 
-    let widget_height = sc(WIDGET_HEIGHT);
+    let widget_height = widget_height();
     let y = compute_popup_y(work_area.top, work_area.bottom, widget_height);
     let desired_x = tray_left - widget_width - tray_offset;
     let x = clamp_popup_x(desired_x, work_area.left, work_area.right, widget_width);
@@ -3535,7 +4067,7 @@ unsafe extern "system" fn wnd_proc(
         WM_LBUTTONDOWN => {
             let client_x = (lparam.0 & 0xFFFF) as i16 as i32;
             let client_y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
-            if !is_drag_handle_point(client_x, client_y) {
+            if !is_drag_handle_point(client_x, client_y, widget_height()) {
                 return LRESULT(0);
             }
 
@@ -3606,7 +4138,7 @@ unsafe extern "system" fn wnd_proc(
                                     right: taskbar_rect.right,
                                     bottom: taskbar_rect.top,
                                 });
-                            let widget_height = sc(WIDGET_HEIGHT);
+                            let widget_height = widget_height_for_state(s);
                             let y = compute_popup_y(work_area.top, work_area.bottom, widget_height);
                             let desired_x = tray_left - widget_width - new_offset;
                             let x = clamp_popup_x(
@@ -3792,16 +4324,21 @@ unsafe extern "system" fn wnd_proc(
                 IDM_DISPLAY_DENSITY_COMPACT
                 | IDM_DISPLAY_DENSITY_STANDARD
                 | IDM_DISPLAY_DENSITY_DETAILED => {
-                    // Not yet consumed by any drawing code, so unlike the
-                    // display-basis handler above there is nothing to
-                    // recompute or redraw here — just persist the choice.
+                    // Now consumed by the pace-guidance popup drawing (see
+                    // AUM-PACE-GUIDANCE-01's connection unit), so — same as
+                    // the display-basis handler above — recompute the cached
+                    // pace text and reposition/redraw immediately; density
+                    // can change the popup's required height.
                     if let Some(new_density) = display_density_for_menu_id(id) {
                         let mut state = lock_state();
                         if let Some(s) = state.as_mut() {
                             s.display_density = new_density;
+                            refresh_usage_texts(s);
                         }
                     }
                     save_state_settings();
+                    position_at_taskbar();
+                    render_layered();
                 }
                 IDM_SHORT_WINDOW_VISIBILITY_ALWAYS
                 | IDM_SHORT_WINDOW_VISIBILITY_WARNING_ONLY
@@ -3810,9 +4347,12 @@ unsafe extern "system" fn wnd_proc(
                         let mut state = lock_state();
                         if let Some(s) = state.as_mut() {
                             s.short_window_visibility = new_visibility;
+                            refresh_usage_texts(s);
                         }
                     }
                     save_state_settings();
+                    position_at_taskbar();
+                    render_layered();
                 }
                 IDM_SHORT_WINDOW_ALERT_SENSITIVITY_SENSITIVE
                 | IDM_SHORT_WINDOW_ALERT_SENSITIVITY_STANDARD
@@ -3821,9 +4361,12 @@ unsafe extern "system" fn wnd_proc(
                         let mut state = lock_state();
                         if let Some(s) = state.as_mut() {
                             s.short_window_alert_sensitivity = new_sensitivity;
+                            refresh_usage_texts(s);
                         }
                     }
                     save_state_settings();
+                    position_at_taskbar();
+                    render_layered();
                 }
                 IDM_FREQ_1MIN | IDM_FREQ_5MIN | IDM_FREQ_15MIN | IDM_FREQ_1HOUR => {
                     let new_interval = match id {
@@ -4446,18 +4989,28 @@ fn paint(hdc: HDC, hwnd: HWND) {
         is_dark,
         strings,
         display_basis,
+        short_window_visibility,
+        session_state,
         session_pct,
         session_text,
+        session_pace,
         weekly_pct,
         weekly_text,
+        weekly_pace,
+        codex_session_state,
         codex_session_pct,
         codex_session_text,
+        codex_session_pace,
         codex_weekly_pct,
         codex_weekly_text,
+        codex_weekly_pace,
+        antigravity_session_state,
         antigravity_session_pct,
         antigravity_session_text,
+        antigravity_session_pace,
         antigravity_weekly_pct,
         antigravity_weekly_text,
+        antigravity_weekly_pace,
         show_claude_code,
         show_codex,
         show_antigravity,
@@ -4468,18 +5021,28 @@ fn paint(hdc: HDC, hwnd: HWND) {
                 s.is_dark,
                 s.language.strings(),
                 s.display_basis,
+                s.short_window_visibility,
+                s.session_state,
                 s.session_percent,
                 s.session_text.clone(),
+                s.session_pace.clone(),
                 s.weekly_percent,
                 s.weekly_text.clone(),
+                s.weekly_pace.clone(),
+                s.codex_session_state,
                 s.codex_session_percent,
                 s.codex_session_text.clone(),
+                s.codex_session_pace.clone(),
                 s.codex_weekly_percent,
                 s.codex_weekly_text.clone(),
+                s.codex_weekly_pace.clone(),
+                s.antigravity_session_state,
                 s.antigravity_session_percent,
                 s.antigravity_session_text.clone(),
+                s.antigravity_session_pace.clone(),
                 s.antigravity_weekly_percent,
                 s.antigravity_weekly_text.clone(),
+                s.antigravity_weekly_pace.clone(),
                 s.show_claude_code,
                 s.show_codex,
                 s.show_antigravity,
@@ -4532,18 +5095,28 @@ fn paint(hdc: HDC, hwnd: HWND) {
             &track,
             strings,
             display_basis,
+            short_window_visibility,
+            session_state,
             session_pct,
             &session_text,
+            session_pace.as_ref(),
             weekly_pct,
             &weekly_text,
+            weekly_pace.as_ref(),
+            codex_session_state,
             codex_session_pct,
             &codex_session_text,
+            codex_session_pace.as_ref(),
             codex_weekly_pct,
             &codex_weekly_text,
+            codex_weekly_pace.as_ref(),
+            antigravity_session_state,
             antigravity_session_pct,
             &antigravity_session_text,
+            antigravity_session_pace.as_ref(),
             antigravity_weekly_pct,
             &antigravity_weekly_text,
+            antigravity_weekly_pace.as_ref(),
             show_claude_code,
             show_codex,
             show_antigravity,
@@ -4639,6 +5212,96 @@ fn draw_basis_label_row(
             &mut label_rect,
             DT_LEFT | DT_VCENTER | DT_SINGLELINE,
         );
+    }
+}
+
+/// The left-edge x position of each shown provider's bar/value column,
+/// mirroring `draw_row`'s own internal `model_x` walk exactly (same
+/// constants, same order) so pace-guidance text drawn separately still
+/// lines up under the right bar. A provider's slot is `0` when it isn't
+/// shown — harmless, since every caller here gates on the matching
+/// `show_*` flag before using it.
+fn provider_column_x_positions(
+    content_x: i32,
+    show_claude_code: bool,
+    show_codex: bool,
+    show_antigravity: bool,
+) -> (i32, i32, i32) {
+    let segment_count = row_bar_segment_count(active_model_count(
+        show_claude_code,
+        show_codex,
+        show_antigravity,
+    ));
+    let column_width = model_usage_width(segment_count);
+
+    let mut model_x = content_x + sc(LABEL_WIDTH) + sc(LABEL_RIGHT_MARGIN);
+    let mut claude_x = 0;
+    let mut codex_x = 0;
+    let mut antigravity_x = 0;
+    if show_claude_code {
+        claude_x = model_x;
+        model_x += column_width + sc(MODEL_RIGHT_MARGIN);
+    }
+    if show_codex {
+        codex_x = model_x;
+        model_x += column_width + sc(MODEL_RIGHT_MARGIN);
+    }
+    if show_antigravity {
+        antigravity_x = model_x;
+    }
+    (claude_x, codex_x, antigravity_x)
+}
+
+/// One line of pace-guidance text under a provider's column, sized to that
+/// provider's own bar+value column width (`model_usage_width`) — comfortable
+/// for the common single-provider popup; a 2-3 provider layout may clip a
+/// long localized string. Not visually verified on this machine — see
+/// completion report.
+fn draw_pace_text_line(hdc: HDC, x: i32, y: i32, width: i32, text: &str, color: &Color) {
+    unsafe {
+        let _ = SetTextColor(hdc, COLORREF(color.to_colorref()));
+        let mut wide: Vec<u16> = text.encode_utf16().collect();
+        let mut rect = RECT {
+            left: x,
+            top: y,
+            right: x + width,
+            bottom: y + sc(PACE_LINE_H),
+        };
+        // DT_END_ELLIPSIS: a too-long localized string truncates with a
+        // visible "…" instead of silently clipping mid-glyph at the column
+        // edge — see AUM-PACE-GUIDANCE-01's popup-connection completion
+        // report on `TEXT_WIDTH`'s worst-case sizing not being live-measured.
+        let _ = DrawTextW(
+            hdc,
+            &mut wide,
+            &mut rect,
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
+        );
+    }
+}
+
+/// Draws one provider's weekly secondary/detail lines (Standard/Detailed
+/// density only — see `weekly_pace_guidance_lines`), stacked below its bar.
+/// `None` (not `CellState::Ok`, or no usable pace data) draws nothing,
+/// leaving the reserved space blank rather than showing stale text.
+fn draw_weekly_pace_extra_lines(
+    hdc: HDC,
+    x: i32,
+    y: i32,
+    width: i32,
+    pace: Option<&PaceGuidanceLines>,
+    text_color: &Color,
+) {
+    let Some(lines) = pace else {
+        return;
+    };
+    let mut line_y = y;
+    if let Some(secondary) = &lines.secondary {
+        draw_pace_text_line(hdc, x, line_y, width, secondary, text_color);
+        line_y += sc(PACE_LINE_H);
+    }
+    if let Some(detail) = &lines.detail {
+        draw_pace_text_line(hdc, x, line_y, width, detail, text_color);
     }
 }
 
@@ -4921,23 +5584,23 @@ mod tests {
 
     #[test]
     fn drag_handle_hit_area_includes_x_zero_at_96_dpi() {
-        assert!(is_drag_handle_point(0, 40));
+        assert!(is_drag_handle_point(0, 40, WIDGET_HEIGHT));
     }
 
     #[test]
     fn drag_handle_hit_area_includes_x_nine_at_96_dpi() {
-        assert!(is_drag_handle_point(9, 40));
+        assert!(is_drag_handle_point(9, 40, WIDGET_HEIGHT));
     }
 
     #[test]
     fn drag_handle_hit_area_excludes_x_ten_at_96_dpi() {
-        assert!(!is_drag_handle_point(10, 40));
+        assert!(!is_drag_handle_point(10, 40, WIDGET_HEIGHT));
     }
 
     #[test]
     fn drag_handle_hit_area_excludes_points_outside_vertical_range() {
-        assert!(!is_drag_handle_point(5, 25));
-        assert!(!is_drag_handle_point(5, 51));
+        assert!(!is_drag_handle_point(5, 25, WIDGET_HEIGHT));
+        assert!(!is_drag_handle_point(5, 51, WIDGET_HEIGHT));
     }
 
     #[test]
@@ -5938,6 +6601,741 @@ mod tests {
             unit: FuturePaceUnit::PerDay,
         };
         assert_eq!(format_future_pace_guidance(&bad_guidance, strings), None);
+    }
+
+    // ── AUM-PACE-GUIDANCE-01: popup connection (CellState gating, extra
+    // line composition) ─────────────────────────────────────────────────
+
+    #[test]
+    fn weekly_pace_for_cell_is_none_for_every_non_ok_state() {
+        let now = SystemTime::now();
+        let strings = LanguageId::English.strings();
+        let section = UsageSection {
+            percentage: 42.0,
+            resets_at: Some(now + Duration::from_secs(WEEKLY_WINDOW_SECS / 2)),
+        };
+        for state in [
+            CellState::Loading,
+            CellState::FetchFailed,
+            CellState::Retrying,
+            CellState::NotConfigured,
+            CellState::NotAvailable,
+        ] {
+            assert_eq!(
+                weekly_pace_for_cell(
+                    state,
+                    Some(&section),
+                    now,
+                    DisplayBasis::UsedPercentage,
+                    DisplayDensity::Detailed,
+                    strings,
+                ),
+                None,
+                "state {state:?} must not produce pace guidance even with a cached section"
+            );
+        }
+    }
+
+    #[test]
+    fn weekly_pace_for_cell_is_none_when_ok_but_section_missing() {
+        let now = SystemTime::now();
+        let strings = LanguageId::English.strings();
+        assert_eq!(
+            weekly_pace_for_cell(
+                CellState::Ok,
+                None,
+                now,
+                DisplayBasis::UsedPercentage,
+                DisplayDensity::Standard,
+                strings,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn weekly_pace_for_cell_is_some_when_ok_with_section() {
+        let now = SystemTime::now();
+        let strings = LanguageId::English.strings();
+        let section = UsageSection {
+            percentage: 42.0,
+            resets_at: Some(now + Duration::from_secs(WEEKLY_WINDOW_SECS / 2)),
+        };
+        assert!(weekly_pace_for_cell(
+            CellState::Ok,
+            Some(&section),
+            now,
+            DisplayBasis::UsedPercentage,
+            DisplayDensity::Standard,
+            strings,
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn session_pace_for_cell_is_none_for_every_non_ok_state() {
+        let now = SystemTime::now();
+        let strings = LanguageId::English.strings();
+        let section = UsageSection {
+            percentage: 80.0,
+            resets_at: Some(now + Duration::from_secs(SESSION_WINDOW_SECS / 2)),
+        };
+        for state in [
+            CellState::Loading,
+            CellState::FetchFailed,
+            CellState::Retrying,
+            CellState::NotConfigured,
+            CellState::NotAvailable,
+        ] {
+            assert_eq!(
+                session_pace_for_cell(
+                    state,
+                    Some(&section),
+                    now,
+                    DisplayBasis::UsedPercentage,
+                    ShortWindowVisibility::Always,
+                    ShortWindowAlertSensitivity::Standard,
+                    strings,
+                ),
+                None,
+                "state {state:?} must not produce pace guidance even with a cached section"
+            );
+        }
+    }
+
+    #[test]
+    fn session_pace_for_cell_is_some_when_ok_with_section() {
+        let now = SystemTime::now();
+        let strings = LanguageId::English.strings();
+        let section = UsageSection {
+            percentage: 24.0,
+            resets_at: Some(now + Duration::from_secs(SESSION_WINDOW_SECS / 2)),
+        };
+        assert!(session_pace_for_cell(
+            CellState::Ok,
+            Some(&section),
+            now,
+            DisplayBasis::UsedPercentage,
+            ShortWindowVisibility::Always,
+            ShortWindowAlertSensitivity::Standard,
+            strings,
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn weekly_pace_extra_lines_for_is_zero_without_secondary_or_detail() {
+        let lines = PaceGuidanceLines {
+            primary: "x".to_string(),
+            secondary: None,
+            detail: None,
+            is_warning: false,
+        };
+        assert_eq!(weekly_pace_extra_lines_for(Some(&lines)), 0);
+        assert_eq!(weekly_pace_extra_lines_for(None), 0);
+    }
+
+    #[test]
+    fn weekly_pace_extra_lines_for_is_one_with_secondary_only() {
+        let lines = PaceGuidanceLines {
+            primary: "x".to_string(),
+            secondary: Some("y".to_string()),
+            detail: None,
+            is_warning: false,
+        };
+        assert_eq!(weekly_pace_extra_lines_for(Some(&lines)), 1);
+    }
+
+    #[test]
+    fn weekly_pace_extra_lines_for_is_two_with_secondary_and_detail() {
+        let lines = PaceGuidanceLines {
+            primary: "x".to_string(),
+            secondary: Some("y".to_string()),
+            detail: Some("z".to_string()),
+            is_warning: false,
+        };
+        assert_eq!(weekly_pace_extra_lines_for(Some(&lines)), 2);
+    }
+
+    // ── AUM-PACE-GUIDANCE-01: existing-5h-row popup connection (row reuse,
+    // reordering, height/layout pure helpers) ──────────────────────────────
+
+    #[test]
+    fn weekly_pace_extra_lines_shown_ignores_hidden_providers_pace() {
+        let lines = PaceGuidanceLines {
+            primary: "x".to_string(),
+            secondary: Some("y".to_string()),
+            detail: Some("z".to_string()),
+            is_warning: false,
+        };
+        // codex has 2 lines worth of data but isn't shown; must not count.
+        assert_eq!(
+            weekly_pace_extra_lines_shown(true, None, false, Some(&lines), false, None),
+            0
+        );
+    }
+
+    #[test]
+    fn weekly_pace_extra_lines_shown_uses_max_across_shown_providers() {
+        let one_line = PaceGuidanceLines {
+            primary: "x".to_string(),
+            secondary: Some("y".to_string()),
+            detail: None,
+            is_warning: false,
+        };
+        let two_lines = PaceGuidanceLines {
+            primary: "x".to_string(),
+            secondary: Some("y".to_string()),
+            detail: Some("z".to_string()),
+            is_warning: false,
+        };
+        assert_eq!(
+            weekly_pace_extra_lines_shown(
+                true,
+                Some(&one_line),
+                true,
+                Some(&two_lines),
+                false,
+                None
+            ),
+            2
+        );
+    }
+
+    #[test]
+    fn weekly_pace_extra_lines_for_compact_density_is_zero() {
+        let now = SystemTime::now();
+        let strings = LanguageId::English.strings();
+        let resets_at = Some(now + Duration::from_secs(WEEKLY_WINDOW_SECS / 2));
+        let lines = weekly_pace_guidance_lines(
+            Some(69.0),
+            resets_at,
+            now,
+            DisplayBasis::UsedPercentage,
+            DisplayDensity::Compact,
+            strings,
+        )
+        .unwrap();
+        assert_eq!(weekly_pace_extra_lines_for(Some(&lines)), 0);
+    }
+
+    #[test]
+    fn weekly_pace_extra_lines_for_standard_density_is_one() {
+        let now = SystemTime::now();
+        let strings = LanguageId::English.strings();
+        let resets_at = Some(now + Duration::from_secs(WEEKLY_WINDOW_SECS / 2));
+        let lines = weekly_pace_guidance_lines(
+            Some(69.0),
+            resets_at,
+            now,
+            DisplayBasis::UsedPercentage,
+            DisplayDensity::Standard,
+            strings,
+        )
+        .unwrap();
+        assert_eq!(weekly_pace_extra_lines_for(Some(&lines)), 1);
+    }
+
+    #[test]
+    fn weekly_pace_extra_lines_for_detailed_density_is_two() {
+        let now = SystemTime::now();
+        let strings = LanguageId::English.strings();
+        // Same 69%-at-50%-elapsed inputs as
+        // `weekly_pace_guidance_detailed_shows_pace_diff`, which produces
+        // both a pace-diff and an exhaustion detail segment.
+        let resets_at = Some(now + Duration::from_secs(WEEKLY_WINDOW_SECS / 2));
+        let lines = weekly_pace_guidance_lines(
+            Some(69.0),
+            resets_at,
+            now,
+            DisplayBasis::UsedPercentage,
+            DisplayDensity::Detailed,
+            strings,
+        )
+        .unwrap();
+        assert_eq!(weekly_pace_extra_lines_for(Some(&lines)), 2);
+    }
+
+    // ── session_cell_decision: existing status text vs. pace guidance,
+    // per `ShortWindowVisibility` (regression fix — the existing 5h bar
+    // row must keep showing Loading/FetchFailed/Retrying/NotConfigured/
+    // NotAvailable, not just pace guidance) ─────────────────────────────
+
+    #[test]
+    fn session_cell_decision_always_ok_with_pace_uses_percent_and_primary() {
+        let lines = PaceGuidanceLines {
+            primary: "68% overpacing".to_string(),
+            secondary: None,
+            detail: None,
+            is_warning: true,
+        };
+        let (shows, percent, text) = session_cell_decision(
+            CellState::Ok,
+            Some(42.0),
+            "42%",
+            Some(&lines),
+            ShortWindowVisibility::Always,
+        );
+        assert!(shows);
+        assert_eq!(percent, Some(42.0));
+        assert_eq!(text, "68% overpacing");
+    }
+
+    #[test]
+    fn session_cell_decision_always_loading_keeps_existing_text() {
+        let strings = LanguageId::English.strings();
+        let (shows, percent, text) = session_cell_decision(
+            CellState::Loading,
+            None,
+            strings.loading,
+            None,
+            ShortWindowVisibility::Always,
+        );
+        assert!(shows);
+        assert_eq!(percent, None);
+        assert_eq!(text, strings.loading);
+    }
+
+    #[test]
+    fn session_cell_decision_always_fetch_failed_keeps_existing_text() {
+        let strings = LanguageId::English.strings();
+        let (shows, percent, text) = session_cell_decision(
+            CellState::FetchFailed,
+            None,
+            strings.fetch_failed,
+            None,
+            ShortWindowVisibility::Always,
+        );
+        assert!(shows);
+        assert_eq!(percent, None);
+        assert_eq!(text, strings.fetch_failed);
+    }
+
+    #[test]
+    fn session_cell_decision_always_retrying_keeps_existing_text() {
+        let strings = LanguageId::English.strings();
+        let (shows, percent, text) = session_cell_decision(
+            CellState::Retrying,
+            None,
+            strings.retrying,
+            None,
+            ShortWindowVisibility::Always,
+        );
+        assert!(shows);
+        assert_eq!(percent, None);
+        assert_eq!(text, strings.retrying);
+    }
+
+    #[test]
+    fn session_cell_decision_always_not_configured_keeps_existing_text() {
+        let strings = LanguageId::English.strings();
+        let (shows, percent, text) = session_cell_decision(
+            CellState::NotConfigured,
+            None,
+            strings.not_configured,
+            None,
+            ShortWindowVisibility::Always,
+        );
+        assert!(shows);
+        assert_eq!(percent, None);
+        assert_eq!(text, strings.not_configured);
+    }
+
+    #[test]
+    fn session_cell_decision_always_not_available_keeps_existing_text() {
+        let strings = LanguageId::English.strings();
+        let (shows, percent, text) = session_cell_decision(
+            CellState::NotAvailable,
+            None,
+            strings.not_available,
+            None,
+            ShortWindowVisibility::Always,
+        );
+        assert!(shows);
+        assert_eq!(percent, None);
+        assert_eq!(text, strings.not_available);
+    }
+
+    #[test]
+    fn session_cell_decision_warning_only_ok_normal_is_blank() {
+        let (shows, percent, text) = session_cell_decision(
+            CellState::Ok,
+            Some(24.0),
+            "24%",
+            None,
+            ShortWindowVisibility::WarningOnly,
+        );
+        assert!(!shows);
+        assert_eq!(percent, None);
+        assert_eq!(text, "");
+    }
+
+    #[test]
+    fn session_cell_decision_warning_only_overpacing_shows_pace() {
+        let lines = PaceGuidanceLines {
+            primary: "68% overpacing".to_string(),
+            secondary: None,
+            detail: None,
+            is_warning: true,
+        };
+        let (shows, percent, text) = session_cell_decision(
+            CellState::Ok,
+            Some(68.0),
+            "68%",
+            Some(&lines),
+            ShortWindowVisibility::WarningOnly,
+        );
+        assert!(shows);
+        assert_eq!(percent, Some(68.0));
+        assert_eq!(text, "68% overpacing");
+    }
+
+    #[test]
+    fn session_cell_decision_warning_only_non_ok_shows_existing_text() {
+        let strings = LanguageId::English.strings();
+        for state in [
+            CellState::Loading,
+            CellState::FetchFailed,
+            CellState::Retrying,
+            CellState::NotConfigured,
+            CellState::NotAvailable,
+        ] {
+            let text = status_text(state, strings);
+            let (shows, percent, out_text) =
+                session_cell_decision(state, None, text, None, ShortWindowVisibility::WarningOnly);
+            assert!(
+                shows,
+                "state {state:?} should keep its status text under WarningOnly"
+            );
+            assert_eq!(percent, None);
+            assert_eq!(out_text, text);
+        }
+    }
+
+    #[test]
+    fn session_cell_decision_ok_with_missing_data_keeps_not_available_text_even_under_warning_only()
+    {
+        // The `render_cell`/`status_text` caller-bug fail-safe:
+        // `CellState::Ok` paired with no section, so `render_cell` produced
+        // `not_available` text and a `None` percent (see `status_text`'s own
+        // doc comment). `session_pace_for_cell` also can't produce a `pace`
+        // here (its match requires `Some(section)` too). Even under
+        // `WarningOnly`, this must still show the fail-safe text rather
+        // than going blank.
+        let strings = LanguageId::English.strings();
+        let (shows, percent, text) = session_cell_decision(
+            CellState::Ok,
+            None,
+            strings.not_available,
+            None,
+            ShortWindowVisibility::WarningOnly,
+        );
+        assert!(shows);
+        assert_eq!(percent, None);
+        assert_eq!(text, strings.not_available);
+    }
+
+    #[test]
+    fn session_cell_decision_hidden_blanks_every_state_including_errors() {
+        let strings = LanguageId::English.strings();
+        let lines = PaceGuidanceLines {
+            primary: "68% overpacing".to_string(),
+            secondary: None,
+            detail: None,
+            is_warning: true,
+        };
+        // Ok + warning pace data would show under Always/WarningOnly, but
+        // not Hidden.
+        let (shows, percent, text) = session_cell_decision(
+            CellState::Ok,
+            Some(68.0),
+            "68%",
+            Some(&lines),
+            ShortWindowVisibility::Hidden,
+        );
+        assert!(!shows);
+        assert_eq!(percent, None);
+        assert_eq!(text, "");
+        // Error states must also stay blank under Hidden.
+        for state in [
+            CellState::Loading,
+            CellState::FetchFailed,
+            CellState::Retrying,
+            CellState::NotConfigured,
+            CellState::NotAvailable,
+        ] {
+            let existing = status_text(state, strings);
+            let (shows, percent, text) =
+                session_cell_decision(state, None, existing, None, ShortWindowVisibility::Hidden);
+            assert!(!shows, "state {state:?} must stay hidden under Hidden");
+            assert_eq!(percent, None);
+            assert_eq!(text, "");
+        }
+    }
+
+    #[test]
+    fn session_pace_for_cell_and_render_cell_agree_after_ok_to_fetch_failed_transition() {
+        // Simulates the exact poll-to-poll data `refresh_usage_texts`
+        // produces: first poll is `Ok` with warning-worthy pace, second
+        // poll transitions to `FetchFailed`. Both `render_cell` (text) and
+        // `session_pace_for_cell` (pace) independently reflect the
+        // *current* state, so `session_cell_decision` can never be handed a
+        // stale `Some(pace)` alongside a fresh non-`Ok` state.
+        let now = SystemTime::now();
+        let strings = LanguageId::English.strings();
+        let remaining = SESSION_WINDOW_SECS - 3600;
+        let section = UsageSection {
+            percentage: 60.0,
+            resets_at: Some(now + Duration::from_secs(remaining)),
+        };
+
+        let ok_pace = session_pace_for_cell(
+            CellState::Ok,
+            Some(&section),
+            now,
+            DisplayBasis::UsedPercentage,
+            ShortWindowVisibility::Always,
+            ShortWindowAlertSensitivity::Standard,
+            strings,
+        )
+        .expect("first poll should have warning-worthy pace");
+
+        // Provider errors out on the next poll; the cached `section` is no
+        // longer paired with `CellState::Ok`.
+        let failed_text = render_cell(
+            CellState::FetchFailed,
+            None,
+            DisplayBasis::UsedPercentage,
+            strings,
+        )
+        .text;
+        let failed_pace = session_pace_for_cell(
+            CellState::FetchFailed,
+            None,
+            now,
+            DisplayBasis::UsedPercentage,
+            ShortWindowVisibility::Always,
+            ShortWindowAlertSensitivity::Standard,
+            strings,
+        );
+        assert_eq!(failed_pace, None);
+
+        let (shows, percent, text) = session_cell_decision(
+            CellState::FetchFailed,
+            None,
+            &failed_text,
+            failed_pace.as_ref(),
+            ShortWindowVisibility::Always,
+        );
+        assert!(shows);
+        assert_eq!(percent, None);
+        assert_eq!(text, strings.fetch_failed);
+        assert_ne!(text, ok_pace.primary);
+    }
+
+    #[test]
+    fn session_row_visible_is_true_only_when_a_shown_providers_decision_says_show() {
+        assert!(!session_row_visible(true, false, true, false, true, false));
+        assert!(session_row_visible(true, true, false, false, false, false));
+        assert!(session_row_visible(false, false, true, true, false, false));
+        assert!(session_row_visible(false, false, false, false, true, true));
+    }
+
+    #[test]
+    fn session_row_visible_ignores_hidden_providers_error_state() {
+        // codex has an error-state decision (`shows == true`) but isn't
+        // currently shown; must not keep the row alive.
+        assert!(!session_row_visible(true, false, false, true, false, false));
+    }
+
+    #[test]
+    fn session_row_visible_false_for_warning_only_with_no_warnings_or_errors_anywhere() {
+        let (claude_shows, _, _) = session_cell_decision(
+            CellState::Ok,
+            Some(24.0),
+            "24%",
+            None,
+            ShortWindowVisibility::WarningOnly,
+        );
+        let (codex_shows, _, _) = session_cell_decision(
+            CellState::Ok,
+            Some(10.0),
+            "10%",
+            None,
+            ShortWindowVisibility::WarningOnly,
+        );
+        assert!(!session_row_visible(
+            true,
+            claude_shows,
+            true,
+            codex_shows,
+            false,
+            false
+        ));
+    }
+
+    #[test]
+    fn session_row_visible_true_for_warning_only_when_one_provider_is_in_error() {
+        let (claude_shows, _, _) = session_cell_decision(
+            CellState::Ok,
+            Some(24.0),
+            "24%",
+            None,
+            ShortWindowVisibility::WarningOnly,
+        );
+        let strings = LanguageId::English.strings();
+        let (codex_shows, _, _) = session_cell_decision(
+            CellState::FetchFailed,
+            None,
+            strings.fetch_failed,
+            None,
+            ShortWindowVisibility::WarningOnly,
+        );
+        assert!(session_row_visible(
+            true,
+            claude_shows,
+            true,
+            codex_shows,
+            false,
+            false
+        ));
+    }
+
+    #[test]
+    fn session_row_visible_false_for_hidden_regardless_of_state() {
+        let strings = LanguageId::English.strings();
+        let lines = PaceGuidanceLines {
+            primary: "x".to_string(),
+            secondary: None,
+            detail: None,
+            is_warning: true,
+        };
+        let (claude_shows, _, _) = session_cell_decision(
+            CellState::Ok,
+            Some(90.0),
+            "90%",
+            Some(&lines),
+            ShortWindowVisibility::Hidden,
+        );
+        let (codex_shows, _, _) = session_cell_decision(
+            CellState::FetchFailed,
+            None,
+            strings.fetch_failed,
+            None,
+            ShortWindowVisibility::Hidden,
+        );
+        assert!(!session_row_visible(
+            true,
+            claude_shows,
+            true,
+            codex_shows,
+            false,
+            false
+        ));
+    }
+
+    #[test]
+    fn popup_height_logical_with_session_row_is_widget_height_plus_weekly_extra() {
+        assert_eq!(popup_height_logical(0, true), WIDGET_HEIGHT);
+        assert_eq!(
+            popup_height_logical(2, true),
+            WIDGET_HEIGHT + 2 * PACE_LINE_H
+        );
+    }
+
+    #[test]
+    fn popup_height_logical_without_session_row_shrinks_by_one_row_and_gap() {
+        assert_eq!(
+            popup_height_logical(0, false),
+            WIDGET_HEIGHT - ROW_GAP_H - SEGMENT_H
+        );
+        assert_eq!(
+            popup_height_logical(1, false),
+            WIDGET_HEIGHT - ROW_GAP_H - SEGMENT_H + PACE_LINE_H
+        );
+    }
+
+    #[test]
+    fn drag_handle_recenters_for_taller_popup_height() {
+        let taller = WIDGET_HEIGHT + 2 * PACE_LINE_H;
+        let divider_h = 25; // sc(25) at the test process's default 96 DPI.
+        let divider_top = (taller - divider_h) / 2;
+        assert_ne!(divider_top, (WIDGET_HEIGHT - divider_h) / 2);
+        assert!(!is_drag_handle_point(5, divider_top - 1, taller));
+        assert!(is_drag_handle_point(5, divider_top, taller));
+        assert!(is_drag_handle_point(5, divider_top + divider_h - 1, taller));
+        assert!(!is_drag_handle_point(5, divider_top + divider_h, taller));
+    }
+
+    #[test]
+    fn weekly_pace_guidance_primary_never_contains_weekly_window_label() {
+        let now = SystemTime::now();
+        let strings = LanguageId::English.strings();
+        let resets_at = Some(now + Duration::from_secs(WEEKLY_WINDOW_SECS / 2));
+        for density in [
+            DisplayDensity::Compact,
+            DisplayDensity::Standard,
+            DisplayDensity::Detailed,
+        ] {
+            let lines = weekly_pace_guidance_lines(
+                Some(69.0),
+                resets_at,
+                now,
+                DisplayBasis::UsedPercentage,
+                density,
+                strings,
+            )
+            .unwrap();
+            assert!(!lines.primary.contains(strings.weekly_window_label));
+        }
+        // Unknown-reset branch too — a separate early return in the function.
+        let lines = weekly_pace_guidance_lines(
+            Some(69.0),
+            None,
+            now,
+            DisplayBasis::UsedPercentage,
+            DisplayDensity::Standard,
+            strings,
+        )
+        .unwrap();
+        assert!(!lines.primary.contains(strings.weekly_window_label));
+    }
+
+    #[test]
+    fn short_window_pace_guidance_primary_never_contains_session_window_label() {
+        let now = SystemTime::now();
+        let strings = LanguageId::English.strings();
+        let resets_at = Some(now + Duration::from_secs(SESSION_WINDOW_SECS / 2));
+        let lines = short_window_pace_guidance_lines(
+            Some(24.0),
+            resets_at,
+            now,
+            DisplayBasis::UsedPercentage,
+            ShortWindowVisibility::Always,
+            ShortWindowAlertSensitivity::Standard,
+            strings,
+        )
+        .unwrap();
+        assert!(!lines.primary.contains(strings.session_window_label));
+    }
+
+    #[test]
+    fn short_window_pace_guidance_with_unknown_reset_shows_current_value_only() {
+        let now = SystemTime::now();
+        let strings = LanguageId::English.strings();
+        let lines = short_window_pace_guidance_lines(
+            Some(24.0),
+            None,
+            now,
+            DisplayBasis::UsedPercentage,
+            ShortWindowVisibility::Always,
+            ShortWindowAlertSensitivity::Standard,
+            strings,
+        )
+        .unwrap();
+        assert!(lines.primary.contains("24%"));
+        assert!(!lines.primary.contains(strings.reset_in));
+        assert!(!lines.primary.contains(strings.session_window_label));
     }
 
     #[test]
