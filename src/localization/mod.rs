@@ -228,6 +228,9 @@ pub struct Strings {
     pub per_hour_suffix: &'static str,
     pub pace_used_prefix: &'static str,
     pub pace_remaining_prefix: &'static str,
+    pub popup_layout: &'static str,
+    pub popup_layout_compact: &'static str,
+    pub popup_layout_standard: &'static str,
 }
 
 pub fn resolve_language(language_override: Option<LanguageId>) -> LanguageId {

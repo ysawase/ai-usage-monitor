@@ -83,4 +83,7 @@ pub(super) const STRINGS: Strings = Strings {
     per_hour_suffix: "시",
     pace_used_prefix: "사용",
     pace_remaining_prefix: "남음",
+    popup_layout: "팝업 레이아웃",
+    popup_layout_compact: "간결",
+    popup_layout_standard: "표준",
 };

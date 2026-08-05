@@ -83,4 +83,7 @@ pub(super) const STRINGS: Strings = Strings {
     per_hour_suffix: "Std",
     pace_used_prefix: "Genutzt",
     pace_remaining_prefix: "Verbleibend",
+    popup_layout: "Popup-Layout",
+    popup_layout_compact: "Kompakt",
+    popup_layout_standard: "Standard",
 };

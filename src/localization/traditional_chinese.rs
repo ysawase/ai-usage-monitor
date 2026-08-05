@@ -83,4 +83,7 @@ pub(super) const STRINGS: Strings = Strings {
     per_hour_suffix: "時",
     pace_used_prefix: "已用",
     pace_remaining_prefix: "剩餘",
+    popup_layout: "彈出視窗版面",
+    popup_layout_compact: "簡潔",
+    popup_layout_standard: "標準",
 };

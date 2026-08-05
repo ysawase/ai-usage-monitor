@@ -66,6 +66,7 @@ struct AppState {
     display_density: DisplayDensity,
     short_window_visibility: ShortWindowVisibility,
     short_window_alert_sensitivity: ShortWindowAlertSensitivity,
+    popup_layout: PopupLayout,
 
     session_state: CellState,
     session_percent: Option<f64>,
@@ -158,6 +159,27 @@ enum DisplayDensity {
 impl Default for DisplayDensity {
     fn default() -> Self {
         Self::Standard
+    }
+}
+
+/// How much of the popup's row structure is shown at once — independent of
+/// `DisplayDensity` (which only controls how much text each *shown* weekly
+/// row carries). `Compact` keeps just the provider header and each shown
+/// provider's weekly row/bar; `Standard` is the full existing layout (basis
+/// label, weekly secondary/detail lines, 5h session row). Deliberately a
+/// separate enum/type from `DisplayDensity` rather than reusing its
+/// `Compact` variant, since the two are orthogonal settings that happen to
+/// share a name in English.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum PopupLayout {
+    Compact,
+    Standard,
+}
+
+impl Default for PopupLayout {
+    fn default() -> Self {
+        Self::Compact
     }
 }
 
@@ -987,6 +1009,8 @@ const IDM_SHORT_WINDOW_VISIBILITY_HIDDEN: u16 = 85;
 const IDM_SHORT_WINDOW_ALERT_SENSITIVITY_SENSITIVE: u16 = 86;
 const IDM_SHORT_WINDOW_ALERT_SENSITIVITY_STANDARD: u16 = 87;
 const IDM_SHORT_WINDOW_ALERT_SENSITIVITY_RELAXED: u16 = 88;
+const IDM_POPUP_LAYOUT_COMPACT: u16 = 89;
+const IDM_POPUP_LAYOUT_STANDARD: u16 = 90;
 
 /// Pure `menu ID -> enum value` lookups, shared by `show_context_menu`
 /// (which sets which item starts checked) and the `WM_COMMAND` handler
@@ -1017,6 +1041,14 @@ fn short_window_alert_sensitivity_for_menu_id(id: u16) -> Option<ShortWindowAler
         }
         IDM_SHORT_WINDOW_ALERT_SENSITIVITY_STANDARD => Some(ShortWindowAlertSensitivity::Standard),
         IDM_SHORT_WINDOW_ALERT_SENSITIVITY_RELAXED => Some(ShortWindowAlertSensitivity::Relaxed),
+        _ => None,
+    }
+}
+
+fn popup_layout_for_menu_id(id: u16) -> Option<PopupLayout> {
+    match id {
+        IDM_POPUP_LAYOUT_COMPACT => Some(PopupLayout::Compact),
+        IDM_POPUP_LAYOUT_STANDARD => Some(PopupLayout::Standard),
         _ => None,
     }
 }
@@ -1222,6 +1254,8 @@ struct SettingsFile {
         deserialize_with = "deserialize_short_window_alert_sensitivity"
     )]
     short_window_alert_sensitivity: ShortWindowAlertSensitivity,
+    #[serde(default, deserialize_with = "deserialize_popup_layout")]
+    popup_layout: PopupLayout,
 }
 
 impl Default for SettingsFile {
@@ -1241,6 +1275,7 @@ impl Default for SettingsFile {
             display_density: DisplayDensity::default(),
             short_window_visibility: ShortWindowVisibility::default(),
             short_window_alert_sensitivity: ShortWindowAlertSensitivity::default(),
+            popup_layout: PopupLayout::default(),
         }
     }
 }
@@ -1295,6 +1330,17 @@ where
     Ok(serde_json::Value::deserialize(deserializer)
         .ok()
         .and_then(|value| serde_json::from_value::<ShortWindowAlertSensitivity>(value).ok())
+        .unwrap_or_default())
+}
+
+/// Same lenient fallback as `deserialize_display_basis`, for `PopupLayout`.
+fn deserialize_popup_layout<'de, D>(deserializer: D) -> Result<PopupLayout, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(serde_json::Value::deserialize(deserializer)
+        .ok()
+        .and_then(|value| serde_json::from_value::<PopupLayout>(value).ok())
         .unwrap_or_default())
 }
 
@@ -1364,6 +1410,7 @@ fn save_state_settings() {
             display_density: s.display_density,
             short_window_visibility: s.short_window_visibility,
             short_window_alert_sensitivity: s.short_window_alert_sensitivity,
+            popup_layout: s.popup_layout,
         });
     }
 }
@@ -2267,6 +2314,18 @@ const HEADER_ROW_H: i32 = 14;
 /// machine — see completion report.
 const WIDGET_HEIGHT: i32 = 78;
 
+/// Gap between the basis-label row and the provider-header row below it
+/// (see `WIDGET_HEIGHT`'s breakdown: "...HEADER_ROW_H (basis label) +
+/// 2px...").
+const BASIS_LABEL_GAP_H: i32 = 2;
+/// Logical budget the basis-label row ("Used %" / "Remaining Allowance")
+/// occupies at the top of the `Standard`-layout popup: its own
+/// `HEADER_ROW_H` plus `BASIS_LABEL_GAP_H`. Named so `popup_height_logical`
+/// and `pace_row_layout` share the exact same value instead of each
+/// hard-coding it — see `PopupLayout::Compact`, which omits this row and
+/// its budget entirely.
+const BASIS_LABEL_ROW_H: i32 = HEADER_ROW_H + BASIS_LABEL_GAP_H;
+
 /// Height of one additional pace-guidance text line (the weekly row's
 /// secondary/detail lines), reusing the same line-height already used for
 /// the header rows above the bars — see `HEADER_ROW_H`. Not visually
@@ -2432,32 +2491,74 @@ fn needs_session_row(state: &AppState) -> bool {
     )
 }
 
+/// Which of the popup's optional rows/lines are actually shown this frame —
+/// the single row-selection judgment shared verbatim by `paint_content`
+/// (what to draw) and `popup_height_logical`/`pace_row_layout` (how tall to
+/// make the popup), so drawing and sizing can never disagree about which
+/// rows exist. `PopupLayout::Compact` forces every optional row off
+/// regardless of what the underlying content (`weekly_extra_lines`,
+/// `needs_session_row`) would otherwise warrant — only the provider-header
+/// and weekly rows remain, and neither is ever gated here since both are
+/// unconditional in every layout. `PopupLayout::Standard` passes the
+/// underlying content through unchanged, reproducing the popup's existing
+/// (pre-`PopupLayout`) behavior exactly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct VisibleRows {
+    basis_label: bool,
+    weekly_extra_lines: i32,
+    session_row: bool,
+}
+
+fn visible_rows(
+    layout: PopupLayout,
+    weekly_extra_lines: i32,
+    needs_session_row: bool,
+) -> VisibleRows {
+    match layout {
+        PopupLayout::Compact => VisibleRows {
+            basis_label: false,
+            weekly_extra_lines: 0,
+            session_row: false,
+        },
+        PopupLayout::Standard => VisibleRows {
+            basis_label: true,
+            weekly_extra_lines,
+            session_row: needs_session_row,
+        },
+    }
+}
+
 /// Popup height (logical, pre-DPI-scale px) for the current pace-guidance
-/// block. `WIDGET_HEIGHT` already covers both main bar rows (weekly and 5h)
-/// and the `ROW_GAP_H` between them — see its own breakdown comment. When
-/// the 5h row has nothing to show this poll, that row and its connecting
-/// gap are removed from the budget entirely (the weekly block simply moves
-/// down to fill the space) rather than left as blank space. Composed
-/// entirely in logical units — callers apply `sc(...)` once, at the end.
-fn popup_height_logical(weekly_extra_lines: i32, needs_session_row: bool) -> i32 {
-    let base = if needs_session_row {
-        WIDGET_HEIGHT
-    } else {
-        WIDGET_HEIGHT - ROW_GAP_H - SEGMENT_H
-    };
-    base + weekly_extra_lines * PACE_LINE_H
+/// block and `PopupLayout`. `WIDGET_HEIGHT` already covers both main bar
+/// rows (weekly and 5h), the `ROW_GAP_H` between them, and the basis-label
+/// row (`BASIS_LABEL_ROW_H`) — see its own breakdown comment. Whichever of
+/// the 5h row / basis-label row `rows` says isn't shown has its budget
+/// removed entirely (the remaining rows simply move to fill the space)
+/// rather than left as blank space. Composed entirely in logical units —
+/// callers apply `sc(...)` once, at the end.
+fn popup_height_logical(rows: VisibleRows) -> i32 {
+    let mut base = WIDGET_HEIGHT;
+    if !rows.session_row {
+        base -= ROW_GAP_H + SEGMENT_H;
+    }
+    if !rows.basis_label {
+        base -= BASIS_LABEL_ROW_H;
+    }
+    base + rows.weekly_extra_lines * PACE_LINE_H
 }
 
 /// Popup height for the current state: the base widget height plus
-/// whatever the pace-guidance block currently needs. Mirrors
-/// `total_widget_width_for_state`'s pattern of a `&AppState`-taking
-/// variant (used where a lock is already held) alongside a self-locking
-/// `widget_height()` convenience wrapper below.
+/// whatever the pace-guidance block currently needs, filtered through the
+/// current `PopupLayout`. Mirrors `total_widget_width_for_state`'s pattern
+/// of a `&AppState`-taking variant (used where a lock is already held)
+/// alongside a self-locking `widget_height()` convenience wrapper below.
 fn widget_height_for_state(state: &AppState) -> i32 {
-    sc(popup_height_logical(
+    let rows = visible_rows(
+        state.popup_layout,
         weekly_pace_extra_lines(state),
         needs_session_row(state),
-    ))
+    );
+    sc(popup_height_logical(rows))
 }
 
 fn widget_height() -> i32 {
@@ -2470,36 +2571,38 @@ fn widget_height() -> i32 {
 
 /// Logical y-coordinates (already DPI-scaled, same convention `paint_content`
 /// uses throughout) for every row in the popup's header + weekly/5h block,
-/// given the popup's total scaled `height` and the same
-/// `weekly_extra_lines`/`needs_session_row` inputs `popup_height_logical`
-/// used to size that `height` in the first place — the two must always
-/// agree, which is why this is the one place either `paint_content` or a
-/// test computes these positions. Order top to bottom: basis label,
+/// given the popup's total scaled `height` and the same `rows`
+/// (`VisibleRows`) input `popup_height_logical` used to size that `height`
+/// in the first place — the two must always agree, which is why this is the
+/// one place either `paint_content` or a test computes these positions.
+/// Order top to bottom: basis label (only when `rows.basis_label`),
 /// provider header, weekly bar, weekly secondary/detail (if any — a single
 /// anchor `weekly_secondary_y`; `draw_weekly_pace_extra_lines` steps detail
 /// down by one more `PACE_LINE_H` internally when present), then the 5h bar
-/// (if shown at all this poll) at the very bottom with a `ROW_GAP_H` gap
+/// (only when `rows.session_row`) at the very bottom with a `ROW_GAP_H` gap
 /// above it — the same gap that used to sit between the two main bar rows.
 struct PaceRowLayout {
-    basis_label_y: i32,
+    basis_label_y: Option<i32>,
     provider_header_y: i32,
     weekly_row_y: i32,
     weekly_secondary_y: Option<i32>,
     session_row_y: Option<i32>,
 }
 
-fn pace_row_layout(height: i32, weekly_extra_lines: i32, needs_session_row: bool) -> PaceRowLayout {
-    let weekly_extra_h = weekly_extra_lines * sc(PACE_LINE_H);
-    let (session_row_y, weekly_block_bottom) = if needs_session_row {
+fn pace_row_layout(height: i32, rows: VisibleRows) -> PaceRowLayout {
+    let weekly_extra_h = rows.weekly_extra_lines * sc(PACE_LINE_H);
+    let (session_row_y, weekly_block_bottom) = if rows.session_row {
         let session_y = height - sc(5) - sc(SEGMENT_H);
         (Some(session_y), session_y - sc(ROW_GAP_H))
     } else {
         (None, height - sc(5))
     };
     let weekly_row_y = weekly_block_bottom - weekly_extra_h - sc(SEGMENT_H);
-    let weekly_secondary_y = (weekly_extra_lines >= 1).then_some(weekly_row_y + sc(SEGMENT_H));
+    let weekly_secondary_y = (rows.weekly_extra_lines >= 1).then_some(weekly_row_y + sc(SEGMENT_H));
     let provider_header_y = weekly_row_y - sc(4) - sc(HEADER_ROW_H);
-    let basis_label_y = provider_header_y - sc(2) - sc(HEADER_ROW_H);
+    let basis_label_y = rows
+        .basis_label
+        .then_some(provider_header_y - sc(BASIS_LABEL_GAP_H) - sc(HEADER_ROW_H));
     PaceRowLayout {
         basis_label_y,
         provider_header_y,
@@ -2750,6 +2853,7 @@ pub fn run() {
                 display_density: settings.display_density,
                 short_window_visibility: settings.short_window_visibility,
                 short_window_alert_sensitivity: settings.short_window_alert_sensitivity,
+                popup_layout: settings.popup_layout,
                 session_state: CellState::Loading,
                 session_percent: None,
                 session_text: String::new(),
@@ -2886,6 +2990,7 @@ fn render_layered() {
         strings,
         display_basis,
         short_window_visibility,
+        popup_layout,
         session_state,
         session_pct,
         session_text,
@@ -2921,6 +3026,7 @@ fn render_layered() {
                 s.language.strings(),
                 s.display_basis,
                 s.short_window_visibility,
+                s.popup_layout,
                 s.session_state,
                 s.session_percent,
                 s.session_text.clone(),
@@ -3053,6 +3159,7 @@ fn render_layered() {
             show_antigravity,
             &codex_accent,
             &antigravity_accent,
+            popup_layout,
         );
 
         // Background pixels → alpha 1 (nearly invisible but still hittable for right-click).
@@ -3140,6 +3247,7 @@ fn paint_content(
     show_antigravity: bool,
     codex_accent: &Color,
     antigravity_accent: &Color,
+    popup_layout: PopupLayout,
 ) {
     unsafe {
         let client_rect = RECT {
@@ -3234,7 +3342,8 @@ fn paint_content(
             show_antigravity,
             antigravity_session_decision.0,
         );
-        let layout = pace_row_layout(height, weekly_lines, needs_session_row);
+        let rows = visible_rows(popup_layout, weekly_lines, needs_session_row);
+        let layout = pace_row_layout(height, rows);
 
         let _ = SetBkMode(hdc, TRANSPARENT);
         let _ = SetTextColor(hdc, COLORREF(text_color.to_colorref()));
@@ -3258,18 +3367,20 @@ fn paint_content(
         );
         let old_font = SelectObject(hdc, font);
 
-        let basis_label = match display_basis {
-            DisplayBasis::UsedPercentage => strings.used_percentage,
-            DisplayBasis::RemainingAllowance => strings.remaining_allowance,
-        };
-        draw_basis_label_row(
-            hdc,
-            content_x,
-            layout.basis_label_y,
-            width - sc(RIGHT_MARGIN),
-            text_color,
-            basis_label,
-        );
+        if let Some(basis_label_y) = layout.basis_label_y {
+            let basis_label = match display_basis {
+                DisplayBasis::UsedPercentage => strings.used_percentage,
+                DisplayBasis::RemainingAllowance => strings.remaining_allowance,
+            };
+            draw_basis_label_row(
+                hdc,
+                content_x,
+                basis_label_y,
+                width - sc(RIGHT_MARGIN),
+                text_color,
+                basis_label,
+            );
+        }
         draw_provider_header_row(
             hdc,
             content_x,
@@ -4340,6 +4451,21 @@ unsafe extern "system" fn wnd_proc(
                     position_at_taskbar();
                     render_layered();
                 }
+                IDM_POPUP_LAYOUT_COMPACT | IDM_POPUP_LAYOUT_STANDARD => {
+                    // Changes which rows the popup shows at all, so — same
+                    // as the display-density handler above — recompute the
+                    // popup's required height and reposition/redraw
+                    // immediately.
+                    if let Some(new_layout) = popup_layout_for_menu_id(id) {
+                        let mut state = lock_state();
+                        if let Some(s) = state.as_mut() {
+                            s.popup_layout = new_layout;
+                        }
+                    }
+                    save_state_settings();
+                    position_at_taskbar();
+                    render_layered();
+                }
                 IDM_SHORT_WINDOW_VISIBILITY_ALWAYS
                 | IDM_SHORT_WINDOW_VISIBILITY_WARNING_ONLY
                 | IDM_SHORT_WINDOW_VISIBILITY_HIDDEN => {
@@ -4536,6 +4662,7 @@ fn show_context_menu(hwnd: HWND) {
             display_density,
             short_window_visibility,
             short_window_alert_sensitivity,
+            popup_layout,
         ) = {
             let state = lock_state();
             match state.as_ref() {
@@ -4555,6 +4682,7 @@ fn show_context_menu(hwnd: HWND) {
                     s.display_density,
                     s.short_window_visibility,
                     s.short_window_alert_sensitivity,
+                    s.popup_layout,
                 ),
                 None => (
                     POLL_15_MIN,
@@ -4572,6 +4700,7 @@ fn show_context_menu(hwnd: HWND) {
                     DisplayDensity::default(),
                     ShortWindowVisibility::default(),
                     ShortWindowAlertSensitivity::default(),
+                    PopupLayout::default(),
                 ),
             }
         };
@@ -4837,6 +4966,46 @@ fn show_context_menu(hwnd: HWND) {
             PCWSTR::from_raw(display_density_label.as_ptr()),
         );
 
+        // Popup layout submenu: mutually exclusive, radio-style, same
+        // pattern as the display-density submenu above. A separate setting
+        // from `DisplayDensity` (which only controls how much text each
+        // shown weekly row carries) — this controls which rows the popup
+        // shows at all.
+        let popup_layout_menu = CreatePopupMenu().unwrap();
+        let popup_layout_items: [(u16, PopupLayout, &str); 2] = [
+            (
+                IDM_POPUP_LAYOUT_COMPACT,
+                PopupLayout::Compact,
+                strings.popup_layout_compact,
+            ),
+            (
+                IDM_POPUP_LAYOUT_STANDARD,
+                PopupLayout::Standard,
+                strings.popup_layout_standard,
+            ),
+        ];
+        for (id, value, label) in popup_layout_items {
+            let label_str = native_interop::wide_str(label);
+            let flags = if value == popup_layout {
+                MF_CHECKED
+            } else {
+                MENU_ITEM_FLAGS(0)
+            };
+            let _ = AppendMenuW(
+                popup_layout_menu,
+                flags,
+                id as usize,
+                PCWSTR::from_raw(label_str.as_ptr()),
+            );
+        }
+        let popup_layout_label = native_interop::wide_str(strings.popup_layout);
+        let _ = AppendMenuW(
+            settings_menu,
+            MF_POPUP,
+            popup_layout_menu.0 as usize,
+            PCWSTR::from_raw(popup_layout_label.as_ptr()),
+        );
+
         // Short-window (5h) visibility submenu.
         let short_window_visibility_menu = CreatePopupMenu().unwrap();
         let short_window_visibility_items: [(u16, ShortWindowVisibility, &str); 3] = [
@@ -4990,6 +5159,7 @@ fn paint(hdc: HDC, hwnd: HWND) {
         strings,
         display_basis,
         short_window_visibility,
+        popup_layout,
         session_state,
         session_pct,
         session_text,
@@ -5022,6 +5192,7 @@ fn paint(hdc: HDC, hwnd: HWND) {
                 s.language.strings(),
                 s.display_basis,
                 s.short_window_visibility,
+                s.popup_layout,
                 s.session_state,
                 s.session_percent,
                 s.session_text.clone(),
@@ -5122,6 +5293,7 @@ fn paint(hdc: HDC, hwnd: HWND) {
             show_antigravity,
             &codex_accent,
             &antigravity_accent,
+            popup_layout,
         );
 
         let _ = BitBlt(hdc, 0, 0, width, height, mem_dc, 0, 0, SRCCOPY);
@@ -6017,6 +6189,180 @@ mod tests {
         );
     }
 
+    // ── AUM-WINDOW-UI-01A: PopupLayout (type/default/persistence/menu) ─────
+
+    #[test]
+    fn popup_layout_default_is_compact() {
+        assert_eq!(PopupLayout::default(), PopupLayout::Compact);
+    }
+
+    #[test]
+    fn popup_layout_serializes_to_expected_snake_case() {
+        assert_eq!(
+            serde_json::to_value(PopupLayout::Compact).unwrap(),
+            serde_json::json!("compact")
+        );
+        assert_eq!(
+            serde_json::to_value(PopupLayout::Standard).unwrap(),
+            serde_json::json!("standard")
+        );
+    }
+
+    #[test]
+    fn legacy_settings_without_popup_layout_key_deserialize_to_compact() {
+        let settings: SettingsFile = serde_json::from_str("{}")
+            .expect("legacy settings without popup_layout should still deserialize");
+        assert_eq!(settings.popup_layout, PopupLayout::Compact);
+    }
+
+    #[test]
+    fn settings_with_unrecognized_popup_layout_falls_back_to_compact_without_failing_the_whole_file(
+    ) {
+        let settings: SettingsFile =
+            serde_json::from_str(r#"{"popup_layout":"ultra_compact","tray_offset":9}"#)
+                .expect("an unrecognized popup_layout must not fail the whole settings file");
+        assert_eq!(settings.popup_layout, PopupLayout::Compact);
+        assert_eq!(settings.tray_offset, 9);
+    }
+
+    #[test]
+    fn popup_layout_round_trips_through_serialization_alongside_other_settings() {
+        let settings = SettingsFile {
+            popup_layout: PopupLayout::Standard,
+            tray_offset: 42,
+            display_density: DisplayDensity::Detailed,
+            ..SettingsFile::default()
+        };
+        let json = serde_json::to_string(&settings).expect("settings should serialize");
+        let round_tripped: SettingsFile =
+            serde_json::from_str(&json).expect("round trip should deserialize");
+        assert_eq!(round_tripped.popup_layout, PopupLayout::Standard);
+        assert_eq!(round_tripped.tray_offset, 42);
+        assert_eq!(round_tripped.display_density, DisplayDensity::Detailed);
+    }
+
+    #[test]
+    fn popup_layout_for_menu_id_maps_each_known_id_and_is_bijective() {
+        assert_eq!(
+            popup_layout_for_menu_id(IDM_POPUP_LAYOUT_COMPACT),
+            Some(PopupLayout::Compact)
+        );
+        assert_eq!(
+            popup_layout_for_menu_id(IDM_POPUP_LAYOUT_STANDARD),
+            Some(PopupLayout::Standard)
+        );
+        assert_eq!(popup_layout_for_menu_id(9999), None);
+
+        // Every menu ID maps to a distinct layout, and every layout is
+        // reachable from some menu ID — the same "id <-> value" coverage
+        // `display_density_for_menu_id_maps_each_known_id` checks.
+        let ids = [IDM_POPUP_LAYOUT_COMPACT, IDM_POPUP_LAYOUT_STANDARD];
+        let mapped: Vec<PopupLayout> = ids
+            .iter()
+            .map(|&id| popup_layout_for_menu_id(id).unwrap())
+            .collect();
+        assert_ne!(mapped[0], mapped[1]);
+    }
+
+    #[test]
+    fn all_languages_have_non_empty_popup_layout_menu_strings() {
+        for language in LanguageId::ALL {
+            let strings = language.strings();
+            assert!(!strings.popup_layout.is_empty());
+            assert!(!strings.popup_layout_compact.is_empty());
+            assert!(!strings.popup_layout_standard.is_empty());
+        }
+    }
+
+    #[test]
+    fn visible_rows_for_compact_forces_every_optional_row_off() {
+        let rows = visible_rows(PopupLayout::Compact, 2, true);
+        assert!(!rows.basis_label);
+        assert_eq!(rows.weekly_extra_lines, 0);
+        assert!(!rows.session_row);
+    }
+
+    #[test]
+    fn visible_rows_for_compact_forces_off_even_with_nothing_to_show() {
+        let rows = visible_rows(PopupLayout::Compact, 0, false);
+        assert!(!rows.basis_label);
+        assert_eq!(rows.weekly_extra_lines, 0);
+        assert!(!rows.session_row);
+    }
+
+    #[test]
+    fn visible_rows_for_standard_passes_content_through_unchanged() {
+        let rows = visible_rows(PopupLayout::Standard, 2, true);
+        assert!(rows.basis_label);
+        assert_eq!(rows.weekly_extra_lines, 2);
+        assert!(rows.session_row);
+
+        let rows = visible_rows(PopupLayout::Standard, 0, false);
+        assert!(rows.basis_label);
+        assert_eq!(rows.weekly_extra_lines, 0);
+        assert!(!rows.session_row);
+    }
+
+    #[test]
+    fn popup_height_logical_for_compact_is_header_plus_weekly_row_only() {
+        // No basis-label row and no session row, regardless of what the
+        // underlying pace content would otherwise show.
+        let rows = visible_rows(PopupLayout::Compact, 2, true);
+        assert_eq!(
+            popup_height_logical(rows),
+            WIDGET_HEIGHT - BASIS_LABEL_ROW_H - ROW_GAP_H - SEGMENT_H
+        );
+    }
+
+    #[test]
+    fn popup_height_logical_for_standard_matches_pre_popup_layout_behavior() {
+        let with_session = visible_rows(PopupLayout::Standard, 0, true);
+        assert_eq!(popup_height_logical(with_session), WIDGET_HEIGHT);
+
+        let without_session = visible_rows(PopupLayout::Standard, 2, false);
+        assert_eq!(
+            popup_height_logical(without_session),
+            WIDGET_HEIGHT - ROW_GAP_H - SEGMENT_H + 2 * PACE_LINE_H
+        );
+    }
+
+    #[test]
+    fn compact_layout_is_never_taller_than_standard_for_the_same_content() {
+        let weekly_extra_lines = 2;
+        let needs_session_row = true;
+        let compact = popup_height_logical(visible_rows(
+            PopupLayout::Compact,
+            weekly_extra_lines,
+            needs_session_row,
+        ));
+        let standard = popup_height_logical(visible_rows(
+            PopupLayout::Standard,
+            weekly_extra_lines,
+            needs_session_row,
+        ));
+        assert!(compact < standard);
+    }
+
+    #[test]
+    fn pace_row_layout_for_compact_omits_basis_label_and_session_row() {
+        let rows = visible_rows(PopupLayout::Compact, 2, true);
+        let height = sc(popup_height_logical(rows));
+        let layout = pace_row_layout(height, rows);
+        assert_eq!(layout.basis_label_y, None);
+        assert_eq!(layout.session_row_y, None);
+        assert_eq!(layout.weekly_secondary_y, None);
+    }
+
+    #[test]
+    fn pace_row_layout_for_standard_matches_pre_popup_layout_positions() {
+        let rows = visible_rows(PopupLayout::Standard, 1, true);
+        let height = sc(popup_height_logical(rows));
+        let layout = pace_row_layout(height, rows);
+        assert!(layout.basis_label_y.is_some());
+        assert!(layout.session_row_y.is_some());
+        assert!(layout.weekly_secondary_y.is_some());
+    }
+
     // ── AUM-PACE-GUIDANCE-01: settings menu (IDs, mapping, localization) ───
 
     #[test]
@@ -6142,6 +6488,8 @@ mod tests {
             IDM_SHORT_WINDOW_ALERT_SENSITIVITY_SENSITIVE,
             IDM_SHORT_WINDOW_ALERT_SENSITIVITY_STANDARD,
             IDM_SHORT_WINDOW_ALERT_SENSITIVITY_RELAXED,
+            IDM_POPUP_LAYOUT_COMPACT,
+            IDM_POPUP_LAYOUT_STANDARD,
             tray_icon::IDM_TOGGLE_WIDGET,
         ];
         #[cfg(feature = "self-update")]
@@ -7284,9 +7632,12 @@ mod tests {
 
     #[test]
     fn popup_height_logical_with_session_row_is_widget_height_plus_weekly_extra() {
-        assert_eq!(popup_height_logical(0, true), WIDGET_HEIGHT);
         assert_eq!(
-            popup_height_logical(2, true),
+            popup_height_logical(visible_rows(PopupLayout::Standard, 0, true)),
+            WIDGET_HEIGHT
+        );
+        assert_eq!(
+            popup_height_logical(visible_rows(PopupLayout::Standard, 2, true)),
             WIDGET_HEIGHT + 2 * PACE_LINE_H
         );
     }
@@ -7294,11 +7645,11 @@ mod tests {
     #[test]
     fn popup_height_logical_without_session_row_shrinks_by_one_row_and_gap() {
         assert_eq!(
-            popup_height_logical(0, false),
+            popup_height_logical(visible_rows(PopupLayout::Standard, 0, false)),
             WIDGET_HEIGHT - ROW_GAP_H - SEGMENT_H
         );
         assert_eq!(
-            popup_height_logical(1, false),
+            popup_height_logical(visible_rows(PopupLayout::Standard, 1, false)),
             WIDGET_HEIGHT - ROW_GAP_H - SEGMENT_H + PACE_LINE_H
         );
     }
