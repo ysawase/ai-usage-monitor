@@ -77,6 +77,7 @@ struct AppState {
     weekly_percent: Option<f64>,
     weekly_text: String,
     weekly_pace: Option<PaceGuidanceLines>,
+    weekly_remaining_text: Option<String>,
     codex_session_state: CellState,
     codex_session_percent: Option<f64>,
     codex_session_text: String,
@@ -85,6 +86,7 @@ struct AppState {
     codex_weekly_percent: Option<f64>,
     codex_weekly_text: String,
     codex_weekly_pace: Option<PaceGuidanceLines>,
+    codex_weekly_remaining_text: Option<String>,
     antigravity_session_state: CellState,
     antigravity_session_percent: Option<f64>,
     antigravity_session_text: String,
@@ -93,6 +95,7 @@ struct AppState {
     antigravity_weekly_percent: Option<f64>,
     antigravity_weekly_text: String,
     antigravity_weekly_pace: Option<PaceGuidanceLines>,
+    antigravity_weekly_remaining_text: Option<String>,
     show_claude_code: bool,
     show_codex: bool,
     show_antigravity: bool,
@@ -286,9 +289,10 @@ fn countdown_text(resets_at: Option<SystemTime>, strings: Strings) -> Option<Str
     })
 }
 
-/// The display-basis prefix ("Used"/"Remaining") is shown once in the
-/// popup's header row rather than repeated on every cell — see
-/// `draw_basis_label_row` — so this is just "<percent>%" optionally
+/// The display-basis prefix ("Used"/"Remaining") is chosen once via the
+/// settings menu (see `IDM_DISPLAY_BASIS_USED`/`IDM_DISPLAY_BASIS_REMAINING`)
+/// and isn't echoed anywhere in the popup body (AUM-WINDOW-UI-01C-1 removed
+/// the popup's own basis-label row), so this is just "<percent>%" optionally
 /// followed by " · <reset-in word> <countdown>".
 fn format_cell_text(basis: DisplayBasis, section: &UsageSection, strings: Strings) -> String {
     let pct = display_value(basis, section.percentage);
@@ -926,6 +930,50 @@ fn short_window_pace_guidance_lines(
         detail: None,
         is_warning: is_overpacing,
     })
+}
+
+/// Compact provider-header row's weekly-remaining text (AUM-WINDOW-UI-01C-1):
+/// "<remaining prefix> <Xd Yh>", reusing the same `remaining_secs_at`/
+/// `format_remaining_duration` primitives `weekly_pace_guidance_lines`
+/// already uses for its own countdown text, and the existing
+/// `pace_remaining_prefix` string rather than a new localization key — it
+/// already reads naturally in front of a duration in every shipped
+/// language. `None` whenever there's nothing safe to show: no reset time,
+/// or the reset has already passed (both handled by `remaining_secs_at`
+/// returning `None`). Takes `now` as a parameter rather than reading the
+/// clock itself, same as `weekly_pace_guidance_lines`, so callers (and
+/// tests) control "now" explicitly.
+fn compact_weekly_remaining_text(
+    resets_at: Option<SystemTime>,
+    now: SystemTime,
+    strings: Strings,
+) -> Option<String> {
+    let remaining_secs = remaining_secs_at(resets_at, now)?;
+    Some(format!(
+        "{} {}",
+        strings.pace_remaining_prefix,
+        format_remaining_duration(remaining_secs, strings)
+    ))
+}
+
+/// One provider cell's Compact weekly-remaining text, gated the same way
+/// `weekly_pace_for_cell` gates its own guidance text: only
+/// `(CellState::Ok, Some(section))` produces anything. A cached `section`
+/// surviving under a non-`Ok` state (loading/error/unconfigured/
+/// not-available — see `merge_successful_providers`) must never reach the
+/// popup, same as it never reaches the bar or the pace text.
+fn compact_weekly_remaining_for_cell(
+    state: CellState,
+    section: Option<&UsageSection>,
+    now: SystemTime,
+    strings: Strings,
+) -> Option<String> {
+    match (state, section) {
+        (CellState::Ok, Some(section)) => {
+            compact_weekly_remaining_text(section.resets_at, now, strings)
+        }
+        _ => None,
+    }
 }
 
 /// Weekly pace guidance for one provider's cell, gated the same way
@@ -1873,6 +1921,12 @@ fn refresh_usage_texts(state: &mut AppState) {
         density,
         strings,
     );
+    state.weekly_remaining_text = compact_weekly_remaining_for_cell(
+        state.weekly_state,
+        claude_code.map(|u| &u.weekly),
+        now,
+        strings,
+    );
 
     let codex = data.and_then(|d| d.codex.as_ref());
     let codex_session = render_cell(
@@ -1908,6 +1962,12 @@ fn refresh_usage_texts(state: &mut AppState) {
         density,
         strings,
     );
+    state.codex_weekly_remaining_text = compact_weekly_remaining_for_cell(
+        state.codex_weekly_state,
+        codex.map(|u| &u.weekly),
+        now,
+        strings,
+    );
 
     let antigravity = data.and_then(|d| d.antigravity.as_ref());
     let antigravity_session = render_cell(
@@ -1941,6 +2001,12 @@ fn refresh_usage_texts(state: &mut AppState) {
         now,
         basis,
         density,
+        strings,
+    );
+    state.antigravity_weekly_remaining_text = compact_weekly_remaining_for_cell(
+        state.antigravity_weekly_state,
+        antigravity.map(|u| &u.weekly),
+        now,
         strings,
     );
 }
@@ -2362,18 +2428,30 @@ const HEADER_ROW_H: i32 = 14;
 /// The weekly row is drawn above the 5h row (see `pace_row_layout`) —
 /// visual order doesn't change this total. Not visually verified on this
 /// machine — see completion report.
+///
+/// AUM-WINDOW-UI-01C-1: the basis-label row this breakdown includes is no
+/// longer drawn at all (removed from the popup body for every
+/// `PopupLayout`) — `popup_height_logical` now always subtracts
+/// `BASIS_LABEL_ROW_H` from this constant rather than conditionally, so the
+/// breakdown above is historical (this constant's *value* is unchanged;
+/// only how much of it actually reaches the screen has).
 const WIDGET_HEIGHT: i32 = 78;
 
-/// Gap between the basis-label row and the provider-header row below it
-/// (see `WIDGET_HEIGHT`'s breakdown: "...HEADER_ROW_H (basis label) +
-/// 2px...").
+/// Gap the basis-label row used to keep above the provider-header row below
+/// it (see `WIDGET_HEIGHT`'s breakdown: "...HEADER_ROW_H (basis label) +
+/// 2px..."). Only remaining use is `BASIS_LABEL_ROW_H`'s own definition,
+/// now that the basis-label row itself is never drawn — see
+/// `BASIS_LABEL_ROW_H`'s doc.
 const BASIS_LABEL_GAP_H: i32 = 2;
 /// Logical budget the basis-label row ("Used %" / "Remaining Allowance")
-/// occupies at the top of the `Standard`-layout popup: its own
-/// `HEADER_ROW_H` plus `BASIS_LABEL_GAP_H`. Named so `popup_height_logical`
-/// and `pace_row_layout` share the exact same value instead of each
-/// hard-coding it — see `PopupLayout::Compact`, which omits this row and
-/// its budget entirely.
+/// used to occupy at the top of the `Standard`-layout popup: its own
+/// `HEADER_ROW_H` plus `BASIS_LABEL_GAP_H`. AUM-WINDOW-UI-01C-1 removed that
+/// row from the popup body entirely (it's still available via the settings
+/// menu — see `IDM_DISPLAY_BASIS_USED`/`IDM_DISPLAY_BASIS_REMAINING`), so
+/// `popup_height_logical` now always subtracts this budget rather than only
+/// when `PopupLayout::Compact` (which already omitted it) — kept as a named
+/// constant so that unconditional subtraction stays self-documenting instead
+/// of a bare magic number.
 const BASIS_LABEL_ROW_H: i32 = HEADER_ROW_H + BASIS_LABEL_GAP_H;
 
 /// Height of one additional pace-guidance text line (the weekly row's
@@ -2556,10 +2634,13 @@ fn needs_session_row(state: &AppState) -> bool {
 /// and weekly rows remain, and neither is ever gated here since both are
 /// unconditional in every layout. `PopupLayout::Standard` passes the
 /// underlying content through unchanged, reproducing the popup's existing
-/// (pre-`PopupLayout`) behavior exactly.
+/// (pre-`PopupLayout`) behavior exactly. The basis-label row itself
+/// (previously a `PopupLayout::Standard`-only third option here) was removed
+/// from the popup body entirely by AUM-WINDOW-UI-01C-1 — see
+/// `popup_height_logical`'s unconditional `BASIS_LABEL_ROW_H` subtraction —
+/// so there is no longer a field for it to gate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct VisibleRows {
-    basis_label: bool,
     weekly_extra_lines: i32,
     session_row: bool,
 }
@@ -2571,12 +2652,10 @@ fn visible_rows(
 ) -> VisibleRows {
     match layout {
         PopupLayout::Compact => VisibleRows {
-            basis_label: false,
             weekly_extra_lines: 0,
             session_row: false,
         },
         PopupLayout::Standard => VisibleRows {
-            basis_label: true,
             weekly_extra_lines,
             session_row: needs_session_row,
         },
@@ -2586,18 +2665,21 @@ fn visible_rows(
 /// Popup height (logical, pre-DPI-scale px) for the current pace-guidance
 /// block and `PopupLayout`. `WIDGET_HEIGHT` already covers both main bar
 /// rows (weekly and 5h), the `ROW_GAP_H` between them, and the basis-label
-/// row (`BASIS_LABEL_ROW_H`) — see its own breakdown comment. Whichever of
-/// the 5h row / basis-label row `rows` says isn't shown has its budget
+/// row (`BASIS_LABEL_ROW_H`) — see its own breakdown comment. The
+/// basis-label row is never drawn any more (AUM-WINDOW-UI-01C-1 removed it
+/// from the popup body for every `PopupLayout`), so its budget is always
+/// subtracted here rather than conditionally — this matches
+/// `PopupLayout::Compact`'s height exactly as before (it already always
+/// subtracted this budget) and shrinks `PopupLayout::Standard`'s height by
+/// the same amount, letting the rows below move up to fill the space.
+/// Whichever of the 5h row `rows` says isn't shown has its own budget
 /// removed entirely (the remaining rows simply move to fill the space)
 /// rather than left as blank space. Composed entirely in logical units —
 /// callers apply `sc(...)` once, at the end.
 fn popup_height_logical(rows: VisibleRows) -> i32 {
-    let mut base = WIDGET_HEIGHT;
+    let mut base = WIDGET_HEIGHT - BASIS_LABEL_ROW_H;
     if !rows.session_row {
         base -= ROW_GAP_H + SEGMENT_H;
-    }
-    if !rows.basis_label {
-        base -= BASIS_LABEL_ROW_H;
     }
     base + rows.weekly_extra_lines * PACE_LINE_H
 }
@@ -2630,14 +2712,15 @@ fn widget_height() -> i32 {
 /// (`VisibleRows`) input `popup_height_logical` used to size that `height`
 /// in the first place — the two must always agree, which is why this is the
 /// one place either `paint_content` or a test computes these positions.
-/// Order top to bottom: basis label (only when `rows.basis_label`),
-/// provider header, weekly bar, weekly secondary/detail (if any — a single
-/// anchor `weekly_secondary_y`; `draw_weekly_pace_extra_lines` steps detail
-/// down by one more `PACE_LINE_H` internally when present), then the 5h bar
-/// (only when `rows.session_row`) at the very bottom with a `ROW_GAP_H` gap
-/// above it — the same gap that used to sit between the two main bar rows.
+/// Order top to bottom: provider header (the basis-label row above it was
+/// removed from the popup body entirely by AUM-WINDOW-UI-01C-1 — see
+/// `popup_height_logical`), weekly bar, weekly secondary/detail (if any — a
+/// single anchor `weekly_secondary_y`; `draw_weekly_pace_extra_lines` steps
+/// detail down by one more `PACE_LINE_H` internally when present), then the
+/// 5h bar (only when `rows.session_row`) at the very bottom with a
+/// `ROW_GAP_H` gap above it — the same gap that used to sit between the two
+/// main bar rows.
 struct PaceRowLayout {
-    basis_label_y: Option<i32>,
     provider_header_y: i32,
     weekly_row_y: i32,
     weekly_secondary_y: Option<i32>,
@@ -2655,11 +2738,7 @@ fn pace_row_layout(height: i32, rows: VisibleRows) -> PaceRowLayout {
     let weekly_row_y = weekly_block_bottom - weekly_extra_h - sc(SEGMENT_H);
     let weekly_secondary_y = (rows.weekly_extra_lines >= 1).then_some(weekly_row_y + sc(SEGMENT_H));
     let provider_header_y = weekly_row_y - sc(4) - sc(HEADER_ROW_H);
-    let basis_label_y = rows
-        .basis_label
-        .then_some(provider_header_y - sc(BASIS_LABEL_GAP_H) - sc(HEADER_ROW_H));
     PaceRowLayout {
-        basis_label_y,
         provider_header_y,
         weekly_row_y,
         weekly_secondary_y,
@@ -2775,11 +2854,11 @@ struct PopupPalette {
     /// `PaceGuidanceLines::is_warning`). Never applied to bar segments
     /// themselves, which always keep the provider's own accent color.
     warning: Color,
-    /// Provider-name header row and the Standard-only basis label row (see
-    /// `draw_provider_header_row`/`draw_basis_label_row`). Equal to
-    /// `primary_text` for RecommendedDark/Light (no visible change there);
-    /// HighVisibility gives it its own color to separate section headings
-    /// from ordinary body text.
+    /// Provider-name header row, including its Compact-only weekly-remaining
+    /// text (see `draw_provider_header_row`). Equal to `primary_text` for
+    /// RecommendedDark/Light (no visible change there); HighVisibility gives
+    /// it its own color to separate section headings from ordinary body
+    /// text.
     heading_text: Color,
 }
 
@@ -3009,6 +3088,7 @@ pub fn run() {
                 weekly_percent: None,
                 weekly_text: String::new(),
                 weekly_pace: None,
+                weekly_remaining_text: None,
                 codex_session_state: CellState::Loading,
                 codex_session_percent: None,
                 codex_session_text: String::new(),
@@ -3017,6 +3097,7 @@ pub fn run() {
                 codex_weekly_percent: None,
                 codex_weekly_text: String::new(),
                 codex_weekly_pace: None,
+                codex_weekly_remaining_text: None,
                 antigravity_session_state: CellState::Loading,
                 antigravity_session_percent: None,
                 antigravity_session_text: String::new(),
@@ -3025,6 +3106,7 @@ pub fn run() {
                 antigravity_weekly_percent: None,
                 antigravity_weekly_text: String::new(),
                 antigravity_weekly_pace: None,
+                antigravity_weekly_remaining_text: None,
                 show_claude_code: settings.show_claude_code,
                 show_codex: settings.show_codex,
                 show_antigravity: settings.show_antigravity,
@@ -3135,7 +3217,6 @@ fn render_layered() {
         app_theme,
         embedded,
         strings,
-        display_basis,
         short_window_visibility,
         popup_layout,
         session_state,
@@ -3145,6 +3226,7 @@ fn render_layered() {
         weekly_pct,
         weekly_text,
         weekly_pace,
+        weekly_remaining_text,
         codex_session_state,
         codex_session_pct,
         codex_session_text,
@@ -3152,6 +3234,7 @@ fn render_layered() {
         codex_weekly_pct,
         codex_weekly_text,
         codex_weekly_pace,
+        codex_weekly_remaining_text,
         antigravity_session_state,
         antigravity_session_pct,
         antigravity_session_text,
@@ -3159,6 +3242,7 @@ fn render_layered() {
         antigravity_weekly_pct,
         antigravity_weekly_text,
         antigravity_weekly_pace,
+        antigravity_weekly_remaining_text,
         show_claude_code,
         show_codex,
         show_antigravity,
@@ -3171,7 +3255,6 @@ fn render_layered() {
                 s.app_theme,
                 s.embedded,
                 s.language.strings(),
-                s.display_basis,
                 s.short_window_visibility,
                 s.popup_layout,
                 s.session_state,
@@ -3181,6 +3264,7 @@ fn render_layered() {
                 s.weekly_percent,
                 s.weekly_text.clone(),
                 s.weekly_pace.clone(),
+                s.weekly_remaining_text.clone(),
                 s.codex_session_state,
                 s.codex_session_percent,
                 s.codex_session_text.clone(),
@@ -3188,6 +3272,7 @@ fn render_layered() {
                 s.codex_weekly_percent,
                 s.codex_weekly_text.clone(),
                 s.codex_weekly_pace.clone(),
+                s.codex_weekly_remaining_text.clone(),
                 s.antigravity_session_state,
                 s.antigravity_session_percent,
                 s.antigravity_session_text.clone(),
@@ -3195,6 +3280,7 @@ fn render_layered() {
                 s.antigravity_weekly_percent,
                 s.antigravity_weekly_text.clone(),
                 s.antigravity_weekly_pace.clone(),
+                s.antigravity_weekly_remaining_text.clone(),
                 s.show_claude_code,
                 s.show_codex,
                 s.show_antigravity,
@@ -3271,7 +3357,6 @@ fn render_layered() {
             &palette.warning,
             &palette.heading_text,
             strings,
-            display_basis,
             short_window_visibility,
             session_state,
             session_pct,
@@ -3280,6 +3365,7 @@ fn render_layered() {
             weekly_pct,
             &weekly_text,
             weekly_pace.as_ref(),
+            weekly_remaining_text.as_deref(),
             codex_session_state,
             codex_session_pct,
             &codex_session_text,
@@ -3287,6 +3373,7 @@ fn render_layered() {
             codex_weekly_pct,
             &codex_weekly_text,
             codex_weekly_pace.as_ref(),
+            codex_weekly_remaining_text.as_deref(),
             antigravity_session_state,
             antigravity_session_pct,
             &antigravity_session_text,
@@ -3294,6 +3381,7 @@ fn render_layered() {
             antigravity_weekly_pct,
             &antigravity_weekly_text,
             antigravity_weekly_pace.as_ref(),
+            antigravity_weekly_remaining_text.as_deref(),
             show_claude_code,
             show_codex,
             show_antigravity,
@@ -3365,7 +3453,6 @@ fn paint_content(
     warning: &Color,
     heading_text: &Color,
     strings: Strings,
-    display_basis: DisplayBasis,
     short_window_visibility: ShortWindowVisibility,
     session_state: CellState,
     session_pct: Option<f64>,
@@ -3374,6 +3461,7 @@ fn paint_content(
     weekly_pct: Option<f64>,
     weekly_text: &str,
     weekly_pace: Option<&PaceGuidanceLines>,
+    weekly_remaining_text: Option<&str>,
     codex_session_state: CellState,
     codex_session_pct: Option<f64>,
     codex_session_text: &str,
@@ -3381,6 +3469,7 @@ fn paint_content(
     codex_weekly_pct: Option<f64>,
     codex_weekly_text: &str,
     codex_weekly_pace: Option<&PaceGuidanceLines>,
+    codex_weekly_remaining_text: Option<&str>,
     antigravity_session_state: CellState,
     antigravity_session_pct: Option<f64>,
     antigravity_session_text: &str,
@@ -3388,6 +3477,7 @@ fn paint_content(
     antigravity_weekly_pct: Option<f64>,
     antigravity_weekly_text: &str,
     antigravity_weekly_pace: Option<&PaceGuidanceLines>,
+    antigravity_weekly_remaining_text: Option<&str>,
     show_claude_code: bool,
     show_codex: bool,
     show_antigravity: bool,
@@ -3516,20 +3606,6 @@ fn paint_content(
         );
         let old_font = SelectObject(hdc, font);
 
-        if let Some(basis_label_y) = layout.basis_label_y {
-            let basis_label = match display_basis {
-                DisplayBasis::UsedPercentage => strings.used_percentage,
-                DisplayBasis::RemainingAllowance => strings.remaining_allowance,
-            };
-            draw_basis_label_row(
-                hdc,
-                content_x,
-                basis_label_y,
-                width - sc(RIGHT_MARGIN),
-                heading_text,
-                basis_label,
-            );
-        }
         draw_provider_header_row(
             hdc,
             content_x,
@@ -3539,6 +3615,10 @@ fn paint_content(
             show_claude_code,
             show_codex,
             show_antigravity,
+            popup_layout == PopupLayout::Compact,
+            weekly_remaining_text,
+            codex_weekly_remaining_text,
+            antigravity_weekly_remaining_text,
         );
 
         // AUM-PACE-GUIDANCE-01: when a provider has usable weekly pace
@@ -5475,7 +5555,6 @@ fn paint(hdc: HDC, hwnd: HWND) {
     let (
         app_theme,
         strings,
-        display_basis,
         short_window_visibility,
         popup_layout,
         session_state,
@@ -5485,6 +5564,7 @@ fn paint(hdc: HDC, hwnd: HWND) {
         weekly_pct,
         weekly_text,
         weekly_pace,
+        weekly_remaining_text,
         codex_session_state,
         codex_session_pct,
         codex_session_text,
@@ -5492,6 +5572,7 @@ fn paint(hdc: HDC, hwnd: HWND) {
         codex_weekly_pct,
         codex_weekly_text,
         codex_weekly_pace,
+        codex_weekly_remaining_text,
         antigravity_session_state,
         antigravity_session_pct,
         antigravity_session_text,
@@ -5499,6 +5580,7 @@ fn paint(hdc: HDC, hwnd: HWND) {
         antigravity_weekly_pct,
         antigravity_weekly_text,
         antigravity_weekly_pace,
+        antigravity_weekly_remaining_text,
         show_claude_code,
         show_codex,
         show_antigravity,
@@ -5508,7 +5590,6 @@ fn paint(hdc: HDC, hwnd: HWND) {
             Some(s) => (
                 s.app_theme,
                 s.language.strings(),
-                s.display_basis,
                 s.short_window_visibility,
                 s.popup_layout,
                 s.session_state,
@@ -5518,6 +5599,7 @@ fn paint(hdc: HDC, hwnd: HWND) {
                 s.weekly_percent,
                 s.weekly_text.clone(),
                 s.weekly_pace.clone(),
+                s.weekly_remaining_text.clone(),
                 s.codex_session_state,
                 s.codex_session_percent,
                 s.codex_session_text.clone(),
@@ -5525,6 +5607,7 @@ fn paint(hdc: HDC, hwnd: HWND) {
                 s.codex_weekly_percent,
                 s.codex_weekly_text.clone(),
                 s.codex_weekly_pace.clone(),
+                s.codex_weekly_remaining_text.clone(),
                 s.antigravity_session_state,
                 s.antigravity_session_percent,
                 s.antigravity_session_text.clone(),
@@ -5532,6 +5615,7 @@ fn paint(hdc: HDC, hwnd: HWND) {
                 s.antigravity_weekly_percent,
                 s.antigravity_weekly_text.clone(),
                 s.antigravity_weekly_pace.clone(),
+                s.antigravity_weekly_remaining_text.clone(),
                 s.show_claude_code,
                 s.show_codex,
                 s.show_antigravity,
@@ -5576,7 +5660,6 @@ fn paint(hdc: HDC, hwnd: HWND) {
             &palette.warning,
             &palette.heading_text,
             strings,
-            display_basis,
             short_window_visibility,
             session_state,
             session_pct,
@@ -5585,6 +5668,7 @@ fn paint(hdc: HDC, hwnd: HWND) {
             weekly_pct,
             &weekly_text,
             weekly_pace.as_ref(),
+            weekly_remaining_text.as_deref(),
             codex_session_state,
             codex_session_pct,
             &codex_session_text,
@@ -5592,6 +5676,7 @@ fn paint(hdc: HDC, hwnd: HWND) {
             codex_weekly_pct,
             &codex_weekly_text,
             codex_weekly_pace.as_ref(),
+            codex_weekly_remaining_text.as_deref(),
             antigravity_session_state,
             antigravity_session_pct,
             &antigravity_session_text,
@@ -5599,6 +5684,7 @@ fn paint(hdc: HDC, hwnd: HWND) {
             antigravity_weekly_pct,
             &antigravity_weekly_text,
             antigravity_weekly_pace.as_ref(),
+            antigravity_weekly_remaining_text.as_deref(),
             show_claude_code,
             show_codex,
             show_antigravity,
@@ -5621,6 +5707,13 @@ fn paint(hdc: HDC, hwnd: HWND) {
 /// column, aligned with the same `model_x` positions `draw_row` uses for its
 /// bars, so a provider is identifiable by its full localized name rather
 /// than by accent color or an invented abbreviation.
+///
+/// `show_weekly_remaining` gates the Compact-only weekly-remaining text
+/// (AUM-WINDOW-UI-01C-1): when `true`, each provider's own already-resolved
+/// remaining-time string (`None` when there's nothing safe to show — see
+/// `compact_weekly_remaining_for_cell`) is right-aligned in that same
+/// provider's column, next to its name — never drawn at all, `Standard`
+/// never passes `true` here.
 fn draw_provider_header_row(
     hdc: HDC,
     x: i32,
@@ -5630,6 +5723,10 @@ fn draw_provider_header_row(
     show_claude_code: bool,
     show_codex: bool,
     show_antigravity: bool,
+    show_weekly_remaining: bool,
+    claude_weekly_remaining: Option<&str>,
+    codex_weekly_remaining: Option<&str>,
+    antigravity_weekly_remaining: Option<&str>,
 ) {
     let active_models = active_model_count(show_claude_code, show_codex, show_antigravity);
     let segment_count = row_bar_segment_count(active_models);
@@ -5640,14 +5737,47 @@ fn draw_provider_header_row(
         let mut model_x = x + sc(LABEL_WIDTH) + sc(LABEL_RIGHT_MARGIN);
         if show_claude_code {
             draw_header_label(hdc, model_x, y, column_width, strings.claude_code_model);
+            if show_weekly_remaining {
+                draw_header_remaining_if_fits(
+                    hdc,
+                    model_x,
+                    y,
+                    column_width,
+                    !show_codex && !show_antigravity,
+                    strings.claude_code_model,
+                    claude_weekly_remaining,
+                );
+            }
             model_x += column_width + sc(MODEL_RIGHT_MARGIN);
         }
         if show_codex {
             draw_header_label(hdc, model_x, y, column_width, strings.codex_model);
+            if show_weekly_remaining {
+                draw_header_remaining_if_fits(
+                    hdc,
+                    model_x,
+                    y,
+                    column_width,
+                    !show_antigravity,
+                    strings.codex_model,
+                    codex_weekly_remaining,
+                );
+            }
             model_x += column_width + sc(MODEL_RIGHT_MARGIN);
         }
         if show_antigravity {
             draw_header_label(hdc, model_x, y, column_width, strings.antigravity_model);
+            if show_weekly_remaining {
+                draw_header_remaining_if_fits(
+                    hdc,
+                    model_x,
+                    y,
+                    column_width,
+                    true,
+                    strings.antigravity_model,
+                    antigravity_weekly_remaining,
+                );
+            }
         }
     }
 }
@@ -5670,32 +5800,91 @@ fn draw_header_label(hdc: HDC, x: i32, y: i32, width: i32, label: &str) {
     }
 }
 
-/// Draws the display-basis label ("Used %" / "Remaining Allowance", already
-/// resolved by the caller) spanning the full row width. It sits above the
-/// provider-name header row and isn't column-constrained, since it applies
-/// to every column at once rather than identifying a single provider.
-fn draw_basis_label_row(
-    hdc: HDC,
-    x: i32,
-    y: i32,
-    right_edge: i32,
-    text_color: &Color,
-    label: &str,
-) {
+/// Logical gap kept clear between a provider's name and its right-aligned
+/// weekly-remaining text (see `draw_header_remaining_if_fits`) so the two
+/// never visually run together even when both are close to the column's
+/// measured width.
+const HEADER_REMAINING_GAP_W: i32 = 8;
+
+/// Logical margin reserved at a non-final provider column's right edge
+/// (AUM-WINDOW-UI-01C-1 visual-review follow-up: without this, a
+/// full-width remaining-time string sits flush against the next provider's
+/// name — e.g. "残り5日13時間Codex" reading as one run-on string, even
+/// though neither string is clipped or literally overlapping). Not applied
+/// to the last shown column, which has no next-provider name after it and
+/// already keeps the popup's own `RIGHT_MARGIN` beyond `column_width` —
+/// see `draw_header_remaining_if_fits`'s `is_last_column`.
+const COLUMN_BOUNDARY_GAP_W: i32 = 8;
+
+/// Live-measured width (in the font currently selected into `hdc`) of
+/// `text`, via `GetTextExtentPoint32W` — the same GDI primitive
+/// `draw_header_remaining_if_fits` uses to decide whether the Compact
+/// weekly-remaining text actually fits next to a provider name, rather than
+/// assuming it fits from a fixed character count (see `TEXT_WIDTH`'s own doc
+/// for why that assumption doesn't hold across 11 languages).
+fn text_extent_width(hdc: HDC, text: &str) -> i32 {
+    let wide: Vec<u16> = text.encode_utf16().collect();
+    let mut size = SIZE::default();
     unsafe {
-        let _ = SetTextColor(hdc, COLORREF(text_color.to_colorref()));
-        let mut label_wide: Vec<u16> = label.encode_utf16().collect();
-        let mut label_rect = RECT {
-            left: x,
+        let _ = GetTextExtentPoint32W(hdc, &wide, &mut size);
+    }
+    size.cx
+}
+
+/// Draws `remaining` right-aligned in the provider header row within
+/// `model_x..model_x + column_width`, but only when `name` (already drawn
+/// left-aligned by the caller), the `HEADER_REMAINING_GAP_W` gap, and
+/// `remaining` all actually fit — measured live via `text_extent_width`
+/// against the font already selected into `hdc`. Draws nothing at all when
+/// they don't fit: the provider name always wins, and a clipped or
+/// overlapping remaining-time string would be worse than omitting it.
+///
+/// `is_last_column` reserves `COLUMN_BOUNDARY_GAP_W` at the column's right
+/// edge for every column except the last shown one — both from the fit
+/// check and from the drawn rect's right edge — so a non-final column's
+/// remaining-time text keeps clear air before the next provider's name
+/// instead of sitting flush against it. The last shown column has no next
+/// provider to guard against, so it keeps using the full `column_width`
+/// exactly as before this margin was added.
+fn draw_header_remaining_if_fits(
+    hdc: HDC,
+    model_x: i32,
+    y: i32,
+    column_width: i32,
+    is_last_column: bool,
+    name: &str,
+    remaining: Option<&str>,
+) {
+    let Some(remaining) = remaining else {
+        return;
+    };
+    if remaining.is_empty() {
+        return;
+    }
+    let boundary_margin = if is_last_column {
+        0
+    } else {
+        sc(COLUMN_BOUNDARY_GAP_W)
+    };
+    let available_width = column_width - boundary_margin;
+    let name_w = text_extent_width(hdc, name);
+    let remaining_w = text_extent_width(hdc, remaining);
+    if name_w + sc(HEADER_REMAINING_GAP_W) + remaining_w > available_width {
+        return;
+    }
+    unsafe {
+        let mut remaining_wide: Vec<u16> = remaining.encode_utf16().collect();
+        let mut rect = RECT {
+            left: model_x,
             top: y,
-            right: right_edge,
+            right: model_x + available_width,
             bottom: y + sc(HEADER_ROW_H),
         };
         let _ = DrawTextW(
             hdc,
-            &mut label_wide,
-            &mut label_rect,
-            DT_LEFT | DT_VCENTER | DT_SINGLELINE,
+            &mut remaining_wide,
+            &mut rect,
+            DT_RIGHT | DT_VCENTER | DT_SINGLELINE,
         );
     }
 }
@@ -6074,11 +6263,18 @@ fn draw_usage_bar(
         // above: also covers a future `Some(percent)` with empty `text`
         // (bar segments still draw; only this text-draw step is skipped).
         if !text_wide.is_empty() {
+            // DT_END_ELLIPSIS (AUM-WINDOW-UI-01C-1): a value+reset string
+            // that overflows `TEXT_WIDTH` (e.g. a long localized reset-in
+            // phrase in a 2-3 provider Standard layout — see `TEXT_WIDTH`'s
+            // own doc on its worst-case sizing not being live-measured) now
+            // truncates with a visible "…" instead of a silent hard clip.
+            // Matches `draw_pace_text_line`'s existing ellipsis handling for
+            // the weekly pace-guidance lines below this row.
             let _ = DrawTextW(
                 hdc,
                 &mut text_wide,
                 &mut text_rect,
-                DT_LEFT | DT_VCENTER | DT_SINGLELINE,
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
             );
         }
     }
@@ -7049,13 +7245,11 @@ mod tests {
             rows_before.weekly_extra_lines,
             rows_after.weekly_extra_lines
         );
-        assert_eq!(rows_before.basis_label, rows_after.basis_label);
     }
 
     #[test]
     fn visible_rows_for_compact_forces_every_optional_row_off() {
         let rows = visible_rows(PopupLayout::Compact, 2, true);
-        assert!(!rows.basis_label);
         assert_eq!(rows.weekly_extra_lines, 0);
         assert!(!rows.session_row);
     }
@@ -7063,7 +7257,6 @@ mod tests {
     #[test]
     fn visible_rows_for_compact_forces_off_even_with_nothing_to_show() {
         let rows = visible_rows(PopupLayout::Compact, 0, false);
-        assert!(!rows.basis_label);
         assert_eq!(rows.weekly_extra_lines, 0);
         assert!(!rows.session_row);
     }
@@ -7071,12 +7264,10 @@ mod tests {
     #[test]
     fn visible_rows_for_standard_passes_content_through_unchanged() {
         let rows = visible_rows(PopupLayout::Standard, 2, true);
-        assert!(rows.basis_label);
         assert_eq!(rows.weekly_extra_lines, 2);
         assert!(rows.session_row);
 
         let rows = visible_rows(PopupLayout::Standard, 0, false);
-        assert!(rows.basis_label);
         assert_eq!(rows.weekly_extra_lines, 0);
         assert!(!rows.session_row);
     }
@@ -7094,13 +7285,20 @@ mod tests {
 
     #[test]
     fn popup_height_logical_for_standard_matches_pre_popup_layout_behavior() {
+        // AUM-WINDOW-UI-01C-1: the basis-label row was removed from the
+        // popup body for every `PopupLayout`, so `Standard`'s height is now
+        // `WIDGET_HEIGHT - BASIS_LABEL_ROW_H` at baseline (previously just
+        // `WIDGET_HEIGHT`, back when the basis-label row was Standard-only).
         let with_session = visible_rows(PopupLayout::Standard, 0, true);
-        assert_eq!(popup_height_logical(with_session), WIDGET_HEIGHT);
+        assert_eq!(
+            popup_height_logical(with_session),
+            WIDGET_HEIGHT - BASIS_LABEL_ROW_H
+        );
 
         let without_session = visible_rows(PopupLayout::Standard, 2, false);
         assert_eq!(
             popup_height_logical(without_session),
-            WIDGET_HEIGHT - ROW_GAP_H - SEGMENT_H + 2 * PACE_LINE_H
+            WIDGET_HEIGHT - BASIS_LABEL_ROW_H - ROW_GAP_H - SEGMENT_H + 2 * PACE_LINE_H
         );
     }
 
@@ -7122,11 +7320,10 @@ mod tests {
     }
 
     #[test]
-    fn pace_row_layout_for_compact_omits_basis_label_and_session_row() {
+    fn pace_row_layout_for_compact_omits_session_row() {
         let rows = visible_rows(PopupLayout::Compact, 2, true);
         let height = sc(popup_height_logical(rows));
         let layout = pace_row_layout(height, rows);
-        assert_eq!(layout.basis_label_y, None);
         assert_eq!(layout.session_row_y, None);
         assert_eq!(layout.weekly_secondary_y, None);
     }
@@ -7136,7 +7333,6 @@ mod tests {
         let rows = visible_rows(PopupLayout::Standard, 1, true);
         let height = sc(popup_height_logical(rows));
         let layout = pace_row_layout(height, rows);
-        assert!(layout.basis_label_y.is_some());
         assert!(layout.session_row_y.is_some());
         assert!(layout.weekly_secondary_y.is_some());
     }
@@ -7849,6 +8045,131 @@ mod tests {
         .is_some());
     }
 
+    // ── AUM-WINDOW-UI-01C-1: Compact provider-header weekly-remaining text ─
+    // Every test below fixes `now` to a synthetic epoch-based instant rather
+    // than calling `SystemTime::now()`, so the exact formatted duration
+    // string can be asserted without any risk of a real-clock second
+    // boundary making the test flaky.
+
+    #[test]
+    fn compact_weekly_remaining_text_formats_days_and_hours() {
+        let now = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let strings = LanguageId::Japanese.strings();
+        let remaining = Duration::from_secs(5 * 86400 + 23 * 3600);
+        let text = compact_weekly_remaining_text(Some(now + remaining), now, strings);
+        assert_eq!(text.as_deref(), Some("残り 5日23時間"));
+    }
+
+    #[test]
+    fn compact_weekly_remaining_text_formats_hours_and_minutes_under_one_day() {
+        let now = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let strings = LanguageId::Japanese.strings();
+        let remaining = Duration::from_secs(10 * 3600 + 30 * 60);
+        let text = compact_weekly_remaining_text(Some(now + remaining), now, strings);
+        assert_eq!(text.as_deref(), Some("残り 10時間30分"));
+    }
+
+    #[test]
+    fn compact_weekly_remaining_text_formats_minutes_and_seconds_under_one_hour() {
+        let now = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let strings = LanguageId::Japanese.strings();
+        let remaining = Duration::from_secs(5 * 60 + 30);
+        let text = compact_weekly_remaining_text(Some(now + remaining), now, strings);
+        assert_eq!(text.as_deref(), Some("残り 5分30秒"));
+    }
+
+    #[test]
+    fn compact_weekly_remaining_text_is_none_without_resets_at() {
+        let now = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let strings = LanguageId::English.strings();
+        assert_eq!(compact_weekly_remaining_text(None, now, strings), None);
+    }
+
+    #[test]
+    fn compact_weekly_remaining_text_is_none_when_reset_already_passed() {
+        let now = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let strings = LanguageId::English.strings();
+        let resets_at = now - Duration::from_secs(5);
+        assert_eq!(
+            compact_weekly_remaining_text(Some(resets_at), now, strings),
+            None
+        );
+    }
+
+    #[test]
+    fn compact_weekly_remaining_for_cell_is_none_for_every_non_ok_state() {
+        let now = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let strings = LanguageId::English.strings();
+        let section = UsageSection {
+            percentage: 42.0,
+            resets_at: Some(now + Duration::from_secs(WEEKLY_WINDOW_SECS / 2)),
+        };
+        for state in [
+            CellState::Loading,
+            CellState::FetchFailed,
+            CellState::Retrying,
+            CellState::NotConfigured,
+            CellState::NotAvailable,
+        ] {
+            assert_eq!(
+                compact_weekly_remaining_for_cell(state, Some(&section), now, strings),
+                None,
+                "state {state:?} must not produce remaining text even with a cached section"
+            );
+        }
+    }
+
+    #[test]
+    fn compact_weekly_remaining_for_cell_is_none_when_ok_but_section_missing() {
+        let now = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let strings = LanguageId::English.strings();
+        assert_eq!(
+            compact_weekly_remaining_for_cell(CellState::Ok, None, now, strings),
+            None
+        );
+    }
+
+    #[test]
+    fn compact_weekly_remaining_for_cell_is_some_when_ok_with_section() {
+        let now = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let strings = LanguageId::English.strings();
+        let section = UsageSection {
+            percentage: 42.0,
+            resets_at: Some(now + Duration::from_secs(WEEKLY_WINDOW_SECS / 2)),
+        };
+        assert!(
+            compact_weekly_remaining_for_cell(CellState::Ok, Some(&section), now, strings)
+                .is_some()
+        );
+    }
+
+    /// Each provider's Compact weekly-remaining text is derived solely from
+    /// that provider's own `resets_at` — `compact_weekly_remaining_for_cell`
+    /// takes no shared/global state, so two providers with different reset
+    /// times can never end up showing each other's remaining time.
+    #[test]
+    fn compact_weekly_remaining_for_cell_does_not_mix_values_across_providers() {
+        let now = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let strings = LanguageId::English.strings();
+        let claude_section = UsageSection {
+            percentage: 10.0,
+            resets_at: Some(now + Duration::from_secs(5 * 86400 + 23 * 3600)),
+        };
+        let codex_section = UsageSection {
+            percentage: 90.0,
+            resets_at: Some(now + Duration::from_secs(2 * 86400 + 3 * 3600)),
+        };
+        let claude_text =
+            compact_weekly_remaining_for_cell(CellState::Ok, Some(&claude_section), now, strings)
+                .unwrap();
+        let codex_text =
+            compact_weekly_remaining_for_cell(CellState::Ok, Some(&codex_section), now, strings)
+                .unwrap();
+        assert_ne!(claude_text, codex_text);
+        assert!(claude_text.contains("5d"));
+        assert!(codex_text.contains("2d"));
+    }
+
     #[test]
     fn session_pace_for_cell_is_none_for_every_non_ok_state() {
         let now = SystemTime::now();
@@ -8418,13 +8739,16 @@ mod tests {
 
     #[test]
     fn popup_height_logical_with_session_row_is_widget_height_plus_weekly_extra() {
+        // AUM-WINDOW-UI-01C-1: baseline is `WIDGET_HEIGHT - BASIS_LABEL_ROW_H`
+        // now that the basis-label row is never drawn (see
+        // `popup_height_logical_for_standard_matches_pre_popup_layout_behavior`).
         assert_eq!(
             popup_height_logical(visible_rows(PopupLayout::Standard, 0, true)),
-            WIDGET_HEIGHT
+            WIDGET_HEIGHT - BASIS_LABEL_ROW_H
         );
         assert_eq!(
             popup_height_logical(visible_rows(PopupLayout::Standard, 2, true)),
-            WIDGET_HEIGHT + 2 * PACE_LINE_H
+            WIDGET_HEIGHT - BASIS_LABEL_ROW_H + 2 * PACE_LINE_H
         );
     }
 
@@ -8432,11 +8756,11 @@ mod tests {
     fn popup_height_logical_without_session_row_shrinks_by_one_row_and_gap() {
         assert_eq!(
             popup_height_logical(visible_rows(PopupLayout::Standard, 0, false)),
-            WIDGET_HEIGHT - ROW_GAP_H - SEGMENT_H
+            WIDGET_HEIGHT - BASIS_LABEL_ROW_H - ROW_GAP_H - SEGMENT_H
         );
         assert_eq!(
             popup_height_logical(visible_rows(PopupLayout::Standard, 1, false)),
-            WIDGET_HEIGHT - ROW_GAP_H - SEGMENT_H + PACE_LINE_H
+            WIDGET_HEIGHT - BASIS_LABEL_ROW_H - ROW_GAP_H - SEGMENT_H + PACE_LINE_H
         );
     }
 
