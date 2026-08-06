@@ -156,6 +156,12 @@ struct CodexRateLimitDetails {
 struct CodexRateLimitWindow {
     used_percent: f64,
     reset_at: i64,
+    /// This window's actual length in seconds — the sole basis for
+    /// classifying it as the 5h/session window or the 7d/weekly window (see
+    /// `apply_codex_window`). `Option<T>` fields already deserialize to
+    /// `None` when the JSON key is absent, so an older/different response
+    /// shape missing this key doesn't fail the whole response.
+    limit_window_seconds: Option<u64>,
 }
 
 #[cfg(feature = "antigravity")]
@@ -1083,19 +1089,57 @@ fn fetch_codex_usage(token: &str, account_id: Option<&str>) -> Result<UsageData,
     codex_usage_from_response(response).ok_or(PollError::RequestFailed)
 }
 
+/// AUM-CODEX-WINDOW-CLASSIFICATION-HF2: the 5h/session window's real length,
+/// in seconds. Codex's `primary_window`/`secondary_window` are positional
+/// slots, not a session/weekly guarantee — Codex has been observed to put
+/// the weekly window in `primary_window` (with `secondary_window` absent)
+/// when no 5-hour window is currently returned — so classification here
+/// uses each window's own `limit_window_seconds` instead of its position.
+const CODEX_SESSION_WINDOW_SECONDS: u64 = 18_000;
+/// The 7d/weekly window's real length, in seconds. See
+/// `CODEX_SESSION_WINDOW_SECONDS`.
+const CODEX_WEEKLY_WINDOW_SECONDS: u64 = 604_800;
+
 fn codex_usage_from_response(response: CodexUsageResponse) -> Option<UsageData> {
     let details = *response.rate_limit.flatten()?;
     let mut data = UsageData::default();
 
     if let Some(window) = details.primary_window.flatten() {
-        data.set_session(codex_section_from_window(&window));
+        apply_codex_window(&mut data, &window);
     }
 
     if let Some(window) = details.secondary_window.flatten() {
-        data.set_weekly(codex_section_from_window(&window));
+        apply_codex_window(&mut data, &window);
     }
 
     Some(data)
+}
+
+/// Merges one Codex rate-limit window into `data`, classified solely by its
+/// `limit_window_seconds` (`CODEX_SESSION_WINDOW_SECONDS`/
+/// `CODEX_WEEKLY_WINDOW_SECONDS`) — never by whether it came from
+/// `primary_window` or `secondary_window`, and never by how soon
+/// `reset_at` is (a weekly window's remaining time also drops under 5 hours
+/// right before it resets, which would misclassify it as the session window
+/// under a time-based guess). A window whose duration is missing or doesn't
+/// match either known length is dropped entirely: a wrong "5h"/"7d" label is
+/// worse than that row showing "not available".
+///
+/// `codex_usage_from_response` always calls this for `primary_window` before
+/// `secondary_window`. If both windows this poll classify into the same
+/// slot, the `session_available`/`weekly_available` guards below mean only
+/// the first one processed is kept — the second is dropped rather than
+/// silently overwriting it.
+fn apply_codex_window(data: &mut UsageData, window: &CodexRateLimitWindow) {
+    match window.limit_window_seconds {
+        Some(CODEX_SESSION_WINDOW_SECONDS) if !data.session_available() => {
+            data.set_session(codex_section_from_window(window));
+        }
+        Some(CODEX_WEEKLY_WINDOW_SECONDS) if !data.weekly_available() => {
+            data.set_weekly(codex_section_from_window(window));
+        }
+        _ => {}
+    }
 }
 
 fn codex_section_from_window(window: &CodexRateLimitWindow) -> UsageSection {
@@ -1888,6 +1932,18 @@ mod tests {
         }
     }
 
+    fn codex_window(
+        used_percent: f64,
+        reset_at: i64,
+        limit_window_seconds: Option<u64>,
+    ) -> CodexRateLimitWindow {
+        CodexRateLimitWindow {
+            used_percent,
+            reset_at,
+            limit_window_seconds,
+        }
+    }
+
     #[test]
     fn claude_missing_windows_remain_unavailable() {
         let usage = claude_usage_from_response(UsageResponse {
@@ -1932,42 +1988,189 @@ mod tests {
         assert_eq!(usage.weekly.percentage, 42.0);
     }
 
+    // ── AUM-CODEX-WINDOW-CLASSIFICATION-HF2: Codex windows are classified by
+    // `limit_window_seconds`, never by primary/secondary position — Codex has
+    // been observed to report the weekly window as `primary_window` (with
+    // `secondary_window` absent) when no 5-hour window is currently
+    // returned. ─────────────────────────────────────────────────────────
+
+    /// Case 1: both windows present with their real durations classify into
+    /// their matching slot, and `used_percent`/`reset_at` survive
+    /// unchanged (also covers case 9).
     #[test]
-    fn codex_window_availability_is_independent() {
-        let primary_only = codex_usage_from_response(codex_response(
-            Some(CodexRateLimitWindow {
-                used_percent: 12.0,
-                reset_at: 10,
-            }),
-            None,
-        ))
-        .expect("rate limit details should produce usage");
-        let secondary_only = codex_usage_from_response(codex_response(
-            None,
-            Some(CodexRateLimitWindow {
-                used_percent: 34.0,
-                reset_at: 20,
-            }),
+    fn codex_classifies_session_and_weekly_by_duration() {
+        let usage = codex_usage_from_response(codex_response(
+            Some(codex_window(12.0, 100, Some(CODEX_SESSION_WINDOW_SECONDS))),
+            Some(codex_window(34.0, 200, Some(CODEX_WEEKLY_WINDOW_SECONDS))),
         ))
         .expect("rate limit details should produce usage");
 
-        assert!(primary_only.session_available());
-        assert!(!primary_only.weekly_available());
-        assert_eq!(primary_only.session.percentage, 12.0);
-        assert_eq!(primary_only.weekly.percentage, 0.0);
-        assert!(!secondary_only.session_available());
-        assert!(secondary_only.weekly_available());
-        assert_eq!(secondary_only.session.percentage, 0.0);
-        assert_eq!(secondary_only.weekly.percentage, 34.0);
+        assert!(usage.session_available());
+        assert!(usage.weekly_available());
+        assert_eq!(usage.session.percentage, 12.0);
+        assert_eq!(usage.weekly.percentage, 34.0);
+        assert_eq!(usage.session.resets_at, unix_to_system_time(Some(100)));
+        assert_eq!(usage.weekly.resets_at, unix_to_system_time(Some(200)));
+    }
+
+    /// Case 2: the exact live HF2 bug shape — Codex puts the weekly window
+    /// in `primary_window` (5h window not currently returned,
+    /// `secondary_window` absent). Must land in `weekly`, not `session`.
+    #[test]
+    fn codex_weekly_reported_as_primary_with_secondary_absent_stays_weekly() {
+        let usage = codex_usage_from_response(codex_response(
+            Some(codex_window(82.0, 300, Some(CODEX_WEEKLY_WINDOW_SECONDS))),
+            None,
+        ))
+        .expect("rate limit details should produce usage");
+
+        assert!(
+            !usage.session_available(),
+            "a weekly-duration window in the primary slot must not appear as the 5h row"
+        );
+        assert!(usage.weekly_available());
+        assert_eq!(usage.weekly.percentage, 82.0);
+    }
+
+    /// Case 3: mirror of case 2 — a session-duration window reported as
+    /// `secondary_window` with `primary_window` absent must still land in
+    /// `session`.
+    #[test]
+    fn codex_session_reported_as_secondary_with_primary_absent_stays_session() {
+        let usage = codex_usage_from_response(codex_response(
+            None,
+            Some(codex_window(50.0, 400, Some(CODEX_SESSION_WINDOW_SECONDS))),
+        ))
+        .expect("rate limit details should produce usage");
+
+        assert!(usage.session_available());
+        assert!(!usage.weekly_available());
+        assert_eq!(usage.session.percentage, 50.0);
+    }
+
+    /// Case 4: both windows present with their positions swapped relative to
+    /// case 1 (weekly duration in `primary_window`, session duration in
+    /// `secondary_window`) — classification must still follow duration, not
+    /// position.
+    #[test]
+    fn codex_classifies_correctly_regardless_of_primary_secondary_order() {
+        let usage = codex_usage_from_response(codex_response(
+            Some(codex_window(60.0, 500, Some(CODEX_WEEKLY_WINDOW_SECONDS))),
+            Some(codex_window(15.0, 600, Some(CODEX_SESSION_WINDOW_SECONDS))),
+        ))
+        .expect("rate limit details should produce usage");
+
+        assert!(usage.session_available());
+        assert!(usage.weekly_available());
+        assert_eq!(usage.session.percentage, 15.0);
+        assert_eq!(usage.weekly.percentage, 60.0);
+    }
+
+    /// Case 5: `limit_window_seconds` missing entirely — dropped rather than
+    /// guessed into either slot.
+    #[test]
+    fn codex_window_with_missing_duration_is_not_classified() {
+        let usage =
+            codex_usage_from_response(codex_response(Some(codex_window(70.0, 700, None)), None))
+                .expect("rate limit details should produce usage");
+
+        assert!(!usage.session_available());
+        assert!(!usage.weekly_available());
+    }
+
+    /// Case 6: a duration that matches neither known window length — also
+    /// dropped rather than guessed.
+    #[test]
+    fn codex_window_with_unknown_duration_is_not_classified() {
+        let usage = codex_usage_from_response(codex_response(
+            Some(codex_window(70.0, 700, Some(3_600))),
+            None,
+        ))
+        .expect("rate limit details should produce usage");
+
+        assert!(!usage.session_available());
+        assert!(!usage.weekly_available());
+    }
+
+    /// Case 7: a weekly-duration window whose `reset_at` is imminent (well
+    /// under 5 hours away) must still classify as weekly — classification
+    /// uses only `limit_window_seconds`, never a `reset_at`-based guess that
+    /// would otherwise misread an about-to-reset weekly window as the
+    /// session window.
+    #[test]
+    fn codex_weekly_classification_is_not_affected_by_near_reset_time() {
+        let usage = codex_usage_from_response(codex_response(
+            Some(codex_window(95.0, 1, Some(CODEX_WEEKLY_WINDOW_SECONDS))),
+            None,
+        ))
+        .expect("rate limit details should produce usage");
+
+        assert!(!usage.session_available());
+        assert!(usage.weekly_available());
+        assert_eq!(usage.weekly.percentage, 95.0);
+    }
+
+    /// Case 8 (session slot): both windows report the same (session)
+    /// duration — the first one processed (`primary_window`) is kept, the
+    /// second is dropped rather than silently overwriting it.
+    #[test]
+    fn codex_duplicate_session_windows_keep_the_first_value() {
+        let usage = codex_usage_from_response(codex_response(
+            Some(codex_window(12.0, 100, Some(CODEX_SESSION_WINDOW_SECONDS))),
+            Some(codex_window(99.0, 200, Some(CODEX_SESSION_WINDOW_SECONDS))),
+        ))
+        .expect("rate limit details should produce usage");
+
+        assert!(usage.session_available());
+        assert_eq!(usage.session.percentage, 12.0);
+        assert_eq!(usage.session.resets_at, unix_to_system_time(Some(100)));
+    }
+
+    /// Case 8 (weekly slot): mirror of the session case above.
+    #[test]
+    fn codex_duplicate_weekly_windows_keep_the_first_value() {
+        let usage = codex_usage_from_response(codex_response(
+            Some(codex_window(20.0, 100, Some(CODEX_WEEKLY_WINDOW_SECONDS))),
+            Some(codex_window(88.0, 200, Some(CODEX_WEEKLY_WINDOW_SECONDS))),
+        ))
+        .expect("rate limit details should produce usage");
+
+        assert!(usage.weekly_available());
+        assert_eq!(usage.weekly.percentage, 20.0);
+        assert_eq!(usage.weekly.resets_at, unix_to_system_time(Some(100)));
+    }
+
+    /// Case 10: the real wire shape — `rate_limit.primary_window`/
+    /// `secondary_window`, each carrying `limit_window_seconds` in
+    /// snake_case, deserializes correctly via `serde_json`.
+    #[test]
+    fn codex_rate_limit_window_deserializes_limit_window_seconds_from_snake_case_json() {
+        let response: CodexUsageResponse = serde_json::from_str(
+            r#"{
+                "rate_limit": {
+                    "primary_window": {
+                        "used_percent": 82.0,
+                        "reset_at": 1754611200,
+                        "limit_window_seconds": 604800
+                    },
+                    "secondary_window": null
+                }
+            }"#,
+        )
+        .expect("valid Codex usage JSON should deserialize");
+
+        let usage =
+            codex_usage_from_response(response).expect("rate limit details should produce usage");
+
+        assert!(!usage.session_available());
+        assert!(usage.weekly_available());
+        assert_eq!(usage.weekly.percentage, 82.0);
     }
 
     #[test]
     fn codex_actual_zero_is_available() {
         let usage = codex_usage_from_response(codex_response(
-            Some(CodexRateLimitWindow {
-                used_percent: 0.0,
-                reset_at: 10,
-            }),
+            Some(codex_window(0.0, 10, Some(CODEX_SESSION_WINDOW_SECONDS))),
             None,
         ))
         .expect("rate limit details should produce usage");
