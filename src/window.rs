@@ -582,9 +582,15 @@ impl ShortWindowAlertSensitivity {
 /// (`used% / elapsed`) linearly forward — 100% is reached with at least
 /// `exhaustion_lead_secs` to spare before the actual reset (boundary
 /// inclusive throughout: `>=`, not `>`). Division is only reached once
-/// `used > 0.0` is established; `used >= 100.0` is handled directly
-/// (already exhausted, so overpacing iff at least `exhaustion_lead_secs`
-/// remain in the window) without going through the projection at all.
+/// `used > 0.0` is established; `used >= 100.0` is handled directly and
+/// unconditionally (AUM-WINDOW-UI-01C-1-HF1: already-100%-used is a fact,
+/// not a projection, so `exhaustion_lead_secs` — "warn this long *before*
+/// the projected 100%" — has nothing left to gate on; gating it on
+/// `remaining_secs` anyway meant a real 100%-used cell silently stopped
+/// showing under `WarningOnly` once the window's reset drew within
+/// `exhaustion_lead_secs`, even though 100% used must always be a warning
+/// regardless of how much of the window is left) without going through the
+/// projection at all.
 /// Linear projection of "how many seconds from now until 100%, if the
 /// current average pace (`used% / elapsed`) continues". `None` when the
 /// projection isn't meaningful/safe: no usage yet or already at/over 100%
@@ -620,7 +626,7 @@ fn short_window_is_overpacing(
         return false;
     }
     if used >= 100.0 {
-        return remaining_secs >= t.exhaustion_lead_secs;
+        return true;
     }
 
     let Some(secs_to_exhaustion) = projected_secs_to_exhaustion(elapsed_secs, used_percent) else {
@@ -7869,6 +7875,69 @@ mod tests {
         assert!(lines.primary.contains(strings.weekly_pace_overpacing));
     }
 
+    /// "使いすぎモード＋95%相当：表示" — a used% comfortably below 100 still
+    /// projects exhaustion well before reset, so it must show under
+    /// `WarningOnly` exactly like the 60%-used projection case above.
+    #[test]
+    fn short_window_pace_guidance_warning_only_shows_ninety_five_percent_overpacing() {
+        let now = SystemTime::now();
+        let sensitivity = ShortWindowAlertSensitivity::Standard;
+        let t = sensitivity.thresholds();
+        let elapsed = t.grace_secs + 1;
+        let remaining = SESSION_WINDOW_SECS - elapsed;
+        let resets_at = Some(now + Duration::from_secs(remaining));
+        let strings = LanguageId::English.strings();
+        let lines = short_window_pace_guidance_lines(
+            Some(95.0),
+            resets_at,
+            now,
+            DisplayBasis::UsedPercentage,
+            ShortWindowVisibility::WarningOnly,
+            sensitivity,
+            strings,
+        )
+        .expect("95%-used projecting exhaustion well before reset must show under WarningOnly");
+        assert!(lines.is_warning);
+    }
+
+    /// AUM-WINDOW-UI-01C-1-HF1 regression: "使いすぎモード＋100%：表示",
+    /// including "リセット直前でも100%が表示される" — reproduces the exact
+    /// live bug report (Claude Code at 100% used, ~35 minutes to reset,
+    /// hidden under "使いすぎのときだけ" before this fix). 100%-used must
+    /// always be a warning under `WarningOnly`, regardless of how little of
+    /// the window remains — see `short_window_is_overpacing`'s `used >=
+    /// 100.0` branch.
+    #[test]
+    fn short_window_pace_guidance_warning_only_shows_hundred_percent_even_near_reset() {
+        let now = SystemTime::now();
+        let remaining = Duration::from_secs(35 * 60).as_secs(); // ~35 minutes, as reported live
+        let resets_at = Some(now + Duration::from_secs(remaining));
+        let strings = LanguageId::English.strings();
+        let lines = short_window_pace_guidance_lines(
+            Some(100.0),
+            resets_at,
+            now,
+            DisplayBasis::UsedPercentage,
+            ShortWindowVisibility::WarningOnly,
+            ShortWindowAlertSensitivity::Standard,
+            strings,
+        )
+        .expect("100%-used must show under WarningOnly even with little time left before reset");
+        assert!(lines.is_warning);
+
+        // Reset itself imminent (0 seconds remaining): still must show.
+        let lines_at_reset = short_window_pace_guidance_lines(
+            Some(100.0),
+            Some(now + Duration::from_secs(SESSION_WINDOW_SECS)),
+            now + Duration::from_secs(SESSION_WINDOW_SECS),
+            DisplayBasis::UsedPercentage,
+            ShortWindowVisibility::WarningOnly,
+            ShortWindowAlertSensitivity::Standard,
+            strings,
+        );
+        assert!(lines_at_reset.is_some());
+    }
+
     #[test]
     fn short_window_pace_guidance_hidden_never_shows_even_when_overpacing() {
         let now = SystemTime::now();
@@ -7877,6 +7946,26 @@ mod tests {
         let strings = LanguageId::English.strings();
         let lines = short_window_pace_guidance_lines(
             Some(60.0),
+            resets_at,
+            now,
+            DisplayBasis::UsedPercentage,
+            ShortWindowVisibility::Hidden,
+            ShortWindowAlertSensitivity::Standard,
+            strings,
+        );
+        assert_eq!(lines, None);
+    }
+
+    /// "表示しない＋100%：非表示" — `Hidden` suppresses everything
+    /// unconditionally, including a 100%-used cell that `WarningOnly` would
+    /// now always show (see the HF1 regression test above).
+    #[test]
+    fn short_window_pace_guidance_hidden_never_shows_hundred_percent() {
+        let now = SystemTime::now();
+        let resets_at = Some(now + Duration::from_secs(35 * 60));
+        let strings = LanguageId::English.strings();
+        let lines = short_window_pace_guidance_lines(
+            Some(100.0),
             resets_at,
             now,
             DisplayBasis::UsedPercentage,
@@ -8490,6 +8579,46 @@ mod tests {
         assert!(shows);
         assert_eq!(percent, Some(68.0));
         assert_eq!(text, "68% overpacing");
+        assert!(is_warning);
+    }
+
+    /// AUM-WINDOW-UI-01C-1-HF1 end-to-end proof: chains `session_pace_for_cell`
+    /// (the same helper `refresh_usage_texts` uses to populate
+    /// `AppState.session_pace`) into `session_cell_decision` (the same
+    /// predicate `needs_session_row`/`session_row_visible`/`paint_content` use
+    /// to decide whether the 5h row is drawn at all), for the exact
+    /// live-reported shape: 100%-used, `WarningOnly`, ~35 minutes to reset.
+    /// The other HF1 tests only prove `short_window_pace_guidance_lines`
+    /// returns `Some` — this proves the row itself actually shows.
+    #[test]
+    fn session_cell_decision_shows_hundred_percent_row_under_warning_only_near_reset() {
+        let now = SystemTime::now();
+        let strings = LanguageId::English.strings();
+        let section = UsageSection {
+            percentage: 100.0,
+            resets_at: Some(now + Duration::from_secs(35 * 60)),
+        };
+        let pace = session_pace_for_cell(
+            CellState::Ok,
+            Some(&section),
+            now,
+            DisplayBasis::UsedPercentage,
+            ShortWindowVisibility::WarningOnly,
+            ShortWindowAlertSensitivity::Standard,
+            strings,
+        );
+        let (shows, percent, _text, is_warning) = session_cell_decision(
+            CellState::Ok,
+            Some(100.0),
+            "100%",
+            pace.as_ref(),
+            ShortWindowVisibility::WarningOnly,
+        );
+        assert!(
+            shows,
+            "the 5h row itself must be shown, not just its pace text computed"
+        );
+        assert_eq!(percent, Some(100.0));
         assert!(is_warning);
     }
 
@@ -9215,24 +9344,50 @@ mod tests {
         ));
     }
 
+    /// AUM-WINDOW-UI-01C-1-HF1: 100%-used is always overpacing once past the
+    /// grace period, regardless of how much of the window remains —
+    /// `exhaustion_lead_secs` only gates the *projection* branch below
+    /// (warning this long *before* an upcoming 100%), and has nothing left
+    /// to gate once 100% has already been reached. Previously this branch
+    /// returned `remaining_secs >= t.exhaustion_lead_secs`, which silently
+    /// hid a real 100%-used cell under `WarningOnly` whenever the window's
+    /// reset drew within `exhaustion_lead_secs` (e.g. Standard sensitivity:
+    /// 45 minutes) — reproduced live with Claude Code at 100% used, ~35
+    /// minutes to reset.
     #[test]
-    fn short_window_hundred_percent_used_lead_boundary() {
+    fn short_window_hundred_percent_used_is_always_overpacing_regardless_of_remaining() {
         let sensitivity = ShortWindowAlertSensitivity::Standard;
         let t = sensitivity.thresholds();
         let elapsed = t.grace_secs + 1;
 
+        // Comfortably more than exhaustion_lead_secs remaining: already
+        // covered by the old boundary, still holds.
         assert!(short_window_is_overpacing(
             elapsed,
             t.exhaustion_lead_secs,
             100.0,
             sensitivity
         ));
-        assert!(!short_window_is_overpacing(
+        // Less than exhaustion_lead_secs remaining (the old, backwards
+        // cutoff — the exact shape of the reported bug): must still be
+        // overpacing.
+        assert!(short_window_is_overpacing(
             elapsed,
             t.exhaustion_lead_secs - 1,
             100.0,
             sensitivity
         ));
+        // Live-reported case: ~35 minutes remaining (well under Standard's
+        // 45-minute exhaustion_lead_secs).
+        assert!(short_window_is_overpacing(
+            elapsed,
+            35 * 60,
+            100.0,
+            sensitivity
+        ));
+        // Right at the reset instant: still overpacing — 100% used doesn't
+        // stop being true just because the window is about to roll over.
+        assert!(short_window_is_overpacing(elapsed, 0, 100.0, sensitivity));
     }
 
     #[test]
