@@ -86,4 +86,8 @@ pub(super) const STRINGS: Strings = Strings {
     popup_layout: "Popup Layout",
     popup_layout_compact: "Compact",
     popup_layout_standard: "Standard",
+    app_theme: "Color Theme",
+    app_theme_recommended_dark: "Recommended (Dark)",
+    app_theme_light: "Light",
+    app_theme_high_visibility: "High Visibility",
 };

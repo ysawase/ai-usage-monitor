@@ -231,6 +231,10 @@ pub struct Strings {
     pub popup_layout: &'static str,
     pub popup_layout_compact: &'static str,
     pub popup_layout_standard: &'static str,
+    pub app_theme: &'static str,
+    pub app_theme_recommended_dark: &'static str,
+    pub app_theme_light: &'static str,
+    pub app_theme_high_visibility: &'static str,
 }
 
 pub fn resolve_language(language_override: Option<LanguageId>) -> LanguageId {

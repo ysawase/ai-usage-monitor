@@ -86,4 +86,8 @@ pub(super) const STRINGS: Strings = Strings {
     popup_layout: "팝업 레이아웃",
     popup_layout_compact: "간결",
     popup_layout_standard: "표준",
+    app_theme: "색상 테마",
+    app_theme_recommended_dark: "추천 (다크)",
+    app_theme_light: "라이트",
+    app_theme_high_visibility: "고가시성",
 };

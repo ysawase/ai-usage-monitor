@@ -86,4 +86,8 @@ pub(super) const STRINGS: Strings = Strings {
     popup_layout: "彈出視窗版面",
     popup_layout_compact: "簡潔",
     popup_layout_standard: "標準",
+    app_theme: "配色主題",
+    app_theme_recommended_dark: "推薦（深色）",
+    app_theme_light: "淺色",
+    app_theme_high_visibility: "高可視性",
 };

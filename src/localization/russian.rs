@@ -86,4 +86,8 @@ pub(super) const STRINGS: Strings = Strings {
     popup_layout: "Макет всплывающего окна",
     popup_layout_compact: "Компактно",
     popup_layout_standard: "Стандартный",
+    app_theme: "Цветовая тема",
+    app_theme_recommended_dark: "Рекомендуемая (тёмная)",
+    app_theme_light: "Светлая",
+    app_theme_high_visibility: "Высокая контрастность",
 };

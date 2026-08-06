@@ -67,6 +67,7 @@ struct AppState {
     short_window_visibility: ShortWindowVisibility,
     short_window_alert_sensitivity: ShortWindowAlertSensitivity,
     popup_layout: PopupLayout,
+    app_theme: AppTheme,
 
     session_state: CellState,
     session_percent: Option<f64>,
@@ -180,6 +181,26 @@ enum PopupLayout {
 impl Default for PopupLayout {
     fn default() -> Self {
         Self::Compact
+    }
+}
+
+/// The popup's own color scheme — independent of `PopupLayout`/`DisplayDensity`
+/// and, deliberately, of the OS light/dark setting (`AppState.is_dark`/
+/// `theme::is_dark_mode`). See `popup_palette` for the actual color values;
+/// this enum is just the user's selection. `HighVisibility` is this app's own
+/// high-contrast palette, not an implementation of Windows' High
+/// Contrast/Contrast Themes feature.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum AppTheme {
+    RecommendedDark,
+    Light,
+    HighVisibility,
+}
+
+impl Default for AppTheme {
+    fn default() -> Self {
+        Self::RecommendedDark
     }
 }
 
@@ -1011,6 +1032,9 @@ const IDM_SHORT_WINDOW_ALERT_SENSITIVITY_STANDARD: u16 = 87;
 const IDM_SHORT_WINDOW_ALERT_SENSITIVITY_RELAXED: u16 = 88;
 const IDM_POPUP_LAYOUT_COMPACT: u16 = 89;
 const IDM_POPUP_LAYOUT_STANDARD: u16 = 90;
+const IDM_APP_THEME_RECOMMENDED_DARK: u16 = 91;
+const IDM_APP_THEME_LIGHT: u16 = 92;
+const IDM_APP_THEME_HIGH_VISIBILITY: u16 = 93;
 
 /// Pure `menu ID -> enum value` lookups, shared by `show_context_menu`
 /// (which sets which item starts checked) and the `WM_COMMAND` handler
@@ -1049,6 +1073,17 @@ fn popup_layout_for_menu_id(id: u16) -> Option<PopupLayout> {
     match id {
         IDM_POPUP_LAYOUT_COMPACT => Some(PopupLayout::Compact),
         IDM_POPUP_LAYOUT_STANDARD => Some(PopupLayout::Standard),
+        _ => None,
+    }
+}
+
+/// Same pure `menu ID -> enum value` mapping pattern as
+/// `popup_layout_for_menu_id`, for `AppTheme`.
+fn app_theme_for_menu_id(id: u16) -> Option<AppTheme> {
+    match id {
+        IDM_APP_THEME_RECOMMENDED_DARK => Some(AppTheme::RecommendedDark),
+        IDM_APP_THEME_LIGHT => Some(AppTheme::Light),
+        IDM_APP_THEME_HIGH_VISIBILITY => Some(AppTheme::HighVisibility),
         _ => None,
     }
 }
@@ -1256,6 +1291,8 @@ struct SettingsFile {
     short_window_alert_sensitivity: ShortWindowAlertSensitivity,
     #[serde(default, deserialize_with = "deserialize_popup_layout")]
     popup_layout: PopupLayout,
+    #[serde(default, deserialize_with = "deserialize_app_theme")]
+    app_theme: AppTheme,
 }
 
 impl Default for SettingsFile {
@@ -1276,6 +1313,7 @@ impl Default for SettingsFile {
             short_window_visibility: ShortWindowVisibility::default(),
             short_window_alert_sensitivity: ShortWindowAlertSensitivity::default(),
             popup_layout: PopupLayout::default(),
+            app_theme: AppTheme::default(),
         }
     }
 }
@@ -1341,6 +1379,17 @@ where
     Ok(serde_json::Value::deserialize(deserializer)
         .ok()
         .and_then(|value| serde_json::from_value::<PopupLayout>(value).ok())
+        .unwrap_or_default())
+}
+
+/// Same lenient fallback as `deserialize_display_basis`, for `AppTheme`.
+fn deserialize_app_theme<'de, D>(deserializer: D) -> Result<AppTheme, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(serde_json::Value::deserialize(deserializer)
+        .ok()
+        .and_then(|value| serde_json::from_value::<AppTheme>(value).ok())
         .unwrap_or_default())
 }
 
@@ -1411,6 +1460,7 @@ fn save_state_settings() {
             short_window_visibility: s.short_window_visibility,
             short_window_alert_sensitivity: s.short_window_alert_sensitivity,
             popup_layout: s.popup_layout,
+            app_theme: s.app_theme,
         });
     }
 }
@@ -2418,23 +2468,28 @@ fn weekly_pace_extra_lines(state: &AppState) -> i32 {
 ///   where `status_text` fails safe to "not available" text) — keeps the
 ///   existing status `text`: a suppressed *pace* line must never suppress
 ///   the provider's actual poll status.
+/// The 4th element (`is_warning`) mirrors `PaceGuidanceLines::is_warning`
+/// when `pace` supplies the shown text, `false` otherwise — it's the signal
+/// `draw_row` uses to color that cell's *value text* with the palette's
+/// warning color (see `PopupPalette::warning`), never the bar segments
+/// themselves (those always keep the provider's own accent color).
 fn session_cell_decision<'a>(
     state: CellState,
     percent: Option<f64>,
     text: &'a str,
     pace: Option<&'a PaceGuidanceLines>,
     visibility: ShortWindowVisibility,
-) -> (bool, Option<f64>, &'a str) {
+) -> (bool, Option<f64>, &'a str, bool) {
     if visibility == ShortWindowVisibility::Hidden {
-        return (false, None, "");
+        return (false, None, "", false);
     }
     if let Some(lines) = pace {
-        return (true, percent, lines.primary.as_str());
+        return (true, percent, lines.primary.as_str(), lines.is_warning);
     }
     if state == CellState::Ok && percent.is_some() {
-        return (false, None, "");
+        return (false, None, "", false);
     }
-    (true, percent, text)
+    (true, percent, text, false)
 }
 
 /// Whether the 5h bar row has anything to draw at all this poll: at least
@@ -2460,21 +2515,21 @@ fn session_row_visible(
 
 fn needs_session_row(state: &AppState) -> bool {
     let visibility = state.short_window_visibility;
-    let (claude_shows, _, _) = session_cell_decision(
+    let (claude_shows, _, _, _) = session_cell_decision(
         state.session_state,
         state.session_percent,
         &state.session_text,
         state.session_pace.as_ref(),
         visibility,
     );
-    let (codex_shows, _, _) = session_cell_decision(
+    let (codex_shows, _, _, _) = session_cell_decision(
         state.codex_session_state,
         state.codex_session_percent,
         &state.codex_session_text,
         state.codex_session_pace.as_ref(),
         visibility,
     );
-    let (antigravity_shows, _, _) = session_cell_decision(
+    let (antigravity_shows, _, _, _) = session_cell_decision(
         state.antigravity_session_state,
         state.antigravity_session_percent,
         &state.antigravity_session_text,
@@ -2680,20 +2735,111 @@ fn total_widget_width() -> i32 {
     total_widget_width_for(active_models)
 }
 
+/// Solid identification color for each provider's usage bar — a brand-image
+/// color, not an assertion of the exact official brand color. Always the
+/// same regardless of `AppTheme`/warning state; see `PopupPalette` for the
+/// theme-driven background/text/track/border colors these bars sit on top
+/// of.
 fn claude_accent_color() -> Color {
     Color::from_hex("#D97757")
 }
 
-fn codex_accent_color(is_dark: bool) -> Color {
-    if is_dark {
-        Color::from_hex("#F5F5F5")
-    } else {
-        Color::from_hex("#1F1F1F")
-    }
+fn codex_accent_color() -> Color {
+    Color::from_hex("#7477E8")
 }
 
 fn antigravity_accent_color() -> Color {
     Color::from_hex("#4285F4")
+}
+
+/// The popup's canonical color source (AUM-WINDOW-UI-01B). Both draw paths —
+/// `render_layered`'s embedded/layered path and `paint`'s non-embedded
+/// `WM_PAINT` fallback — build their colors by calling this function with
+/// the user's chosen `AppTheme`, instead of each computing its own
+/// light/dark color set. Provider accent colors (`claude_accent_color` and
+/// friends) are intentionally not part of this palette: they identify a
+/// provider, not the theme, and stay constant across all three themes.
+struct PopupPalette {
+    background: Color,
+    /// Bar track / panel fill.
+    track: Color,
+    primary_text: Color,
+    /// Used for the weekly pace guidance's secondary/detail lines (see
+    /// `draw_weekly_pace_extra_lines`), which are already visually
+    /// subordinate to the primary row text.
+    secondary_text: Color,
+    /// Divider/separator color (see `paint_content`'s left divider).
+    border: Color,
+    /// Value-text color for a session-row cell whose pace guidance flags a
+    /// warning (currently only the 5h window's overpacing case — see
+    /// `PaceGuidanceLines::is_warning`). Never applied to bar segments
+    /// themselves, which always keep the provider's own accent color.
+    warning: Color,
+    /// Provider-name header row and the Standard-only basis label row (see
+    /// `draw_provider_header_row`/`draw_basis_label_row`). Equal to
+    /// `primary_text` for RecommendedDark/Light (no visible change there);
+    /// HighVisibility gives it its own color to separate section headings
+    /// from ordinary body text.
+    heading_text: Color,
+}
+
+fn popup_palette(theme: AppTheme) -> PopupPalette {
+    match theme {
+        AppTheme::RecommendedDark => PopupPalette {
+            background: Color::from_hex("#11171D"),
+            track: Color::from_hex("#18222B"),
+            primary_text: Color::from_hex("#F4F8FB"),
+            secondary_text: Color::from_hex("#AAB8C3"),
+            border: Color::from_hex("#31424F"),
+            warning: Color::from_hex("#F2B84B"),
+            heading_text: Color::from_hex("#F4F8FB"),
+        },
+        AppTheme::Light => PopupPalette {
+            background: Color::from_hex("#F4F7FA"),
+            // A near-white-but-not-quite gray, not pure white, so the track
+            // stays visible against the light background instead of
+            // vanishing into it.
+            track: Color::from_hex("#E3E9EF"),
+            primary_text: Color::from_hex("#17212B"),
+            secondary_text: Color::from_hex("#5D6C78"),
+            border: Color::from_hex("#BDCCD7"),
+            warning: Color::from_hex("#B15C00"),
+            heading_text: Color::from_hex("#17212B"),
+        },
+        AppTheme::HighVisibility => PopupPalette {
+            background: Color::from_hex("#000000"),
+            track: Color::from_hex("#484848"),
+            primary_text: Color::from_hex("#FFFFFF"),
+            secondary_text: Color::from_hex("#00E5FF"),
+            border: Color::from_hex("#FFFFFF"),
+            warning: Color::from_hex("#FF4D4D"),
+            heading_text: Color::from_hex("#FFFF00"),
+        },
+    }
+}
+
+/// Whether `theme` shows a 1px vertical divider between adjacent provider
+/// columns (Claude Code/Codex, Codex/Antigravity). Only HighVisibility —
+/// RecommendedDark/Light rely on the provider accent colors and spacing
+/// alone to separate columns.
+fn theme_shows_column_dividers(theme: AppTheme) -> bool {
+    matches!(theme, AppTheme::HighVisibility)
+}
+
+/// Whether `theme` draws a 1px outline around each usage bar segment's
+/// unfilled (track-colored) area. Only HighVisibility — never drawn over a
+/// segment's provider-accent fill, see `draw_usage_bar`.
+fn theme_outlines_usage_track(theme: AppTheme) -> bool {
+    matches!(theme, AppTheme::HighVisibility)
+}
+
+/// Whether `theme` should use the "dark" variant of the per-provider value-
+/// text tint (`claude_usage_text_color` and friends) when more than one
+/// model is shown. Independent of `PopupPalette` — this only selects between
+/// each function's two hardcoded tint variants, keyed off overall theme
+/// darkness rather than a fourth copy of the theme's own colors.
+fn theme_is_dark_variant(theme: AppTheme) -> bool {
+    !matches!(theme, AppTheme::Light)
 }
 
 fn claude_usage_text_color(is_dark: bool) -> Color {
@@ -2854,6 +3000,7 @@ pub fn run() {
                 short_window_visibility: settings.short_window_visibility,
                 short_window_alert_sensitivity: settings.short_window_alert_sensitivity,
                 popup_layout: settings.popup_layout,
+                app_theme: settings.app_theme,
                 session_state: CellState::Loading,
                 session_percent: None,
                 session_text: String::new(),
@@ -2985,7 +3132,7 @@ fn render_layered() {
     refresh_dpi();
     let (
         hwnd_val,
-        is_dark,
+        app_theme,
         embedded,
         strings,
         display_basis,
@@ -3021,7 +3168,7 @@ fn render_layered() {
         match state.as_ref() {
             Some(s) => (
                 s.hwnd,
-                s.is_dark,
+                s.app_theme,
                 s.embedded,
                 s.language.strings(),
                 s.display_basis,
@@ -3069,24 +3216,13 @@ fn render_layered() {
 
     let width = total_widget_width();
 
+    let palette = popup_palette(app_theme);
+    let provider_tint_dark = theme_is_dark_variant(app_theme);
+    let show_column_dividers = theme_shows_column_dividers(app_theme);
+    let outline_usage_track = theme_outlines_usage_track(app_theme);
     let accent = claude_accent_color();
-    let codex_accent = codex_accent_color(is_dark);
+    let codex_accent = codex_accent_color();
     let antigravity_accent = antigravity_accent_color();
-    let track = if is_dark {
-        Color::from_hex("#444444")
-    } else {
-        Color::from_hex("#AAAAAA")
-    };
-    let text_color = if is_dark {
-        Color::from_hex("#888888")
-    } else {
-        Color::from_hex("#404040")
-    };
-    let bg_color = if is_dark {
-        Color::from_hex("#1C1C1C")
-    } else {
-        Color::from_hex("#F3F3F3")
-    };
 
     unsafe {
         let screen_dc = GetDC(hwnd);
@@ -3125,11 +3261,15 @@ fn render_layered() {
             mem_dc,
             width,
             height,
-            is_dark,
-            &bg_color,
-            &text_color,
+            provider_tint_dark,
+            &palette.background,
+            &palette.primary_text,
+            &palette.secondary_text,
             &accent,
-            &track,
+            &palette.track,
+            &palette.border,
+            &palette.warning,
+            &palette.heading_text,
             strings,
             display_basis,
             short_window_visibility,
@@ -3160,11 +3300,13 @@ fn render_layered() {
             &codex_accent,
             &antigravity_accent,
             popup_layout,
+            show_column_dividers,
+            outline_usage_track,
         );
 
         // Background pixels → alpha 1 (nearly invisible but still hittable for right-click).
         // Content pixels → fully opaque (preserves ClearType sub-pixel rendering).
-        let bg_bgr = bg_color.to_colorref();
+        let bg_bgr = palette.background.to_colorref();
         let pixel_data = std::slice::from_raw_parts_mut(bits as *mut u32, pixel_count);
         for px in pixel_data.iter_mut() {
             let rgb = *px & 0x00FFFFFF;
@@ -3213,11 +3355,15 @@ fn paint_content(
     hdc: HDC,
     width: i32,
     height: i32,
-    is_dark: bool,
+    provider_tint_dark: bool,
     bg: &Color,
     text_color: &Color,
+    secondary_text: &Color,
     accent: &Color,
     track: &Color,
+    border: &Color,
+    warning: &Color,
+    heading_text: &Color,
     strings: Strings,
     display_basis: DisplayBasis,
     short_window_visibility: ShortWindowVisibility,
@@ -3248,6 +3394,8 @@ fn paint_content(
     codex_accent: &Color,
     antigravity_accent: &Color,
     popup_layout: PopupLayout,
+    show_column_dividers: bool,
+    outline_usage_track: bool,
 ) {
     unsafe {
         let client_rect = RECT {
@@ -3261,44 +3409,45 @@ fn paint_content(
         FillRect(hdc, &client_rect, bg_brush);
         let _ = DeleteObject(bg_brush);
 
-        // Left divider
+        // Left divider — a single solid color from the palette's `border`
+        // (previously two hand-picked is_dark/light RGB tuples forming a
+        // bevel; now sourced from the same theme-driven color for both
+        // halves, consistent with the "single canonical border color"
+        // consolidation).
         let divider_h = sc(25);
         let divider_top = (height - divider_h) / 2;
         let divider_bottom = divider_top + divider_h;
 
-        let (div_left, div_right) = if is_dark {
-            ((80, 80, 80), (40, 40, 40))
-        } else {
-            ((160, 160, 160), (230, 230, 230))
-        };
-
-        let left_brush = CreateSolidBrush(COLORREF(native_interop::colorref(
-            div_left.0, div_left.1, div_left.2,
-        )));
+        let divider_brush = CreateSolidBrush(COLORREF(border.to_colorref()));
         let left_rect = RECT {
             left: 0,
             top: divider_top,
             right: sc(2),
             bottom: divider_bottom,
         };
-        FillRect(hdc, &left_rect, left_brush);
-        let _ = DeleteObject(left_brush);
+        FillRect(hdc, &left_rect, divider_brush);
 
-        let right_brush = CreateSolidBrush(COLORREF(native_interop::colorref(
-            div_right.0,
-            div_right.1,
-            div_right.2,
-        )));
         let right_rect = RECT {
             left: sc(2),
             top: divider_top,
             right: sc(3),
             bottom: divider_bottom,
         };
-        FillRect(hdc, &right_rect, right_brush);
-        let _ = DeleteObject(right_brush);
+        FillRect(hdc, &right_rect, divider_brush);
+        let _ = DeleteObject(divider_brush);
 
         let content_x = sc(LEFT_DIVIDER_W) + sc(DIVIDER_RIGHT_MARGIN);
+
+        // AUM-WINDOW-UI-01B: HighVisibility-only outline traced around each
+        // usage bar segment's unfilled (track-colored) area — see
+        // `draw_usage_bar`, which never draws it over the provider-accent
+        // fill. `None` for every other theme, so `draw_row`/`draw_usage_bar`
+        // skip the outline entirely.
+        let track_outline: Option<&Color> = if outline_usage_track {
+            Some(border)
+        } else {
+            None
+        };
 
         // AUM-PACE-GUIDANCE-01: same predicates as the `&AppState`-based
         // `weekly_pace_extra_lines`/`needs_session_row` (used for popup
@@ -3377,7 +3526,7 @@ fn paint_content(
                 content_x,
                 basis_label_y,
                 width - sc(RIGHT_MARGIN),
-                text_color,
+                heading_text,
                 basis_label,
             );
         }
@@ -3385,7 +3534,7 @@ fn paint_content(
             hdc,
             content_x,
             layout.provider_header_y,
-            text_color,
+            heading_text,
             strings,
             show_claude_code,
             show_codex,
@@ -3412,7 +3561,7 @@ fn paint_content(
             hdc,
             content_x,
             layout.weekly_row_y,
-            is_dark,
+            provider_tint_dark,
             text_color,
             strings.weekly_window,
             weekly_pct,
@@ -3428,6 +3577,14 @@ fn paint_content(
             codex_accent,
             antigravity_accent,
             track,
+            warning,
+            // The weekly row never carries a warning flag of its own — see
+            // `weekly_pace_guidance_lines`, which always sets
+            // `PaceGuidanceLines::is_warning` to `false`.
+            false,
+            false,
+            false,
+            track_outline,
         );
 
         // AUM-PACE-GUIDANCE-01: weekly secondary/detail lines, one column
@@ -3456,7 +3613,7 @@ fn paint_content(
                     secondary_y,
                     pace_column_width,
                     weekly_pace,
-                    text_color,
+                    secondary_text,
                 );
             }
             if show_codex {
@@ -3466,7 +3623,7 @@ fn paint_content(
                     secondary_y,
                     pace_column_width,
                     codex_weekly_pace,
-                    text_color,
+                    secondary_text,
                 );
             }
             if show_antigravity {
@@ -3476,7 +3633,7 @@ fn paint_content(
                     secondary_y,
                     pace_column_width,
                     antigravity_weekly_pace,
-                    text_color,
+                    secondary_text,
                 );
             }
         }
@@ -3495,7 +3652,7 @@ fn paint_content(
                 hdc,
                 content_x,
                 session_row_y,
-                is_dark,
+                provider_tint_dark,
                 text_color,
                 strings.session_window,
                 claude_session_decision.1,
@@ -3511,7 +3668,107 @@ fn paint_content(
                 codex_accent,
                 antigravity_accent,
                 track,
+                warning,
+                claude_session_decision.3,
+                codex_session_decision.3,
+                antigravity_session_decision.3,
+                track_outline,
             );
+        }
+
+        // AUM-WINDOW-UI-01B: outer 1px frame in the palette's border color,
+        // drawn last (on top of the rows/divider) and inset within the
+        // existing client rect so it never expands the popup's bounds.
+        // Shared by both draw paths since both call this function.
+        let outline_w = sc(1).max(1);
+        let outline_brush = CreateSolidBrush(COLORREF(border.to_colorref()));
+        FillRect(
+            hdc,
+            &RECT {
+                left: 0,
+                top: 0,
+                right: width,
+                bottom: outline_w,
+            },
+            outline_brush,
+        );
+        FillRect(
+            hdc,
+            &RECT {
+                left: 0,
+                top: height - outline_w,
+                right: width,
+                bottom: height,
+            },
+            outline_brush,
+        );
+        FillRect(
+            hdc,
+            &RECT {
+                left: 0,
+                top: 0,
+                right: outline_w,
+                bottom: height,
+            },
+            outline_brush,
+        );
+        FillRect(
+            hdc,
+            &RECT {
+                left: width - outline_w,
+                top: 0,
+                right: width,
+                bottom: height,
+            },
+            outline_brush,
+        );
+        let _ = DeleteObject(outline_brush);
+
+        // AUM-WINDOW-UI-01B: HighVisibility-only 1px column dividers between
+        // adjacent shown provider columns, in the same border color as the
+        // outer frame above. Positioned inside the existing
+        // `MODEL_RIGHT_MARGIN` gap `draw_row`/`provider_column_x_positions`
+        // already leave between columns, so it never overlaps a column's
+        // text or bar.
+        if show_column_dividers {
+            let (claude_col_x, codex_col_x, _antigravity_col_x) = provider_column_x_positions(
+                content_x,
+                show_claude_code,
+                show_codex,
+                show_antigravity,
+            );
+            let divider_column_width = model_usage_width(row_bar_segment_count(
+                active_model_count(show_claude_code, show_codex, show_antigravity),
+            ));
+            let column_divider_w = sc(1).max(1);
+            let column_divider_brush = CreateSolidBrush(COLORREF(border.to_colorref()));
+            if show_claude_code && show_codex {
+                let boundary_x = claude_col_x + divider_column_width + sc(MODEL_RIGHT_MARGIN) / 2;
+                FillRect(
+                    hdc,
+                    &RECT {
+                        left: boundary_x,
+                        top: 0,
+                        right: boundary_x + column_divider_w,
+                        bottom: height,
+                    },
+                    column_divider_brush,
+                );
+            }
+            if show_codex && show_antigravity {
+                let boundary_x = codex_col_x + divider_column_width + sc(MODEL_RIGHT_MARGIN) / 2;
+                FillRect(
+                    hdc,
+                    &RECT {
+                        left: boundary_x,
+                        top: 0,
+                        right: boundary_x + column_divider_w,
+                        bottom: height,
+                    },
+                    column_divider_brush,
+                );
+            }
+            let _ = DeleteObject(column_divider_brush);
         }
 
         SelectObject(hdc, old_font);
@@ -4466,6 +4723,21 @@ unsafe extern "system" fn wnd_proc(
                     position_at_taskbar();
                     render_layered();
                 }
+                IDM_APP_THEME_RECOMMENDED_DARK
+                | IDM_APP_THEME_LIGHT
+                | IDM_APP_THEME_HIGH_VISIBILITY => {
+                    // Only the popup's colors change here — no row/height
+                    // change like `PopupLayout` above, so no
+                    // `position_at_taskbar()` call.
+                    if let Some(new_theme) = app_theme_for_menu_id(id) {
+                        let mut state = lock_state();
+                        if let Some(s) = state.as_mut() {
+                            s.app_theme = new_theme;
+                        }
+                    }
+                    save_state_settings();
+                    render_layered();
+                }
                 IDM_SHORT_WINDOW_VISIBILITY_ALWAYS
                 | IDM_SHORT_WINDOW_VISIBILITY_WARNING_ONLY
                 | IDM_SHORT_WINDOW_VISIBILITY_HIDDEN => {
@@ -4663,6 +4935,7 @@ fn show_context_menu(hwnd: HWND) {
             short_window_visibility,
             short_window_alert_sensitivity,
             popup_layout,
+            app_theme,
         ) = {
             let state = lock_state();
             match state.as_ref() {
@@ -4683,6 +4956,7 @@ fn show_context_menu(hwnd: HWND) {
                     s.short_window_visibility,
                     s.short_window_alert_sensitivity,
                     s.popup_layout,
+                    s.app_theme,
                 ),
                 None => (
                     POLL_15_MIN,
@@ -4701,6 +4975,7 @@ fn show_context_menu(hwnd: HWND) {
                     ShortWindowVisibility::default(),
                     ShortWindowAlertSensitivity::default(),
                     PopupLayout::default(),
+                    AppTheme::default(),
                 ),
             }
         };
@@ -5006,6 +5281,49 @@ fn show_context_menu(hwnd: HWND) {
             PCWSTR::from_raw(popup_layout_label.as_ptr()),
         );
 
+        // App theme submenu: mutually exclusive, radio-style, same pattern
+        // as the popup-layout submenu above. Only affects popup colors
+        // (`PopupPalette`/`popup_palette`) — never row count or height.
+        let app_theme_menu = CreatePopupMenu().unwrap();
+        let app_theme_items: [(u16, AppTheme, &str); 3] = [
+            (
+                IDM_APP_THEME_RECOMMENDED_DARK,
+                AppTheme::RecommendedDark,
+                strings.app_theme_recommended_dark,
+            ),
+            (
+                IDM_APP_THEME_LIGHT,
+                AppTheme::Light,
+                strings.app_theme_light,
+            ),
+            (
+                IDM_APP_THEME_HIGH_VISIBILITY,
+                AppTheme::HighVisibility,
+                strings.app_theme_high_visibility,
+            ),
+        ];
+        for (id, value, label) in app_theme_items {
+            let label_str = native_interop::wide_str(label);
+            let flags = if value == app_theme {
+                MF_CHECKED
+            } else {
+                MENU_ITEM_FLAGS(0)
+            };
+            let _ = AppendMenuW(
+                app_theme_menu,
+                flags,
+                id as usize,
+                PCWSTR::from_raw(label_str.as_ptr()),
+            );
+        }
+        let app_theme_label = native_interop::wide_str(strings.app_theme);
+        let _ = AppendMenuW(
+            settings_menu,
+            MF_POPUP,
+            app_theme_menu.0 as usize,
+            PCWSTR::from_raw(app_theme_label.as_ptr()),
+        );
+
         // Short-window (5h) visibility submenu.
         let short_window_visibility_menu = CreatePopupMenu().unwrap();
         let short_window_visibility_items: [(u16, ShortWindowVisibility, &str); 3] = [
@@ -5155,7 +5473,7 @@ fn show_context_menu(hwnd: HWND) {
 /// Paint for non-embedded fallback (normal WM_PAINT path)
 fn paint(hdc: HDC, hwnd: HWND) {
     let (
-        is_dark,
+        app_theme,
         strings,
         display_basis,
         short_window_visibility,
@@ -5188,7 +5506,7 @@ fn paint(hdc: HDC, hwnd: HWND) {
         let state = lock_state();
         match state.as_ref() {
             Some(s) => (
-                s.is_dark,
+                s.app_theme,
                 s.language.strings(),
                 s.display_basis,
                 s.short_window_visibility,
@@ -5222,24 +5540,13 @@ fn paint(hdc: HDC, hwnd: HWND) {
         }
     };
 
+    let palette = popup_palette(app_theme);
+    let provider_tint_dark = theme_is_dark_variant(app_theme);
+    let show_column_dividers = theme_shows_column_dividers(app_theme);
+    let outline_usage_track = theme_outlines_usage_track(app_theme);
     let accent = claude_accent_color();
-    let codex_accent = codex_accent_color(is_dark);
+    let codex_accent = codex_accent_color();
     let antigravity_accent = antigravity_accent_color();
-    let track = if is_dark {
-        Color::from_hex("#444444")
-    } else {
-        Color::from_hex("#AAAAAA")
-    };
-    let text_color = if is_dark {
-        Color::from_hex("#888888")
-    } else {
-        Color::from_hex("#404040")
-    };
-    let bg_color = if is_dark {
-        Color::from_hex("#1C1C1C")
-    } else {
-        Color::from_hex("#F3F3F3")
-    };
 
     unsafe {
         let mut client_rect = RECT::default();
@@ -5259,11 +5566,15 @@ fn paint(hdc: HDC, hwnd: HWND) {
             mem_dc,
             width,
             height,
-            is_dark,
-            &bg_color,
-            &text_color,
+            provider_tint_dark,
+            &palette.background,
+            &palette.primary_text,
+            &palette.secondary_text,
             &accent,
-            &track,
+            &palette.track,
+            &palette.border,
+            &palette.warning,
+            &palette.heading_text,
             strings,
             display_basis,
             short_window_visibility,
@@ -5294,6 +5605,8 @@ fn paint(hdc: HDC, hwnd: HWND) {
             &codex_accent,
             &antigravity_accent,
             popup_layout,
+            show_column_dividers,
+            outline_usage_track,
         );
 
         let _ = BitBlt(hdc, 0, 0, width, height, mem_dc, 0, 0, SRCCOPY);
@@ -5481,7 +5794,7 @@ fn draw_row(
     hdc: HDC,
     x: i32,
     y: i32,
-    is_dark: bool,
+    provider_tint_dark: bool,
     text_color: &Color,
     label: &str,
     claude_percent: Option<f64>,
@@ -5497,23 +5810,38 @@ fn draw_row(
     codex_accent: &Color,
     antigravity_accent: &Color,
     track: &Color,
+    warning: &Color,
+    claude_is_warning: bool,
+    codex_is_warning: bool,
+    antigravity_is_warning: bool,
+    track_outline: Option<&Color>,
 ) {
     let seg_h = sc(SEGMENT_H);
     let active_models = active_model_count(show_claude_code, show_codex, show_antigravity);
     let segment_count = row_bar_segment_count(active_models);
     let use_model_text_colors = active_models > 1;
-    let claude_value_color = if use_model_text_colors {
-        claude_usage_text_color(is_dark)
+    // `is_warning` always wins the *value text* color, regardless of
+    // `use_model_text_colors` — but never touches the bar segments below
+    // (`draw_usage_bar`'s `accent` argument, passed separately), which stay
+    // the provider's own identification color even while warning.
+    let claude_value_color = if claude_is_warning {
+        *warning
+    } else if use_model_text_colors {
+        claude_usage_text_color(provider_tint_dark)
     } else {
         *text_color
     };
-    let codex_value_color = if use_model_text_colors {
-        codex_usage_text_color(is_dark)
+    let codex_value_color = if codex_is_warning {
+        *warning
+    } else if use_model_text_colors {
+        codex_usage_text_color(provider_tint_dark)
     } else {
         *text_color
     };
-    let antigravity_value_color = if use_model_text_colors {
-        antigravity_usage_text_color(is_dark)
+    let antigravity_value_color = if antigravity_is_warning {
+        *warning
+    } else if use_model_text_colors {
+        antigravity_usage_text_color(provider_tint_dark)
     } else {
         *text_color
     };
@@ -5546,6 +5874,7 @@ fn draw_row(
                 claude_accent,
                 track,
                 &claude_value_color,
+                track_outline,
             );
             model_x += model_usage_width(segment_count) + sc(MODEL_RIGHT_MARGIN);
         }
@@ -5560,6 +5889,7 @@ fn draw_row(
                 codex_accent,
                 track,
                 &codex_value_color,
+                track_outline,
             );
             model_x += model_usage_width(segment_count) + sc(MODEL_RIGHT_MARGIN);
         }
@@ -5574,6 +5904,7 @@ fn draw_row(
                 antigravity_accent,
                 track,
                 &antigravity_value_color,
+                track_outline,
             );
         }
     }
@@ -5619,6 +5950,7 @@ fn draw_usage_bar(
     accent: &Color,
     track: &Color,
     text_color: &Color,
+    track_outline: Option<&Color>,
 ) {
     if !usage_bar_has_content(percent, text) {
         return;
@@ -5646,9 +5978,29 @@ fn draw_usage_bar(
                 };
 
                 if percent_clamped >= seg_end {
+                    // Fully provider-filled: never draw a track outline here
+                    // (see `track_outline`'s doc) — the whole segment is
+                    // provider-accent color.
                     draw_rounded_rect(hdc, &seg_rect, accent, corner_r);
                 } else if percent_clamped <= seg_start {
                     draw_rounded_rect(hdc, &seg_rect, track, corner_r);
+                    if let Some(outline_color) = track_outline {
+                        // Fully track-colored segment: the outline is safe
+                        // over its whole area, nothing here is provider fill.
+                        let outline_rgn = CreateRoundRectRgn(
+                            seg_rect.left,
+                            seg_rect.top,
+                            seg_rect.right + 1,
+                            seg_rect.bottom + 1,
+                            corner_r * 2,
+                            corner_r * 2,
+                        );
+                        let outline_brush = CreateSolidBrush(COLORREF(outline_color.to_colorref()));
+                        let outline_w = sc(1).max(1);
+                        let _ = FrameRgn(hdc, outline_rgn, outline_brush, outline_w, outline_w);
+                        let _ = DeleteObject(outline_brush);
+                        let _ = DeleteObject(outline_rgn);
+                    }
                 } else {
                     draw_rounded_rect(hdc, &seg_rect, track, corner_r);
                     let fraction = (percent_clamped - seg_start) / segment_percent;
@@ -5674,6 +6026,34 @@ fn draw_usage_bar(
                         let _ = DeleteObject(brush);
                         let _ = SelectClipRgn(hdc, HRGN::default());
                         let _ = DeleteObject(rgn);
+                    }
+                    if let Some(outline_color) = track_outline {
+                        // Partial segment: clip to the still-track-colored
+                        // remainder (right of `fill_width`) before drawing,
+                        // so the outline never touches the provider-accent
+                        // pixels drawn just above.
+                        let track_clip = CreateRectRgn(
+                            seg_x + fill_width,
+                            seg_rect.top,
+                            seg_rect.right,
+                            seg_rect.bottom,
+                        );
+                        let _ = SelectClipRgn(hdc, track_clip);
+                        let outline_rgn = CreateRoundRectRgn(
+                            seg_rect.left,
+                            seg_rect.top,
+                            seg_rect.right + 1,
+                            seg_rect.bottom + 1,
+                            corner_r * 2,
+                            corner_r * 2,
+                        );
+                        let outline_brush = CreateSolidBrush(COLORREF(outline_color.to_colorref()));
+                        let outline_w = sc(1).max(1);
+                        let _ = FrameRgn(hdc, outline_rgn, outline_brush, outline_w, outline_w);
+                        let _ = DeleteObject(outline_brush);
+                        let _ = DeleteObject(outline_rgn);
+                        let _ = SelectClipRgn(hdc, HRGN::default());
+                        let _ = DeleteObject(track_clip);
                     }
                 }
             }
@@ -6274,6 +6654,404 @@ mod tests {
         }
     }
 
+    // ── AUM-WINDOW-UI-01B: AppTheme / PopupPalette / provider colors /
+    // warning (type/default/persistence/menu/palette) ──────────────────────
+
+    #[test]
+    fn app_theme_default_is_recommended_dark() {
+        assert_eq!(AppTheme::default(), AppTheme::RecommendedDark);
+    }
+
+    #[test]
+    fn app_theme_serializes_to_expected_snake_case() {
+        assert_eq!(
+            serde_json::to_value(AppTheme::RecommendedDark).unwrap(),
+            serde_json::json!("recommended_dark")
+        );
+        assert_eq!(
+            serde_json::to_value(AppTheme::Light).unwrap(),
+            serde_json::json!("light")
+        );
+        assert_eq!(
+            serde_json::to_value(AppTheme::HighVisibility).unwrap(),
+            serde_json::json!("high_visibility")
+        );
+    }
+
+    #[test]
+    fn legacy_settings_without_app_theme_key_deserialize_to_recommended_dark() {
+        let settings: SettingsFile = serde_json::from_str("{}")
+            .expect("legacy settings without app_theme should still deserialize");
+        assert_eq!(settings.app_theme, AppTheme::RecommendedDark);
+    }
+
+    #[test]
+    fn settings_with_unrecognized_app_theme_falls_back_to_recommended_dark_without_failing_the_whole_file(
+    ) {
+        let settings: SettingsFile =
+            serde_json::from_str(r#"{"app_theme":"ultra_neon","tray_offset":9}"#)
+                .expect("an unrecognized app_theme must not fail the whole settings file");
+        assert_eq!(settings.app_theme, AppTheme::RecommendedDark);
+        assert_eq!(settings.tray_offset, 9);
+    }
+
+    #[test]
+    fn app_theme_round_trips_through_serialization_alongside_other_settings() {
+        let settings = SettingsFile {
+            app_theme: AppTheme::HighVisibility,
+            tray_offset: 42,
+            popup_layout: PopupLayout::Standard,
+            ..SettingsFile::default()
+        };
+        let json = serde_json::to_string(&settings).expect("settings should serialize");
+        let round_tripped: SettingsFile =
+            serde_json::from_str(&json).expect("round trip should deserialize");
+        assert_eq!(round_tripped.app_theme, AppTheme::HighVisibility);
+        assert_eq!(round_tripped.tray_offset, 42);
+        assert_eq!(round_tripped.popup_layout, PopupLayout::Standard);
+    }
+
+    #[test]
+    fn app_theme_for_menu_id_maps_each_known_id_and_is_bijective() {
+        assert_eq!(
+            app_theme_for_menu_id(IDM_APP_THEME_RECOMMENDED_DARK),
+            Some(AppTheme::RecommendedDark)
+        );
+        assert_eq!(
+            app_theme_for_menu_id(IDM_APP_THEME_LIGHT),
+            Some(AppTheme::Light)
+        );
+        assert_eq!(
+            app_theme_for_menu_id(IDM_APP_THEME_HIGH_VISIBILITY),
+            Some(AppTheme::HighVisibility)
+        );
+        assert_eq!(app_theme_for_menu_id(9999), None);
+
+        let ids = [
+            IDM_APP_THEME_RECOMMENDED_DARK,
+            IDM_APP_THEME_LIGHT,
+            IDM_APP_THEME_HIGH_VISIBILITY,
+        ];
+        let mapped: Vec<AppTheme> = ids
+            .iter()
+            .map(|&id| app_theme_for_menu_id(id).unwrap())
+            .collect();
+        assert_ne!(mapped[0], mapped[1]);
+        assert_ne!(mapped[0], mapped[2]);
+        assert_ne!(mapped[1], mapped[2]);
+    }
+
+    #[test]
+    fn all_languages_have_non_empty_app_theme_menu_strings() {
+        for language in LanguageId::ALL {
+            let strings = language.strings();
+            assert!(!strings.app_theme.is_empty());
+            assert!(!strings.app_theme_recommended_dark.is_empty());
+            assert!(!strings.app_theme_light.is_empty());
+            assert!(!strings.app_theme_high_visibility.is_empty());
+        }
+    }
+
+    fn assert_color_hex(color: Color, hex: &str, label: &str) {
+        let expected = Color::from_hex(hex);
+        assert_eq!(
+            (color.r, color.g, color.b),
+            (expected.r, expected.g, expected.b),
+            "{label} expected {hex}"
+        );
+    }
+
+    #[test]
+    fn popup_palette_recommended_dark_matches_spec_hex_values() {
+        let palette = popup_palette(AppTheme::RecommendedDark);
+        assert_color_hex(palette.background, "#11171D", "RecommendedDark background");
+        assert_color_hex(palette.track, "#18222B", "RecommendedDark track");
+        assert_color_hex(
+            palette.primary_text,
+            "#F4F8FB",
+            "RecommendedDark primary_text",
+        );
+        assert_color_hex(
+            palette.secondary_text,
+            "#AAB8C3",
+            "RecommendedDark secondary_text",
+        );
+        assert_color_hex(palette.border, "#31424F", "RecommendedDark border");
+        // heading_text equals primary_text here (unchanged visible behavior)
+        // — only HighVisibility gets its own heading color.
+        assert_color_hex(
+            palette.heading_text,
+            "#F4F8FB",
+            "RecommendedDark heading_text",
+        );
+    }
+
+    #[test]
+    fn popup_palette_light_matches_spec_hex_values() {
+        let palette = popup_palette(AppTheme::Light);
+        assert_color_hex(palette.background, "#F4F7FA", "Light background");
+        assert_color_hex(palette.primary_text, "#17212B", "Light primary_text");
+        assert_color_hex(palette.secondary_text, "#5D6C78", "Light secondary_text");
+        assert_color_hex(palette.border, "#BDCCD7", "Light border");
+        assert_color_hex(palette.heading_text, "#17212B", "Light heading_text");
+        // The spec calls for white-or-a-visible-near-white track that
+        // doesn't vanish into the light background — not pure white.
+        assert_ne!(
+            (palette.track.r, palette.track.g, palette.track.b),
+            (0xFF, 0xFF, 0xFF),
+            "Light track must not be pure white (would vanish into the background)"
+        );
+        assert_ne!(
+            (palette.track.r, palette.track.g, palette.track.b),
+            (
+                palette.background.r,
+                palette.background.g,
+                palette.background.b
+            ),
+            "Light track must be visually distinct from the background"
+        );
+    }
+
+    #[test]
+    fn popup_palette_high_visibility_matches_spec_hex_values() {
+        let palette = popup_palette(AppTheme::HighVisibility);
+        assert_color_hex(palette.background, "#000000", "HighVisibility background");
+        assert_color_hex(palette.track, "#484848", "HighVisibility track");
+        assert_color_hex(
+            palette.primary_text,
+            "#FFFFFF",
+            "HighVisibility primary_text",
+        );
+        assert_color_hex(
+            palette.secondary_text,
+            "#00E5FF",
+            "HighVisibility secondary_text",
+        );
+        assert_color_hex(palette.border, "#FFFFFF", "HighVisibility border");
+        assert_color_hex(palette.warning, "#FF4D4D", "HighVisibility warning");
+        assert_color_hex(
+            palette.heading_text,
+            "#FFFF00",
+            "HighVisibility heading_text",
+        );
+    }
+
+    #[test]
+    fn popup_palette_high_visibility_is_visually_distinct_from_recommended_dark() {
+        // AUM-WINDOW-UI-01B: HighVisibility was previously too close to
+        // RecommendedDark on screen — these four channels must differ so the
+        // two themes are actually distinguishable.
+        let high_visibility = popup_palette(AppTheme::HighVisibility);
+        let recommended_dark = popup_palette(AppTheme::RecommendedDark);
+
+        assert_ne!(
+            (
+                high_visibility.background.r,
+                high_visibility.background.g,
+                high_visibility.background.b
+            ),
+            (
+                recommended_dark.background.r,
+                recommended_dark.background.g,
+                recommended_dark.background.b
+            ),
+            "HighVisibility background must differ from RecommendedDark"
+        );
+        assert_ne!(
+            (
+                high_visibility.track.r,
+                high_visibility.track.g,
+                high_visibility.track.b
+            ),
+            (
+                recommended_dark.track.r,
+                recommended_dark.track.g,
+                recommended_dark.track.b
+            ),
+            "HighVisibility track must differ from RecommendedDark"
+        );
+        assert_ne!(
+            (
+                high_visibility.secondary_text.r,
+                high_visibility.secondary_text.g,
+                high_visibility.secondary_text.b
+            ),
+            (
+                recommended_dark.secondary_text.r,
+                recommended_dark.secondary_text.g,
+                recommended_dark.secondary_text.b
+            ),
+            "HighVisibility secondary_text must differ from RecommendedDark"
+        );
+        assert_ne!(
+            (
+                high_visibility.border.r,
+                high_visibility.border.g,
+                high_visibility.border.b
+            ),
+            (
+                recommended_dark.border.r,
+                recommended_dark.border.g,
+                recommended_dark.border.b
+            ),
+            "HighVisibility border must differ from RecommendedDark"
+        );
+        assert_ne!(
+            (
+                high_visibility.heading_text.r,
+                high_visibility.heading_text.g,
+                high_visibility.heading_text.b
+            ),
+            (
+                recommended_dark.heading_text.r,
+                recommended_dark.heading_text.g,
+                recommended_dark.heading_text.b
+            ),
+            "HighVisibility heading_text must differ from RecommendedDark"
+        );
+        assert_ne!(
+            (
+                high_visibility.warning.r,
+                high_visibility.warning.g,
+                high_visibility.warning.b
+            ),
+            (
+                recommended_dark.warning.r,
+                recommended_dark.warning.g,
+                recommended_dark.warning.b
+            ),
+            "HighVisibility warning must differ from RecommendedDark"
+        );
+    }
+
+    #[test]
+    fn theme_shows_column_dividers_is_true_only_for_high_visibility() {
+        assert!(!theme_shows_column_dividers(AppTheme::RecommendedDark));
+        assert!(!theme_shows_column_dividers(AppTheme::Light));
+        assert!(theme_shows_column_dividers(AppTheme::HighVisibility));
+    }
+
+    #[test]
+    fn theme_outlines_usage_track_is_true_only_for_high_visibility() {
+        assert!(!theme_outlines_usage_track(AppTheme::RecommendedDark));
+        assert!(!theme_outlines_usage_track(AppTheme::Light));
+        assert!(theme_outlines_usage_track(AppTheme::HighVisibility));
+    }
+
+    #[test]
+    fn both_draw_paths_source_colors_from_the_same_popup_palette_call() {
+        // `render_layered` and `paint` each call `popup_palette(app_theme)`
+        // once and thread the same `PopupPalette` value into `paint_content`
+        // — see both functions' bodies. This pins the *value* half of that
+        // guarantee: calling `popup_palette` twice with the same theme (as
+        // the two draw paths each independently do) always yields identical
+        // colors, so which path renders never matters.
+        for theme in [
+            AppTheme::RecommendedDark,
+            AppTheme::Light,
+            AppTheme::HighVisibility,
+        ] {
+            let a = popup_palette(theme);
+            let b = popup_palette(theme);
+            assert_eq!(
+                (a.background.r, a.background.g, a.background.b),
+                (b.background.r, b.background.g, b.background.b)
+            );
+            assert_eq!(
+                (a.track.r, a.track.g, a.track.b),
+                (b.track.r, b.track.g, b.track.b)
+            );
+            assert_eq!(
+                (a.primary_text.r, a.primary_text.g, a.primary_text.b),
+                (b.primary_text.r, b.primary_text.g, b.primary_text.b)
+            );
+            assert_eq!(
+                (a.secondary_text.r, a.secondary_text.g, a.secondary_text.b),
+                (b.secondary_text.r, b.secondary_text.g, b.secondary_text.b)
+            );
+            assert_eq!(
+                (a.border.r, a.border.g, a.border.b),
+                (b.border.r, b.border.g, b.border.b)
+            );
+            assert_eq!(
+                (a.warning.r, a.warning.g, a.warning.b),
+                (b.warning.r, b.warning.g, b.warning.b)
+            );
+            assert_eq!(
+                (a.heading_text.r, a.heading_text.g, a.heading_text.b),
+                (b.heading_text.r, b.heading_text.g, b.heading_text.b)
+            );
+        }
+    }
+
+    #[test]
+    fn claude_accent_color_matches_spec_hex() {
+        assert_color_hex(claude_accent_color(), "#D97757", "Claude accent");
+    }
+
+    #[test]
+    fn codex_accent_color_matches_spec_hex() {
+        assert_color_hex(codex_accent_color(), "#7477E8", "Codex accent");
+    }
+
+    #[test]
+    fn antigravity_accent_color_matches_spec_hex() {
+        assert_color_hex(antigravity_accent_color(), "#4285F4", "Antigravity accent");
+    }
+
+    #[test]
+    fn overpacing_session_cell_still_carries_a_real_percent_so_the_bar_keeps_rendering_in_provider_color(
+    ) {
+        // `draw_row` passes each provider's fixed accent color to
+        // `draw_usage_bar` unconditionally — `claude_is_warning`/
+        // `codex_is_warning`/`antigravity_is_warning` only pick the *value
+        // text* color (`PopupPalette::warning` vs. the normal text color),
+        // never the bar's `accent` argument. So as long as `percent` stays
+        // `Some`, the bar segments keep rendering in the provider's own
+        // color even while `is_warning` is true.
+        let lines = PaceGuidanceLines {
+            primary: "80% overpacing".to_string(),
+            secondary: None,
+            detail: None,
+            is_warning: true,
+        };
+        let (shows, percent, _text, is_warning) = session_cell_decision(
+            CellState::Ok,
+            Some(80.0),
+            "80%",
+            Some(&lines),
+            ShortWindowVisibility::Always,
+        );
+        assert!(shows);
+        assert!(is_warning);
+        assert_eq!(percent, Some(80.0));
+    }
+
+    #[test]
+    fn app_theme_variants_do_not_affect_visible_rows_or_popup_height() {
+        // `visible_rows`/`popup_height_logical` take `PopupLayout` and
+        // weekly-lines/session-row inputs, but no `AppTheme` at all — so a
+        // theme switch cannot change row count or height by construction.
+        // Computing every theme's palette in between exercises that real
+        // decoupling rather than just asserting it in a comment.
+        let rows_before = visible_rows(PopupLayout::Standard, 2, true);
+        let height_before = popup_height_logical(rows_before);
+
+        let _ = popup_palette(AppTheme::RecommendedDark);
+        let _ = popup_palette(AppTheme::Light);
+        let _ = popup_palette(AppTheme::HighVisibility);
+
+        let rows_after = visible_rows(PopupLayout::Standard, 2, true);
+        let height_after = popup_height_logical(rows_after);
+        assert_eq!(height_before, height_after);
+        assert_eq!(rows_before.session_row, rows_after.session_row);
+        assert_eq!(
+            rows_before.weekly_extra_lines,
+            rows_after.weekly_extra_lines
+        );
+        assert_eq!(rows_before.basis_label, rows_after.basis_label);
+    }
+
     #[test]
     fn visible_rows_for_compact_forces_every_optional_row_off() {
         let rows = visible_rows(PopupLayout::Compact, 2, true);
@@ -6490,6 +7268,9 @@ mod tests {
             IDM_SHORT_WINDOW_ALERT_SENSITIVITY_RELAXED,
             IDM_POPUP_LAYOUT_COMPACT,
             IDM_POPUP_LAYOUT_STANDARD,
+            IDM_APP_THEME_RECOMMENDED_DARK,
+            IDM_APP_THEME_LIGHT,
+            IDM_APP_THEME_HIGH_VISIBILITY,
             tray_icon::IDM_TOGGLE_WIDGET,
         ];
         #[cfg(feature = "self-update")]
@@ -7265,7 +8046,7 @@ mod tests {
             detail: None,
             is_warning: true,
         };
-        let (shows, percent, text) = session_cell_decision(
+        let (shows, percent, text, is_warning) = session_cell_decision(
             CellState::Ok,
             Some(42.0),
             "42%",
@@ -7275,12 +8056,16 @@ mod tests {
         assert!(shows);
         assert_eq!(percent, Some(42.0));
         assert_eq!(text, "68% overpacing");
+        // The bar itself never depends on this flag (see `draw_row` — only
+        // the value text does), but the flag must still reach the caller
+        // faithfully.
+        assert!(is_warning);
     }
 
     #[test]
     fn session_cell_decision_always_loading_keeps_existing_text() {
         let strings = LanguageId::English.strings();
-        let (shows, percent, text) = session_cell_decision(
+        let (shows, percent, text, _is_warning) = session_cell_decision(
             CellState::Loading,
             None,
             strings.loading,
@@ -7295,7 +8080,7 @@ mod tests {
     #[test]
     fn session_cell_decision_always_fetch_failed_keeps_existing_text() {
         let strings = LanguageId::English.strings();
-        let (shows, percent, text) = session_cell_decision(
+        let (shows, percent, text, _is_warning) = session_cell_decision(
             CellState::FetchFailed,
             None,
             strings.fetch_failed,
@@ -7310,7 +8095,7 @@ mod tests {
     #[test]
     fn session_cell_decision_always_retrying_keeps_existing_text() {
         let strings = LanguageId::English.strings();
-        let (shows, percent, text) = session_cell_decision(
+        let (shows, percent, text, _is_warning) = session_cell_decision(
             CellState::Retrying,
             None,
             strings.retrying,
@@ -7325,7 +8110,7 @@ mod tests {
     #[test]
     fn session_cell_decision_always_not_configured_keeps_existing_text() {
         let strings = LanguageId::English.strings();
-        let (shows, percent, text) = session_cell_decision(
+        let (shows, percent, text, _is_warning) = session_cell_decision(
             CellState::NotConfigured,
             None,
             strings.not_configured,
@@ -7340,7 +8125,7 @@ mod tests {
     #[test]
     fn session_cell_decision_always_not_available_keeps_existing_text() {
         let strings = LanguageId::English.strings();
-        let (shows, percent, text) = session_cell_decision(
+        let (shows, percent, text, _is_warning) = session_cell_decision(
             CellState::NotAvailable,
             None,
             strings.not_available,
@@ -7354,7 +8139,7 @@ mod tests {
 
     #[test]
     fn session_cell_decision_warning_only_ok_normal_is_blank() {
-        let (shows, percent, text) = session_cell_decision(
+        let (shows, percent, text, _is_warning) = session_cell_decision(
             CellState::Ok,
             Some(24.0),
             "24%",
@@ -7374,7 +8159,7 @@ mod tests {
             detail: None,
             is_warning: true,
         };
-        let (shows, percent, text) = session_cell_decision(
+        let (shows, percent, text, is_warning) = session_cell_decision(
             CellState::Ok,
             Some(68.0),
             "68%",
@@ -7384,6 +8169,7 @@ mod tests {
         assert!(shows);
         assert_eq!(percent, Some(68.0));
         assert_eq!(text, "68% overpacing");
+        assert!(is_warning);
     }
 
     #[test]
@@ -7397,7 +8183,7 @@ mod tests {
             CellState::NotAvailable,
         ] {
             let text = status_text(state, strings);
-            let (shows, percent, out_text) =
+            let (shows, percent, out_text, _is_warning) =
                 session_cell_decision(state, None, text, None, ShortWindowVisibility::WarningOnly);
             assert!(
                 shows,
@@ -7419,7 +8205,7 @@ mod tests {
         // `WarningOnly`, this must still show the fail-safe text rather
         // than going blank.
         let strings = LanguageId::English.strings();
-        let (shows, percent, text) = session_cell_decision(
+        let (shows, percent, text, _is_warning) = session_cell_decision(
             CellState::Ok,
             None,
             strings.not_available,
@@ -7442,7 +8228,7 @@ mod tests {
         };
         // Ok + warning pace data would show under Always/WarningOnly, but
         // not Hidden.
-        let (shows, percent, text) = session_cell_decision(
+        let (shows, percent, text, _is_warning) = session_cell_decision(
             CellState::Ok,
             Some(68.0),
             "68%",
@@ -7461,7 +8247,7 @@ mod tests {
             CellState::NotAvailable,
         ] {
             let existing = status_text(state, strings);
-            let (shows, percent, text) =
+            let (shows, percent, text, _is_warning) =
                 session_cell_decision(state, None, existing, None, ShortWindowVisibility::Hidden);
             assert!(!shows, "state {state:?} must stay hidden under Hidden");
             assert_eq!(percent, None);
@@ -7516,7 +8302,7 @@ mod tests {
         );
         assert_eq!(failed_pace, None);
 
-        let (shows, percent, text) = session_cell_decision(
+        let (shows, percent, text, _is_warning) = session_cell_decision(
             CellState::FetchFailed,
             None,
             &failed_text,
@@ -7546,14 +8332,14 @@ mod tests {
 
     #[test]
     fn session_row_visible_false_for_warning_only_with_no_warnings_or_errors_anywhere() {
-        let (claude_shows, _, _) = session_cell_decision(
+        let (claude_shows, _, _, _) = session_cell_decision(
             CellState::Ok,
             Some(24.0),
             "24%",
             None,
             ShortWindowVisibility::WarningOnly,
         );
-        let (codex_shows, _, _) = session_cell_decision(
+        let (codex_shows, _, _, _) = session_cell_decision(
             CellState::Ok,
             Some(10.0),
             "10%",
@@ -7572,7 +8358,7 @@ mod tests {
 
     #[test]
     fn session_row_visible_true_for_warning_only_when_one_provider_is_in_error() {
-        let (claude_shows, _, _) = session_cell_decision(
+        let (claude_shows, _, _, _) = session_cell_decision(
             CellState::Ok,
             Some(24.0),
             "24%",
@@ -7580,7 +8366,7 @@ mod tests {
             ShortWindowVisibility::WarningOnly,
         );
         let strings = LanguageId::English.strings();
-        let (codex_shows, _, _) = session_cell_decision(
+        let (codex_shows, _, _, _) = session_cell_decision(
             CellState::FetchFailed,
             None,
             strings.fetch_failed,
@@ -7606,14 +8392,14 @@ mod tests {
             detail: None,
             is_warning: true,
         };
-        let (claude_shows, _, _) = session_cell_decision(
+        let (claude_shows, _, _, _) = session_cell_decision(
             CellState::Ok,
             Some(90.0),
             "90%",
             Some(&lines),
             ShortWindowVisibility::Hidden,
         );
-        let (codex_shows, _, _) = session_cell_decision(
+        let (codex_shows, _, _, _) = session_cell_decision(
             CellState::FetchFailed,
             None,
             strings.fetch_failed,
