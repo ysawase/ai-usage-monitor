@@ -2576,6 +2576,49 @@ fn session_cell_decision<'a>(
     (true, percent, text, false)
 }
 
+/// AUM-WINDOW-UI-SHORT-WINDOW-WARNING-ROW-01: whether this provider's state
+/// alone, under `WarningOnly`, should keep the 5h row visible — distinct
+/// from `session_cell_decision`'s `shows` (which also covers "draw this
+/// cell's own text once the row exists for some other reason", and must
+/// keep returning `true` for `NotAvailable` so that cell still renders its
+/// status word when the row *is* shown for some other provider). A
+/// pace-driven warning (including HF1's "100%-used is always overpacing"
+/// case — see `short_window_is_overpacing`) always justifies the row. So
+/// does any other non-`Ok` status (`Loading`/`FetchFailed`/`Retrying`/
+/// `NotConfigured`) — a suppressed pace line must never hide a real error
+/// or loading state, matching `session_cell_decision`'s own existing intent
+/// (see `session_row_visible_true_for_warning_only_when_one_provider_is_in_error`).
+/// Only `NotAvailable` — a provider that structurally has no such window
+/// this poll (e.g. Codex with no 5-hour window — see HF2,
+/// `cb85cd52fcf8cb1a366e355c1bcba4c79f236ef6`) — is excluded: that fact
+/// alone must never be the sole reason the row appears.
+fn session_cell_justifies_warning_only_row(
+    state: CellState,
+    pace: Option<&PaceGuidanceLines>,
+) -> bool {
+    pace.is_some() || !matches!(state, CellState::Ok | CellState::NotAvailable)
+}
+
+/// One provider's contribution to the 5h row's existence — shared by both
+/// `needs_session_row` (popup sizing) and `paint_content` (drawing), which
+/// must never disagree about which providers keep the row alive (see
+/// `session_row_visible`'s own doc). Identical to `session_cell_decision`'s
+/// `shows` for `Always`/`Hidden`; for `WarningOnly`, defers to
+/// `session_cell_justifies_warning_only_row` instead, so a lone
+/// `NotAvailable` provider can't keep the row alive on its own.
+fn session_row_cell_shows(
+    state: CellState,
+    percent: Option<f64>,
+    text: &str,
+    pace: Option<&PaceGuidanceLines>,
+    visibility: ShortWindowVisibility,
+) -> bool {
+    if visibility == ShortWindowVisibility::WarningOnly {
+        return session_cell_justifies_warning_only_row(state, pace);
+    }
+    session_cell_decision(state, percent, text, pace, visibility).0
+}
+
 /// Whether the 5h bar row has anything to draw at all this poll: at least
 /// one *currently-shown* provider's `session_cell_decision` says to show
 /// something. The `show_*` checks here are the authority — a hidden
@@ -2599,21 +2642,21 @@ fn session_row_visible(
 
 fn needs_session_row(state: &AppState) -> bool {
     let visibility = state.short_window_visibility;
-    let (claude_shows, _, _, _) = session_cell_decision(
+    let claude_shows = session_row_cell_shows(
         state.session_state,
         state.session_percent,
         &state.session_text,
         state.session_pace.as_ref(),
         visibility,
     );
-    let (codex_shows, _, _, _) = session_cell_decision(
+    let codex_shows = session_row_cell_shows(
         state.codex_session_state,
         state.codex_session_percent,
         &state.codex_session_text,
         state.codex_session_pace.as_ref(),
         visibility,
     );
-    let (antigravity_shows, _, _, _) = session_cell_decision(
+    let antigravity_shows = session_row_cell_shows(
         state.antigravity_session_state,
         state.antigravity_session_percent,
         &state.antigravity_session_text,
@@ -3581,11 +3624,29 @@ fn paint_content(
         );
         let needs_session_row = session_row_visible(
             show_claude_code,
-            claude_session_decision.0,
+            session_row_cell_shows(
+                session_state,
+                session_pct,
+                session_text,
+                session_pace,
+                short_window_visibility,
+            ),
             show_codex,
-            codex_session_decision.0,
+            session_row_cell_shows(
+                codex_session_state,
+                codex_session_pct,
+                codex_session_text,
+                codex_session_pace,
+                short_window_visibility,
+            ),
             show_antigravity,
-            antigravity_session_decision.0,
+            session_row_cell_shows(
+                antigravity_session_state,
+                antigravity_session_pct,
+                antigravity_session_text,
+                antigravity_session_pace,
+                short_window_visibility,
+            ),
         );
         let rows = visible_rows(popup_layout, weekly_lines, needs_session_row);
         let layout = pace_row_layout(height, rows);
@@ -8979,6 +9040,405 @@ mod tests {
         );
         assert!(!session_row_visible(
             true,
+            claude_shows,
+            true,
+            codex_shows,
+            false,
+            false
+        ));
+    }
+
+    // ── AUM-WINDOW-UI-SHORT-WINDOW-WARNING-ROW-01 ──────────────────────────
+    // `session_cell_justifies_warning_only_row` / `session_row_cell_shows`:
+    // under WarningOnly, a lone NotAvailable provider must not keep the 5h
+    // row alive, but every other non-Ok status (and any real pace-driven
+    // warning, including HF1's 100%-used case) still must.
+
+    #[test]
+    fn justifies_warning_only_row_is_false_for_not_available_alone() {
+        assert!(!session_cell_justifies_warning_only_row(
+            CellState::NotAvailable,
+            None
+        ));
+    }
+
+    #[test]
+    fn justifies_warning_only_row_is_false_for_ok_without_pace() {
+        // A normal, non-warning value: pace is None (WarningOnly suppresses
+        // non-overpacing pace text), and Ok is excluded on its own.
+        assert!(!session_cell_justifies_warning_only_row(
+            CellState::Ok,
+            None
+        ));
+    }
+
+    #[test]
+    fn justifies_warning_only_row_is_true_for_any_pace_present() {
+        let lines = PaceGuidanceLines {
+            primary: "x".to_string(),
+            secondary: None,
+            detail: None,
+            is_warning: true,
+        };
+        assert!(session_cell_justifies_warning_only_row(
+            CellState::Ok,
+            Some(&lines)
+        ));
+    }
+
+    #[test]
+    fn justifies_warning_only_row_is_true_for_every_non_ok_non_not_available_state() {
+        // Existing status-word states other than NotAvailable — a
+        // suppressed pace line must never hide a real error/loading state
+        // (see `session_row_visible_true_for_warning_only_when_one_provider_is_in_error`,
+        // preserved unchanged by this predicate).
+        for state in [
+            CellState::Loading,
+            CellState::FetchFailed,
+            CellState::Retrying,
+            CellState::NotConfigured,
+        ] {
+            assert!(
+                session_cell_justifies_warning_only_row(state, None),
+                "state {state:?} must still justify the row on its own"
+            );
+        }
+    }
+
+    #[test]
+    fn session_row_cell_shows_matches_session_cell_decision_for_always_and_hidden() {
+        let lines = PaceGuidanceLines {
+            primary: "x".to_string(),
+            secondary: None,
+            detail: None,
+            is_warning: false,
+        };
+        for visibility in [ShortWindowVisibility::Always, ShortWindowVisibility::Hidden] {
+            for (state, percent, pace) in [
+                (CellState::Ok, Some(26.0), Some(&lines)),
+                (CellState::NotAvailable, None, None),
+                (CellState::FetchFailed, None, None),
+            ] {
+                let expected = session_cell_decision(state, percent, "text", pace, visibility).0;
+                assert_eq!(
+                    session_row_cell_shows(state, percent, "text", pace, visibility),
+                    expected,
+                    "state={state:?} visibility={visibility:?} must match session_cell_decision outside WarningOnly"
+                );
+            }
+        }
+    }
+
+    /// Case 1: Always + Claude 26% (normal) + Codex NotAvailable → row shown
+    /// (unchanged from today).
+    #[test]
+    fn session_row_always_shows_for_normal_value_and_not_available() {
+        let lines = PaceGuidanceLines {
+            primary: "26%".to_string(),
+            secondary: None,
+            detail: None,
+            is_warning: false,
+        };
+        let claude_shows = session_row_cell_shows(
+            CellState::Ok,
+            Some(26.0),
+            "26%",
+            Some(&lines),
+            ShortWindowVisibility::Always,
+        );
+        let codex_shows = session_row_cell_shows(
+            CellState::NotAvailable,
+            None,
+            "N/A",
+            None,
+            ShortWindowVisibility::Always,
+        );
+        assert!(session_row_visible(
+            true,
+            claude_shows,
+            true,
+            codex_shows,
+            false,
+            false
+        ));
+    }
+
+    /// Case 2 (the reported bug): WarningOnly + Claude 26% (non-warning) +
+    /// Codex NotAvailable → row must now be hidden entirely.
+    #[test]
+    fn session_row_warning_only_hides_for_normal_value_and_not_available() {
+        let claude_shows = session_row_cell_shows(
+            CellState::Ok,
+            Some(26.0),
+            "26%",
+            None,
+            ShortWindowVisibility::WarningOnly,
+        );
+        let codex_shows = session_row_cell_shows(
+            CellState::NotAvailable,
+            None,
+            "N/A",
+            None,
+            ShortWindowVisibility::WarningOnly,
+        );
+        assert!(!session_row_visible(
+            true,
+            claude_shows,
+            true,
+            codex_shows,
+            false,
+            false
+        ));
+    }
+
+    /// Case 3 (HF1 regression guard): WarningOnly + Claude 100% + Codex
+    /// NotAvailable → row must still be shown, via the real
+    /// `session_pace_for_cell` pipeline (not a hand-built
+    /// `PaceGuidanceLines`), so a future change to `short_window_is_overpacing`
+    /// or `short_window_pace_guidance_lines` would also be caught here.
+    #[test]
+    fn session_row_warning_only_shows_for_hundred_percent_via_real_pace_pipeline() {
+        let now = SystemTime::now();
+        let strings = LanguageId::English.strings();
+        let section = UsageSection {
+            percentage: 100.0,
+            resets_at: Some(now + Duration::from_secs(35 * 60)),
+        };
+        let pace = session_pace_for_cell(
+            CellState::Ok,
+            Some(&section),
+            now,
+            DisplayBasis::UsedPercentage,
+            ShortWindowVisibility::WarningOnly,
+            ShortWindowAlertSensitivity::Standard,
+            strings,
+        );
+        let claude_shows = session_row_cell_shows(
+            CellState::Ok,
+            Some(100.0),
+            "100%",
+            pace.as_ref(),
+            ShortWindowVisibility::WarningOnly,
+        );
+        let codex_shows = session_row_cell_shows(
+            CellState::NotAvailable,
+            None,
+            "N/A",
+            None,
+            ShortWindowVisibility::WarningOnly,
+        );
+        assert!(session_row_visible(
+            true,
+            claude_shows,
+            true,
+            codex_shows,
+            false,
+            false
+        ));
+    }
+
+    /// Case 4: WarningOnly + Claude genuinely overpacing (not the 100%-used
+    /// edge case) + Codex NotAvailable → row shown.
+    #[test]
+    fn session_row_warning_only_shows_for_overpacing_and_not_available() {
+        let lines = PaceGuidanceLines {
+            primary: "68% overpacing".to_string(),
+            secondary: None,
+            detail: None,
+            is_warning: true,
+        };
+        let claude_shows = session_row_cell_shows(
+            CellState::Ok,
+            Some(68.0),
+            "68%",
+            Some(&lines),
+            ShortWindowVisibility::WarningOnly,
+        );
+        let codex_shows = session_row_cell_shows(
+            CellState::NotAvailable,
+            None,
+            "N/A",
+            None,
+            ShortWindowVisibility::WarningOnly,
+        );
+        assert!(session_row_visible(
+            true,
+            claude_shows,
+            true,
+            codex_shows,
+            false,
+            false
+        ));
+    }
+
+    /// Case 5: WarningOnly + Claude non-warning + Codex Ok/non-warning (a
+    /// real 5h value that just isn't overpacing) → row hidden.
+    #[test]
+    fn session_row_warning_only_hides_when_no_provider_is_warning_or_non_ok() {
+        let claude_shows = session_row_cell_shows(
+            CellState::Ok,
+            Some(10.0),
+            "10%",
+            None,
+            ShortWindowVisibility::WarningOnly,
+        );
+        let codex_shows = session_row_cell_shows(
+            CellState::Ok,
+            Some(15.0),
+            "15%",
+            None,
+            ShortWindowVisibility::WarningOnly,
+        );
+        assert!(!session_row_visible(
+            true,
+            claude_shows,
+            true,
+            codex_shows,
+            false,
+            false
+        ));
+    }
+
+    /// Case 6: WarningOnly + every active provider NotAvailable → row
+    /// hidden (generalizes the reported bug to all-N/A).
+    #[test]
+    fn session_row_warning_only_hides_when_all_active_providers_are_not_available() {
+        let claude_shows = session_row_cell_shows(
+            CellState::NotAvailable,
+            None,
+            "N/A",
+            None,
+            ShortWindowVisibility::WarningOnly,
+        );
+        let codex_shows = session_row_cell_shows(
+            CellState::NotAvailable,
+            None,
+            "N/A",
+            None,
+            ShortWindowVisibility::WarningOnly,
+        );
+        assert!(!session_row_visible(
+            true,
+            claude_shows,
+            true,
+            codex_shows,
+            false,
+            false
+        ));
+    }
+
+    /// Case 7: WarningOnly + FetchFailed only → row still shown (existing
+    /// behavior preserved unchanged).
+    #[test]
+    fn session_row_warning_only_shows_for_fetch_failed_alone() {
+        let strings = LanguageId::English.strings();
+        let claude_shows = session_row_cell_shows(
+            CellState::FetchFailed,
+            None,
+            strings.fetch_failed,
+            None,
+            ShortWindowVisibility::WarningOnly,
+        );
+        assert!(session_row_visible(
+            true,
+            claude_shows,
+            false,
+            false,
+            false,
+            false
+        ));
+    }
+
+    /// Case 8: WarningOnly + Loading / Retrying / NotConfigured each still
+    /// justify the row on their own (existing intent preserved).
+    #[test]
+    fn session_row_warning_only_shows_for_loading_retrying_not_configured() {
+        let strings = LanguageId::English.strings();
+        for (state, text) in [
+            (CellState::Loading, strings.loading),
+            (CellState::Retrying, strings.retrying),
+            (CellState::NotConfigured, strings.not_configured),
+        ] {
+            let claude_shows =
+                session_row_cell_shows(state, None, text, None, ShortWindowVisibility::WarningOnly);
+            assert!(
+                session_row_visible(true, claude_shows, false, false, false, false),
+                "state {state:?} must keep the row visible under WarningOnly"
+            );
+        }
+    }
+
+    /// Case 9: Hidden + any state → row never shown, regardless of the new
+    /// WarningOnly-only logic (Hidden short-circuits before it).
+    #[test]
+    fn session_row_hidden_never_shows_regardless_of_state() {
+        let lines = PaceGuidanceLines {
+            primary: "x".to_string(),
+            secondary: None,
+            detail: None,
+            is_warning: true,
+        };
+        let claude_shows = session_row_cell_shows(
+            CellState::Ok,
+            Some(100.0),
+            "100%",
+            Some(&lines),
+            ShortWindowVisibility::Hidden,
+        );
+        let codex_shows = session_row_cell_shows(
+            CellState::FetchFailed,
+            None,
+            "fetch failed",
+            None,
+            ShortWindowVisibility::Hidden,
+        );
+        assert!(!session_row_visible(
+            true,
+            claude_shows,
+            true,
+            codex_shows,
+            false,
+            false
+        ));
+    }
+
+    /// Case 10: an OFF provider never contributes to row existence, even
+    /// when its own decision would justify the row (e.g. 100%-used) — the
+    /// `show_*` gate in `session_row_visible` is the authority.
+    #[test]
+    fn session_row_ignores_an_off_providers_justification() {
+        let now = SystemTime::now();
+        let strings = LanguageId::English.strings();
+        let section = UsageSection {
+            percentage: 100.0,
+            resets_at: Some(now + Duration::from_secs(35 * 60)),
+        };
+        let pace = session_pace_for_cell(
+            CellState::Ok,
+            Some(&section),
+            now,
+            DisplayBasis::UsedPercentage,
+            ShortWindowVisibility::WarningOnly,
+            ShortWindowAlertSensitivity::Standard,
+            strings,
+        );
+        let claude_shows = session_row_cell_shows(
+            CellState::Ok,
+            Some(100.0),
+            "100%",
+            pace.as_ref(),
+            ShortWindowVisibility::WarningOnly,
+        );
+        let codex_shows = session_row_cell_shows(
+            CellState::NotAvailable,
+            None,
+            "N/A",
+            None,
+            ShortWindowVisibility::WarningOnly,
+        );
+        // Claude Code is OFF despite its decision justifying the row.
+        assert!(!session_row_visible(
+            false,
             claude_shows,
             true,
             codex_shows,
