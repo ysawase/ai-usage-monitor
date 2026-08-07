@@ -116,8 +116,19 @@ struct AppState {
     tray_offset: i32,
     dragging: bool,
     drag_start_mouse_x: i32,
+    drag_start_mouse_y: i32,
     drag_start_client_x: i32,
-    drag_start_offset: i32,
+    drag_start_window_x: i32,
+    drag_start_window_y: i32,
+    /// AUM-WINDOW-UI-01C-2-STEP2: runtime-only free placement. `None` means
+    /// the popup follows the taskbar-anchored auto position
+    /// (`compute_auto_popup_position`); `Some((x, y))` means the user
+    /// free-dragged it off the taskbar this session, so `position_at_taskbar`
+    /// keeps that position and only resizes in place. Never persisted to
+    /// `SettingsFile` — cleared back to `None` on `IDM_RESET_POSITION`, on a
+    /// taskbar-rect drop (see `WM_LBUTTONUP`), and implicitly on every
+    /// restart (this field simply isn't saved).
+    manual_position: Option<(i32, i32)>,
 
     widget_visible: bool,
     always_on_top: bool,
@@ -2401,9 +2412,6 @@ const SEGMENT_COUNT: i32 = 10;
 const CORNER_RADIUS: i32 = 2;
 
 const LEFT_DIVIDER_W: i32 = 3;
-/// Wider than the visible divider so the drag handle is easier to grab;
-/// purely a hit-test width, does not affect drawing.
-const DRAG_HANDLE_HIT_W: i32 = 10;
 const DIVIDER_RIGHT_MARGIN: i32 = 10;
 const LABEL_WIDTH: i32 = 18;
 const LABEL_RIGHT_MARGIN: i32 = 10;
@@ -2795,28 +2803,73 @@ fn pace_row_layout(height: i32, rows: VisibleRows) -> PaceRowLayout {
     }
 }
 
-/// `height` is the popup's *current* total height (now variable — see
-/// `widget_height`/`widget_height_for_state` — rather than the fixed
-/// `WIDGET_HEIGHT` this used before pace guidance could grow it), since the
-/// drag handle stays vertically centered on the popup regardless of how
-/// tall the pace-guidance block currently makes it.
-fn is_drag_handle_point(client_x: i32, client_y: i32, height: i32) -> bool {
-    let divider_h = sc(25);
-    let divider_top = (height - divider_h) / 2;
-    client_x >= 0
-        && client_x < sc(DRAG_HANDLE_HIT_W)
-        && client_y >= divider_top
-        && client_y < divider_top + divider_h
+/// AUM-WINDOW-UI-01C-2-STEP2 (drag UX): the popup's y-boundary between the
+/// draggable header band (the provider-name row — and, in Compact, each
+/// provider's weekly-remaining text) and the non-draggable 7d/5h bar rows
+/// below it. This is literally `pace_row_layout`'s own `weekly_row_y` — the
+/// same value `paint_content` uses to position the weekly row — so the drag
+/// region can never disagree with what's actually drawn as the header. (In
+/// practice this boundary is identical across every `PopupLayout`/content
+/// combination: `popup_height_logical` always grows/shrinks the popup's
+/// total height by exactly the extra content's own size, so the top-anchored
+/// header never moves — see the STEP2 drag-UX design report — but it's
+/// still computed fresh here rather than assumed, since it's cheap and this
+/// is the single source of truth already used for drawing.)
+fn header_band_bottom(state: &AppState) -> i32 {
+    let rows = visible_rows(
+        state.popup_layout,
+        weekly_pace_extra_lines(state),
+        needs_session_row(state),
+    );
+    let height = widget_height_for_state(state);
+    pace_row_layout(height, rows).weekly_row_y
 }
 
-fn cursor_is_on_drag_handle(hwnd: HWND) -> bool {
+/// Whether `(client_x, client_y)` falls within the popup's draggable header
+/// band — the full-width strip from the top edge down to (not including)
+/// `header_band_bottom`. Replaces the old narrow left-edge handle
+/// (AUM-WINDOW-UI-01C-2-STEP2): the header band already shows the provider
+/// names, making it a far more discoverable drag target than a 10px-wide
+/// strip ever was.
+fn is_drag_region_point(client_x: i32, client_y: i32, width: i32, header_band_bottom: i32) -> bool {
+    client_x >= 0 && client_x < width && client_y >= 0 && client_y < header_band_bottom
+}
+
+fn cursor_is_on_drag_region(hwnd: HWND) -> bool {
+    let mut pt = POINT::default();
     unsafe {
-        let mut pt = POINT::default();
         if GetCursorPos(&mut pt).is_err() || !ScreenToClient(hwnd, &mut pt).as_bool() {
             return false;
         }
-        is_drag_handle_point(pt.x, pt.y, widget_height())
     }
+    let state = lock_state();
+    let s = match state.as_ref() {
+        Some(s) => s,
+        None => return false,
+    };
+    is_drag_region_point(
+        pt.x,
+        pt.y,
+        total_widget_width_for_state(s),
+        header_band_bottom(s),
+    )
+}
+
+/// AUM-WINDOW-UI-01C-2-STEP2: the popup's screen position while free-dragging
+/// — the window's position at drag-start, shifted by how far the cursor has
+/// moved since. Shared by `WM_MOUSEMOVE` (live follow) and `WM_LBUTTONUP`
+/// (final drop position), so the two can never compute a different answer
+/// for the same cursor position. No clamping here — off-screen recovery is
+/// a separate, later step.
+fn drag_follow_position(
+    start_window: (i32, i32),
+    start_mouse: (i32, i32),
+    current_mouse: (i32, i32),
+) -> (i32, i32) {
+    (
+        start_window.0 + (current_mouse.0 - start_mouse.0),
+        start_window.1 + (current_mouse.1 - start_mouse.1),
+    )
 }
 
 fn active_model_count(show_claude_code: bool, show_codex: bool, show_antigravity: bool) -> i32 {
@@ -3173,8 +3226,11 @@ pub fn run() {
                 tray_offset: settings.tray_offset,
                 dragging: false,
                 drag_start_mouse_x: 0,
+                drag_start_mouse_y: 0,
                 drag_start_client_x: 0,
-                drag_start_offset: 0,
+                drag_start_window_x: 0,
+                drag_start_window_y: 0,
+                manual_position: None,
                 widget_visible: settings.widget_visible,
                 always_on_top: settings.always_on_top,
             });
@@ -4285,7 +4341,7 @@ fn position_at_taskbar() {
     refresh_dpi();
     // Drop the app-state lock before any Win32 call that may synchronously
     // re-enter our window procedure.
-    let (hwnd, tray_offset, taskbar_hwnd) = {
+    let (hwnd, tray_offset, taskbar_hwnd, manual_position) = {
         let state = lock_state();
         let s = match state.as_ref() {
             Some(s) => s,
@@ -4297,15 +4353,36 @@ fn position_at_taskbar() {
             return;
         }
 
-        let taskbar_hwnd = match s.taskbar_hwnd {
-            Some(h) => h,
-            None => {
-                diagnose::log("position_at_taskbar skipped: no taskbar handle");
-                return;
-            }
-        };
+        (
+            s.hwnd.to_hwnd(),
+            s.tray_offset,
+            s.taskbar_hwnd,
+            s.manual_position,
+        )
+    };
 
-        (s.hwnd.to_hwnd(), s.tray_offset, taskbar_hwnd)
+    let widget_width = total_widget_width();
+    let widget_height = widget_height();
+
+    // AUM-WINDOW-UI-01C-2-STEP2: a free-dragged popup keeps its manual x/y —
+    // never recomputed from the taskbar — but still needs its size kept
+    // current (Compact/Standard, provider toggles, display density, etc. all
+    // change `widget_width`/`widget_height` independently of placement).
+    // `taskbar_hwnd` isn't even needed here: sizing is purely content-driven.
+    if let Some((x, y)) = manual_position {
+        native_interop::move_window(hwnd, x, y, widget_width, widget_height);
+        diagnose::log(format!(
+            "resized manually-placed popup at x={x} y={y} w={widget_width} h={widget_height}"
+        ));
+        return;
+    }
+
+    let taskbar_hwnd = match taskbar_hwnd {
+        Some(h) => h,
+        None => {
+            diagnose::log("position_at_taskbar skipped: no taskbar handle");
+            return;
+        }
     };
 
     let taskbar_rect = match native_interop::get_taskbar_rect(taskbar_hwnd) {
@@ -4335,7 +4412,6 @@ fn position_at_taskbar() {
         }
     }
 
-    let widget_width = total_widget_width();
     let max_offset = (tray_left - taskbar_rect.left - widget_width).max(0);
     let tray_offset = tray_offset.clamp(0, max_offset);
     let offset_changed = {
@@ -4355,7 +4431,6 @@ fn position_at_taskbar() {
         save_state_settings();
     }
 
-    let widget_height = widget_height();
     let (x, y) = compute_auto_popup_position(
         work_area,
         tray_left,
@@ -4598,12 +4673,12 @@ unsafe extern "system" fn wnd_proc(
                 state.as_ref().map(|s| s.dragging).unwrap_or(false)
             };
             if is_dragging {
-                let cursor = LoadCursorW(HINSTANCE::default(), IDC_SIZEWE).unwrap_or_default();
+                let cursor = LoadCursorW(HINSTANCE::default(), IDC_SIZEALL).unwrap_or_default();
                 SetCursor(cursor);
                 return LRESULT(1);
             }
-            if cursor_is_on_drag_handle(hwnd) {
-                let cursor = LoadCursorW(HINSTANCE::default(), IDC_SIZEWE).unwrap_or_default();
+            if cursor_is_on_drag_region(hwnd) {
+                let cursor = LoadCursorW(HINSTANCE::default(), IDC_SIZEALL).unwrap_or_default();
                 SetCursor(cursor);
                 return LRESULT(1);
             }
@@ -4612,18 +4687,40 @@ unsafe extern "system" fn wnd_proc(
         WM_LBUTTONDOWN => {
             let client_x = (lparam.0 & 0xFFFF) as i16 as i32;
             let client_y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
-            if !is_drag_handle_point(client_x, client_y, widget_height()) {
+            let in_drag_region = {
+                let state = lock_state();
+                match state.as_ref() {
+                    Some(s) => is_drag_region_point(
+                        client_x,
+                        client_y,
+                        total_widget_width_for_state(s),
+                        header_band_bottom(s),
+                    ),
+                    None => false,
+                }
+            };
+            if !in_drag_region {
                 return LRESULT(0);
             }
 
             let mut pt = POINT::default();
             let _ = GetCursorPos(&mut pt);
+            // AUM-WINDOW-UI-01C-2-STEP2: the window's current screen
+            // position is the reference point free-drag deltas are applied
+            // to in `WM_MOUSEMOVE` — captured once here rather than derived
+            // from any taskbar/tray formula, since a free drag no longer
+            // assumes the popup starts taskbar-anchored.
+            let window_rect = native_interop::get_window_rect_safe(hwnd);
             let mut state = lock_state();
             if let Some(s) = state.as_mut() {
                 s.dragging = true;
                 s.drag_start_mouse_x = pt.x;
+                s.drag_start_mouse_y = pt.y;
                 s.drag_start_client_x = client_x;
-                s.drag_start_offset = s.tray_offset;
+                if let Some(rect) = window_rect {
+                    s.drag_start_window_x = rect.left;
+                    s.drag_start_window_y = rect.top;
+                }
             }
             SetCapture(hwnd);
             LRESULT(0)
@@ -4636,76 +4733,29 @@ unsafe extern "system" fn wnd_proc(
             if is_dragging {
                 let mut pt = POINT::default();
                 let _ = GetCursorPos(&mut pt);
+                // AUM-WINDOW-UI-01C-2-STEP2: free 2-axis follow — the popup
+                // tracks the cursor directly (window start + cursor delta),
+                // no taskbar/tray/work-area math and no clamping here (see
+                // STEP2's design: off-screen recovery is a separate,
+                // later step).
                 let move_target = {
-                    let mut state = lock_state();
-                    let s = match state.as_mut() {
+                    let state = lock_state();
+                    let s = match state.as_ref() {
                         Some(s) => s,
                         None => return LRESULT(0),
                     };
-
-                    // Moving mouse left = positive delta = larger offset (further left)
-                    let delta = s.drag_start_mouse_x - pt.x;
-                    let mut new_offset = s.drag_start_offset + delta;
-
-                    // Clamp: offset >= 0 (can't go right of default)
-                    if new_offset < 0 {
-                        new_offset = 0;
-                    }
-
-                    let taskbar_hwnd = s.taskbar_hwnd;
+                    let (x, y) = drag_follow_position(
+                        (s.drag_start_window_x, s.drag_start_window_y),
+                        (s.drag_start_mouse_x, s.drag_start_mouse_y),
+                        (pt.x, pt.y),
+                    );
                     let hwnd_val = s.hwnd.to_hwnd();
-
-                    // Clamp: don't go past left edge of taskbar
-                    if let Some(taskbar_hwnd) = taskbar_hwnd {
-                        if let Some(taskbar_rect) = native_interop::get_taskbar_rect(taskbar_hwnd) {
-                            let mut tray_left = taskbar_rect.right;
-                            if let Some(tray_hwnd) =
-                                native_interop::find_child_window(taskbar_hwnd, "TrayNotifyWnd")
-                            {
-                                if let Some(tray_rect) =
-                                    native_interop::get_window_rect_safe(tray_hwnd)
-                                {
-                                    tray_left = tray_rect.left;
-                                }
-                            }
-                            let widget_width = total_widget_width_for_state(s);
-                            let max_offset = (tray_left - taskbar_rect.left - widget_width).max(0);
-                            if new_offset > max_offset {
-                                new_offset = max_offset;
-                            }
-
-                            s.tray_offset = new_offset;
-
-                            let work_area = native_interop::get_monitor_work_area(taskbar_hwnd)
-                                .unwrap_or(RECT {
-                                    left: taskbar_rect.left,
-                                    top: i32::MIN / 2,
-                                    right: taskbar_rect.right,
-                                    bottom: taskbar_rect.top,
-                                });
-                            let widget_height = widget_height_for_state(s);
-                            let y = compute_popup_y(work_area.top, work_area.bottom, widget_height);
-                            let desired_x = tray_left - widget_width - new_offset;
-                            let x = clamp_popup_x(
-                                desired_x,
-                                work_area.left,
-                                work_area.right,
-                                widget_width,
-                            );
-                            Some((hwnd_val, x, y, widget_width, widget_height))
-                        } else {
-                            s.tray_offset = new_offset;
-                            None
-                        }
-                    } else {
-                        s.tray_offset = new_offset;
-                        None
-                    }
+                    let width = total_widget_width_for_state(s);
+                    let height = widget_height_for_state(s);
+                    (hwnd_val, x, y, width, height)
                 };
-
-                if let Some((hwnd_val, x, y, widget_width, widget_height)) = move_target {
-                    native_interop::move_window(hwnd_val, x, y, widget_width, widget_height);
-                }
+                let (hwnd_val, x, y, width, height) = move_target;
+                native_interop::move_window(hwnd_val, x, y, width, height);
             }
             LRESULT(0)
         }
@@ -4717,7 +4767,14 @@ unsafe extern "system" fn wnd_proc(
                 if let Some(s) = state.as_mut() {
                     if s.dragging {
                         s.dragging = false;
-                        Some((s.taskbar_index, s.drag_start_client_x))
+                        Some((
+                            s.taskbar_index,
+                            s.drag_start_client_x,
+                            s.drag_start_window_x,
+                            s.drag_start_window_y,
+                            s.drag_start_mouse_x,
+                            s.drag_start_mouse_y,
+                        ))
                     } else {
                         None
                     }
@@ -4725,9 +4782,37 @@ unsafe extern "system" fn wnd_proc(
                     None
                 }
             };
-            if let Some((current_taskbar_index, drag_start_client_x)) = drag_result {
+            if let Some((
+                current_taskbar_index,
+                drag_start_client_x,
+                start_window_x,
+                start_window_y,
+                start_mouse_x,
+                start_mouse_y,
+            )) = drag_result
+            {
                 let _ = ReleaseCapture();
+                let (final_x, final_y) = drag_follow_position(
+                    (start_window_x, start_window_y),
+                    (start_mouse_x, start_mouse_y),
+                    (pt.x, pt.y),
+                );
                 if let Some((target_index, target_taskbar)) = taskbar_at_point(pt) {
+                    // AUM-WINDOW-UI-01C-2-STEP2: dropped back onto a taskbar
+                    // (the same one or a different monitor's) — always
+                    // returns to taskbar-anchored auto placement, clearing
+                    // any manual placement first. Same-taskbar drops now
+                    // need an explicit `position_at_taskbar()` call too
+                    // (unlike before STEP2): `WM_MOUSEMOVE` free-follows the
+                    // cursor rather than already tracking the taskbar-auto
+                    // formula live, so the popup isn't necessarily snapped
+                    // into place yet at drop time.
+                    {
+                        let mut state = lock_state();
+                        if let Some(s) = state.as_mut() {
+                            s.manual_position = None;
+                        }
+                    }
                     if target_index != current_taskbar_index {
                         let new_offset = offset_for_drop_point(
                             target_taskbar.hwnd,
@@ -4745,9 +4830,21 @@ unsafe extern "system" fn wnd_proc(
                             position_at_taskbar();
                             render_layered();
                         }
+                    } else {
+                        position_at_taskbar();
+                        render_layered();
+                    }
+                    save_state_settings();
+                } else {
+                    // Dropped away from any taskbar: runtime-only manual
+                    // placement. `tray_offset`/`taskbar_index` are left
+                    // untouched, and this is never persisted to
+                    // `SettingsFile` (no `save_state_settings()` call here).
+                    let mut state = lock_state();
+                    if let Some(s) = state.as_mut() {
+                        s.manual_position = Some((final_x, final_y));
                     }
                 }
-                save_state_settings();
             }
             LRESULT(0)
         }
@@ -4826,6 +4923,11 @@ unsafe extern "system" fn wnd_proc(
                         let mut state = lock_state();
                         if let Some(s) = state.as_mut() {
                             s.tray_offset = 0;
+                            // AUM-WINDOW-UI-01C-2-STEP2: also clears any
+                            // runtime free-placement, so this menu item is
+                            // the manual→auto escape hatch as well as the
+                            // existing tray-offset reset.
+                            s.manual_position = None;
                         }
                     }
                     save_state_settings();
@@ -6566,25 +6668,37 @@ mod tests {
         assert_eq!((x, y), (3500, 1034));
     }
 
+    // ── AUM-WINDOW-UI-01C-2-STEP2 (drag UX): is_drag_region_point ───────────
+
     #[test]
-    fn drag_handle_hit_area_includes_x_zero_at_96_dpi() {
-        assert!(is_drag_handle_point(0, 40, WIDGET_HEIGHT));
+    fn drag_region_point_covers_the_full_width_header_band() {
+        let width = 300;
+        let header_bottom = 25;
+        // Left edge, center, right edge (just inside width) all draggable.
+        for x in [0, 150, width - 1] {
+            assert!(
+                is_drag_region_point(x, 10, width, header_bottom),
+                "x={x} inside the header band should be draggable"
+            );
+        }
     }
 
     #[test]
-    fn drag_handle_hit_area_includes_x_nine_at_96_dpi() {
-        assert!(is_drag_handle_point(9, 40, WIDGET_HEIGHT));
-    }
-
-    #[test]
-    fn drag_handle_hit_area_excludes_x_ten_at_96_dpi() {
-        assert!(!is_drag_handle_point(10, 40, WIDGET_HEIGHT));
-    }
-
-    #[test]
-    fn drag_handle_hit_area_excludes_points_outside_vertical_range() {
-        assert!(!is_drag_handle_point(5, 25, WIDGET_HEIGHT));
-        assert!(!is_drag_handle_point(5, 51, WIDGET_HEIGHT));
+    fn drag_region_point_excludes_rows_below_the_header_band_and_outside_popup() {
+        let width = 300;
+        let header_bottom = 25;
+        // Right at the boundary (7d row), further down (5h row), the
+        // popup's own bottom edge, and points outside the popup entirely —
+        // none of these are draggable.
+        for y in [header_bottom, header_bottom + 5, 78] {
+            assert!(
+                !is_drag_region_point(150, y, width, header_bottom),
+                "y={y} at/below the header band must not be draggable"
+            );
+        }
+        assert!(!is_drag_region_point(-1, 10, width, header_bottom));
+        assert!(!is_drag_region_point(width, 10, width, header_bottom));
+        assert!(!is_drag_region_point(150, -1, width, header_bottom));
     }
 
     #[test]
@@ -9474,16 +9588,78 @@ mod tests {
         );
     }
 
+    /// AUM-WINDOW-UI-01C-2-STEP2 (drag UX): `header_band_bottom` (the
+    /// header/7d-row boundary `is_drag_region_point` uses) is
+    /// `pace_row_layout`'s own `weekly_row_y` — identical regardless of
+    /// `PopupLayout`/content state, since `popup_height_logical` always
+    /// grows or shrinks the popup's total height by exactly the extra
+    /// content's own size, so the top-anchored header row never moves. A
+    /// single static drag-region boundary is therefore correct for both
+    /// Compact and every Standard content variation, without needing to
+    /// special-case either.
     #[test]
-    fn drag_handle_recenters_for_taller_popup_height() {
-        let taller = WIDGET_HEIGHT + 2 * PACE_LINE_H;
-        let divider_h = 25; // sc(25) at the test process's default 96 DPI.
-        let divider_top = (taller - divider_h) / 2;
-        assert_ne!(divider_top, (WIDGET_HEIGHT - divider_h) / 2);
-        assert!(!is_drag_handle_point(5, divider_top - 1, taller));
-        assert!(is_drag_handle_point(5, divider_top, taller));
-        assert!(is_drag_handle_point(5, divider_top + divider_h - 1, taller));
-        assert!(!is_drag_handle_point(5, divider_top + divider_h, taller));
+    fn header_band_bottom_is_the_same_boundary_for_compact_and_standard() {
+        let compact_rows = visible_rows(PopupLayout::Compact, 2, true);
+        let compact_bottom =
+            pace_row_layout(sc(popup_height_logical(compact_rows)), compact_rows).weekly_row_y;
+
+        let standard_with_session_rows = visible_rows(PopupLayout::Standard, 2, true);
+        let standard_with_session_bottom = pace_row_layout(
+            sc(popup_height_logical(standard_with_session_rows)),
+            standard_with_session_rows,
+        )
+        .weekly_row_y;
+
+        let standard_without_session_rows = visible_rows(PopupLayout::Standard, 0, false);
+        let standard_without_session_bottom = pace_row_layout(
+            sc(popup_height_logical(standard_without_session_rows)),
+            standard_without_session_rows,
+        )
+        .weekly_row_y;
+
+        assert_eq!(compact_bottom, standard_with_session_bottom);
+        assert_eq!(compact_bottom, standard_without_session_bottom);
+    }
+
+    // ── AUM-WINDOW-UI-01C-2-STEP2: drag_follow_position ─────────────────────
+
+    #[test]
+    fn drag_follow_position_at_drag_start_equals_start_window() {
+        // Cursor hasn't moved yet: the popup stays exactly where it started.
+        assert_eq!(
+            drag_follow_position((500, 800), (1000, 1000), (1000, 1000)),
+            (500, 800)
+        );
+    }
+
+    #[test]
+    fn drag_follow_position_tracks_positive_cursor_movement() {
+        assert_eq!(
+            drag_follow_position((500, 800), (1000, 1000), (1150, 1100)),
+            (650, 900)
+        );
+    }
+
+    #[test]
+    fn drag_follow_position_tracks_negative_cursor_movement() {
+        assert_eq!(
+            drag_follow_position((500, 800), (1000, 1000), (850, 700)),
+            (350, 500)
+        );
+    }
+
+    #[test]
+    fn drag_follow_position_axes_move_independently() {
+        // X moves right, Y stays put.
+        assert_eq!(
+            drag_follow_position((500, 800), (1000, 1000), (1200, 1000)),
+            (700, 800)
+        );
+        // Y moves up, X stays put.
+        assert_eq!(
+            drag_follow_position((500, 800), (1000, 1000), (1000, 700)),
+            (500, 500)
+        );
     }
 
     #[test]
