@@ -4295,9 +4295,13 @@ fn position_at_taskbar() {
     }
 
     let widget_height = widget_height();
-    let y = compute_popup_y(work_area.top, work_area.bottom, widget_height);
-    let desired_x = tray_left - widget_width - tray_offset;
-    let x = clamp_popup_x(desired_x, work_area.left, work_area.right, widget_width);
+    let (x, y) = compute_auto_popup_position(
+        work_area,
+        tray_left,
+        widget_width,
+        widget_height,
+        tray_offset,
+    );
     native_interop::move_window(hwnd, x, y, widget_width, widget_height);
     diagnose::log(format!(
         "positioned popup at x={x} y={y} w={widget_width} h={widget_height}"
@@ -4325,6 +4329,32 @@ fn clamp_popup_x(
 ) -> i32 {
     let max_x = (work_area_right - popup_width).max(work_area_left);
     desired_x.clamp(work_area_left, max_x)
+}
+
+/// AUM-WINDOW-UI-01C-2-STEP1: the popup's automatic (taskbar-anchored) x/y,
+/// extracted verbatim from `position_at_taskbar`'s own calculation so the
+/// "where does auto-placement put the popup" arithmetic is a pure function
+/// separate from the Win32 plumbing (DPI refresh, taskbar/tray/work-area
+/// queries, `tray_offset` clamping, `MoveWindow`) that `position_at_taskbar`
+/// still owns. Composes the existing `compute_popup_y`/`clamp_popup_x`
+/// rather than duplicating their logic — `y` is independent of `tray_left`/
+/// `tray_offset`, and `x` is `tray_left - popup_width - tray_offset` clamped
+/// into `work_area` exactly as before this extraction. This is purely a
+/// responsibility split: given the same inputs, it returns the same `(x, y)`
+/// `position_at_taskbar` computed inline previously — no behavior change,
+/// and no new placement concept (manual/auto mode, saved coordinates, etc.)
+/// is introduced here.
+fn compute_auto_popup_position(
+    work_area: RECT,
+    tray_left: i32,
+    popup_width: i32,
+    popup_height: i32,
+    tray_offset: i32,
+) -> (i32, i32) {
+    let y = compute_popup_y(work_area.top, work_area.bottom, popup_height);
+    let desired_x = tray_left - popup_width - tray_offset;
+    let x = clamp_popup_x(desired_x, work_area.left, work_area.right, popup_width);
+    (x, y)
 }
 
 /// WinEvent callback for tray icon location changes
@@ -6382,6 +6412,97 @@ mod tests {
         // popup_width (2000) > work area width (1920): must not panic on
         // clamp(min, max) with min > max, and must fall back to the left edge.
         assert_eq!(clamp_popup_x(500, 0, 1920, 2000), 0);
+    }
+
+    // ── AUM-WINDOW-UI-01C-2-STEP1: compute_auto_popup_position ─────────────
+    // `position_at_taskbar`'s x/y arithmetic, extracted verbatim into a pure
+    // function — these fix the extracted function's behavior with concrete,
+    // independently-computed expected coordinates (not the same formula
+    // copied into the assertion) so the extraction can't silently drift from
+    // what `position_at_taskbar` used to compute inline.
+
+    #[test]
+    fn compute_auto_popup_position_matches_desired_x_and_y_for_ordinary_case() {
+        // 1920x1080 primary monitor, bottom taskbar, popup 300x46, tray
+        // sitting 20px right of the popup's target (tray_offset = 10).
+        let work_area = RECT {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1040,
+        };
+        let (x, y) = compute_auto_popup_position(work_area, 1900, 300, 46, 10);
+        assert_eq!((x, y), (1590, 994));
+    }
+
+    #[test]
+    fn compute_auto_popup_position_clamps_to_left_edge_when_desired_x_is_negative() {
+        // tray sits close to the work area's left edge; the popup's own
+        // desired position (tray_left - width) would land off-screen.
+        let work_area = RECT {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1040,
+        };
+        let (x, y) = compute_auto_popup_position(work_area, 250, 300, 46, 0);
+        assert_eq!((x, y), (0, 994));
+    }
+
+    #[test]
+    fn compute_auto_popup_position_clamps_to_right_edge_when_popup_would_overflow() {
+        // A narrow work area (e.g. a small secondary monitor) with tray_left
+        // far to the right of it: the popup's desired x would overflow the
+        // work area's right edge.
+        let work_area = RECT {
+            left: 0,
+            top: 0,
+            right: 500,
+            bottom: 1040,
+        };
+        let (x, y) = compute_auto_popup_position(work_area, 2000, 300, 46, 0);
+        assert_eq!((x, y), (200, 994));
+    }
+
+    #[test]
+    fn compute_auto_popup_position_clamps_to_left_when_popup_wider_than_work_area() {
+        // Mirrors `popup_wider_than_work_area_clamps_to_left_without_panicking`
+        // at the composed function's level: popup_width (300) > work area
+        // width (200).
+        let work_area = RECT {
+            left: 100,
+            top: 0,
+            right: 300,
+            bottom: 1040,
+        };
+        let (x, y) = compute_auto_popup_position(work_area, 250, 300, 46, 0);
+        assert_eq!((x, y), (100, 994));
+    }
+
+    #[test]
+    fn compute_auto_popup_position_y_matches_compute_popup_y() {
+        let work_area = RECT {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1040,
+        };
+        let (_, y) = compute_auto_popup_position(work_area, 1900, 300, 46, 10);
+        assert_eq!(y, compute_popup_y(work_area.top, work_area.bottom, 46));
+    }
+
+    #[test]
+    fn compute_auto_popup_position_handles_non_zero_work_area_origin() {
+        // A secondary monitor to the right of and slightly below the
+        // primary, so both work_area.left and work_area.top are non-zero.
+        let work_area = RECT {
+            left: 1920,
+            top: 40,
+            right: 3840,
+            bottom: 1080,
+        };
+        let (x, y) = compute_auto_popup_position(work_area, 3800, 300, 46, 0);
+        assert_eq!((x, y), (3500, 1034));
     }
 
     #[test]
