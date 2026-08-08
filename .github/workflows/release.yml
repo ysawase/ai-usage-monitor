@@ -23,7 +23,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Build release binary
-        run: cargo build --release --locked --no-default-features
+        run: cargo build --release --locked --no-default-features --features antigravity
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
