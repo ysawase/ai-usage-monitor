@@ -75,7 +75,15 @@ Use the right-click **Models** menu to choose what the widget displays:
 - **Codex** can be enabled alongside Claude Code or shown by itself
 - **Antigravity** can be enabled alongside the other providers or shown by itself as its own model column
 
-When multiple models are shown, each model has its own usage bar and matching usage text color. Antigravity prefers Google's Gemini quota summary when available and falls back to model quota data when needed.
+When multiple models are shown, each model has its own usage bar and matching usage text color.
+
+Antigravity is shown as its own model column, but its number is not a dedicated Gemini metric:
+
+- Antigravity's quota summary can include several model families (Gemini, Claude, GPT, image models)
+- The widget prefers the Gemini quota group when the summary has one, and falls back to whichever quota data is available when it doesn't
+- Because the underlying quota isn't guaranteed to be Gemini specifically, Gemini is not shown as a separate provider — the Antigravity column is the accurate representation of what's actually being reported
+
+*Last verified: 2026-08-08*
 
 ### System Tray Icon
 
