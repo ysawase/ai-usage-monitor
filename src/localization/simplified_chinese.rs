@@ -12,7 +12,7 @@ pub(super) const STRINGS: Strings = Strings {
     one_hour: "1 小时",
     models: "模型",
     claude_code_model: "Claude",
-    codex_model: "Codex",
+    codex_model: "ChatGPT",
     antigravity_model: "Antigravity",
     settings: "设置",
     start_with_windows: "开机时启动",

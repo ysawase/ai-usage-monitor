@@ -12,7 +12,7 @@ pub(super) const STRINGS: Strings = Strings {
     one_hour: "1 Hour",
     models: "Models",
     claude_code_model: "Claude",
-    codex_model: "Codex",
+    codex_model: "ChatGPT",
     antigravity_model: "Antigravity",
     settings: "Settings",
     start_with_windows: "Start with Windows",
