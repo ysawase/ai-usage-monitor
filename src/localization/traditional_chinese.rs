@@ -13,6 +13,7 @@ pub(super) const STRINGS: Strings = Strings {
     models: "模型",
     claude_code_model: "Claude",
     codex_model: "ChatGPT",
+    full_reset: "完整重設",
     antigravity_model: "Antigravity",
     settings: "設定",
     start_with_windows: "開機時啟動",

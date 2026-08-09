@@ -1,5 +1,12 @@
 use std::time::SystemTime;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum BankedResetCount {
+    Available(u64),
+    #[default]
+    Unavailable,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct UsageSection {
     pub percentage: f64,
@@ -10,6 +17,7 @@ pub struct UsageSection {
 pub struct UsageData {
     pub session: UsageSection,
     pub weekly: UsageSection,
+    pub(crate) banked_reset_count: BankedResetCount,
     session_available: bool,
     weekly_available: bool,
 }
@@ -53,6 +61,7 @@ mod tests {
         assert!(!usage.weekly_available());
         assert_eq!(usage.session.percentage, 0.0);
         assert_eq!(usage.weekly.percentage, 0.0);
+        assert_eq!(usage.banked_reset_count, BankedResetCount::Unavailable);
     }
 
     #[test]

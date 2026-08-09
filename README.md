@@ -81,6 +81,7 @@ The widget keeps its labels short. Here's what each one actually represents:
 
 - **Claude** is the shared Claude / Claude Code usage window, not a Claude Code-specific metric
 - **ChatGPT** displays the usage data fetched through the Codex CLI's credentials and endpoint, shown under the ChatGPT name because that's what the underlying data represents
+- When available, the ChatGPT heading also shows the number of banked **Full resets** reported by the Codex CLI; an unavailable count is shown separately from zero
 - **Antigravity** is shown as its own provider column. Its number prefers Google's Gemini quota summary when available, and falls back to model quota data when it isn't
 - Antigravity's quota summary can include several model families (Gemini, Claude, GPT, image models), so its number isn't a dedicated Gemini metric
 - Gemini is not shown as its own separate provider, since the underlying quota isn't guaranteed to always be Gemini specifically

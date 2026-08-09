@@ -6,21 +6,27 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 #[cfg(feature = "antigravity")]
 use std::hash::{Hash, Hasher};
+use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
-use std::process::Command;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::sync::{Mutex, OnceLock};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
 use std::os::windows::process::CommandExt;
 
 use crate::diagnose;
 use crate::localization::Strings;
-use crate::models::{AppUsageData, UsageData, UsageSection};
+use crate::models::{AppUsageData, BankedResetCount, UsageData, UsageSection};
 
 const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 #[cfg(feature = "claude-messages-fallback")]
 const MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
 const CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
+const CODEX_APP_SERVER_TIMEOUT: Duration = Duration::from_secs(10);
+const CODEX_BANKED_RESET_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 #[cfg(feature = "antigravity")]
 const ANTIGRAVITY_CREDENTIAL_TARGET: &str = "gemini:antigravity";
 #[cfg(feature = "antigravity")]
@@ -162,6 +168,45 @@ struct CodexRateLimitWindow {
     /// `None` when the JSON key is absent, so an older/different response
     /// shape missing this key doesn't fail the whole response.
     limit_window_seconds: Option<u64>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexRateLimitsReadResult {
+    rate_limit_reset_credits: Option<CodexResetCreditsSummary>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexResetCreditsSummary {
+    available_count: u64,
+}
+
+#[derive(Deserialize)]
+struct CodexAppServerResponse {
+    id: Option<serde_json::Value>,
+    result: Option<CodexRateLimitsReadResult>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CodexAppServerError {
+    CliUnavailable,
+    StartFailed,
+    InitializeFailed,
+    Timeout,
+    Protocol,
+}
+
+enum CodexAppServerMessage {
+    Response(CodexAppServerResponse),
+    ProtocolError,
+    EndOfStream,
+}
+
+#[derive(Default)]
+struct CodexBankedResetCache {
+    fetched_at: Option<Instant>,
+    available_count: Option<u64>,
 }
 
 #[cfg(feature = "antigravity")]
@@ -452,7 +497,8 @@ fn poll_codex() -> Result<UsageData, PollError> {
         }
     };
 
-    let result = fetch_codex_usage(&creds.access_token, creds.account_id.as_deref());
+    let result =
+        fetch_codex_usage_with_banked_reset(&creds.access_token, creds.account_id.as_deref());
 
     #[cfg(feature = "legacy-auto-refresh")]
     match result {
@@ -460,7 +506,10 @@ fn poll_codex() -> Result<UsageData, PollError> {
         Err(PollError::AuthRequired) => {
             cli_refresh_codex_token();
             let refreshed = read_codex_credentials().ok_or(PollError::TokenExpired)?;
-            fetch_codex_usage(&refreshed.access_token, refreshed.account_id.as_deref())
+            fetch_codex_usage_with_banked_reset(
+                &refreshed.access_token,
+                refreshed.account_id.as_deref(),
+            )
         }
         Err(error) => Err(error),
     }
@@ -602,7 +651,7 @@ fn cli_refresh_wsl_token(distro: &str) {
 
 #[cfg(feature = "legacy-auto-refresh")]
 fn cli_refresh_codex_token() {
-    let codex_path = resolve_windows_codex_path();
+    let codex_path = resolve_windows_codex_path().unwrap_or_else(|| "codex.cmd".to_string());
     let is_cmd = codex_path.to_lowercase().ends_with(".cmd");
     let is_ps1 = codex_path.to_lowercase().ends_with(".ps1");
     diagnose::log(format!(
@@ -722,8 +771,7 @@ fn resolve_windows_claude_path() -> String {
     "claude.cmd".to_string()
 }
 
-#[cfg(feature = "legacy-auto-refresh")]
-fn resolve_windows_codex_path() -> String {
+fn resolve_windows_codex_path() -> Option<String> {
     for name in &["codex.cmd", "codex.ps1", "codex.exe", "codex"] {
         if Command::new(name)
             .arg("--version")
@@ -733,7 +781,7 @@ fn resolve_windows_codex_path() -> String {
             .status()
             .is_ok()
         {
-            return name.to_string();
+            return Some(name.to_string());
         }
     }
 
@@ -748,14 +796,236 @@ fn resolve_windows_codex_path() -> String {
                 if let Some(first_line) = stdout.lines().next() {
                     let path = first_line.trim().to_string();
                     if !path.is_empty() {
-                        return path;
+                        return Some(path);
                     }
                 }
             }
         }
     }
 
-    "codex.cmd".to_string()
+    None
+}
+
+fn windows_codex_command(codex_path: &str) -> Command {
+    let lower = codex_path.to_ascii_lowercase();
+    if lower.ends_with(".cmd") || lower.ends_with(".bat") {
+        let mut command = Command::new("cmd.exe");
+        command.arg("/d").arg("/c").arg(codex_path);
+        command
+    } else if lower.ends_with(".ps1") {
+        let mut command = Command::new("powershell.exe");
+        command
+            .arg("-NoProfile")
+            .arg("-ExecutionPolicy")
+            .arg("Bypass")
+            .arg("-File")
+            .arg(codex_path);
+        command
+    } else {
+        Command::new(codex_path)
+    }
+}
+
+struct CodexAppServer {
+    child: Child,
+    stdin: Option<ChildStdin>,
+    messages: Receiver<CodexAppServerMessage>,
+    reader: Option<JoinHandle<()>>,
+}
+
+impl CodexAppServer {
+    fn start() -> Result<Self, CodexAppServerError> {
+        let codex_path = resolve_windows_codex_path().ok_or(CodexAppServerError::CliUnavailable)?;
+        let mut command = windows_codex_command(&codex_path);
+        command
+            .arg("app-server")
+            .arg("--stdio")
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+
+        let mut child = command
+            .spawn()
+            .map_err(|_| CodexAppServerError::StartFailed)?;
+        let Some(stdin) = child.stdin.take() else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(CodexAppServerError::StartFailed);
+        };
+        let Some(stdout) = child.stdout.take() else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(CodexAppServerError::StartFailed);
+        };
+        let (sender, messages) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                let Ok(line) = line else {
+                    let _ = sender.send(CodexAppServerMessage::ProtocolError);
+                    return;
+                };
+                match serde_json::from_str::<CodexAppServerResponse>(&line) {
+                    Ok(response) if response.id.is_some() => {
+                        if sender
+                            .send(CodexAppServerMessage::Response(response))
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(_) => {
+                        let _ = sender.send(CodexAppServerMessage::ProtocolError);
+                        return;
+                    }
+                }
+            }
+            let _ = sender.send(CodexAppServerMessage::EndOfStream);
+        });
+
+        Ok(Self {
+            child,
+            stdin: Some(stdin),
+            messages,
+            reader: Some(reader),
+        })
+    }
+
+    fn send(&mut self, message: &serde_json::Value) -> Result<(), CodexAppServerError> {
+        let stdin = self.stdin.as_mut().ok_or(CodexAppServerError::Protocol)?;
+        serde_json::to_writer(&mut *stdin, message).map_err(|_| CodexAppServerError::Protocol)?;
+        stdin
+            .write_all(b"\n")
+            .and_then(|_| stdin.flush())
+            .map_err(|_| CodexAppServerError::Protocol)
+    }
+
+    fn wait_for_response(
+        &self,
+        expected_id: u64,
+        deadline: Instant,
+    ) -> Result<CodexAppServerResponse, CodexAppServerError> {
+        loop {
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .ok_or(CodexAppServerError::Timeout)?;
+            match self.messages.recv_timeout(remaining) {
+                Ok(CodexAppServerMessage::Response(response)) => {
+                    if response.id.as_ref().and_then(serde_json::Value::as_u64) == Some(expected_id)
+                    {
+                        return Ok(response);
+                    }
+                }
+                Ok(CodexAppServerMessage::ProtocolError)
+                | Ok(CodexAppServerMessage::EndOfStream) => {
+                    return Err(CodexAppServerError::Protocol);
+                }
+                Err(RecvTimeoutError::Timeout) => {
+                    return Err(CodexAppServerError::Timeout);
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    return Err(CodexAppServerError::Protocol);
+                }
+            }
+        }
+    }
+}
+
+impl Drop for CodexAppServer {
+    fn drop(&mut self) {
+        self.stdin.take();
+        let deadline = Instant::now() + Duration::from_millis(250);
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                _ => {
+                    let _ = self.child.kill();
+                    let _ = self.child.wait();
+                    break;
+                }
+            }
+        }
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
+    }
+}
+
+fn fetch_codex_banked_reset_count() -> Result<Option<u64>, CodexAppServerError> {
+    let deadline = Instant::now() + CODEX_APP_SERVER_TIMEOUT;
+    let mut server = CodexAppServer::start()?;
+    server.send(&serde_json::json!({
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "clientInfo": {
+                "name": "ai-usage-monitor",
+                "version": env!("CARGO_PKG_VERSION")
+            }
+        }
+    }))?;
+    let initialized = server.wait_for_response(1, deadline)?;
+    if initialized.result.is_none() {
+        return Err(CodexAppServerError::InitializeFailed);
+    }
+
+    server.send(&serde_json::json!({ "method": "initialized" }))?;
+    server.send(&serde_json::json!({
+        "id": 2,
+        "method": "account/rateLimits/read"
+    }))?;
+    let response = server.wait_for_response(2, deadline)?;
+    banked_reset_count_from_response(response)
+}
+
+fn banked_reset_count_from_response(
+    response: CodexAppServerResponse,
+) -> Result<Option<u64>, CodexAppServerError> {
+    let result = response.result.ok_or(CodexAppServerError::Protocol)?;
+    Ok(result
+        .rate_limit_reset_credits
+        .map(|credits| credits.available_count))
+}
+
+fn log_codex_banked_reset_error(error: CodexAppServerError) {
+    let category = match error {
+        CodexAppServerError::CliUnavailable => "Codex CLI unavailable",
+        CodexAppServerError::StartFailed => "app-server start failed",
+        CodexAppServerError::InitializeFailed => "app-server initialize failed",
+        CodexAppServerError::Timeout => "app-server timeout",
+        CodexAppServerError::Protocol => "app-server protocol error",
+    };
+    diagnose::log(format!("Codex banked reset unavailable: {category}"));
+}
+
+fn cached_codex_banked_reset_count() -> Option<u64> {
+    static CACHE: OnceLock<Mutex<CodexBankedResetCache>> = OnceLock::new();
+
+    let now = Instant::now();
+    let mut cache = CACHE
+        .get_or_init(|| Mutex::new(CodexBankedResetCache::default()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if cache
+        .fetched_at
+        .is_some_and(|fetched_at| now.duration_since(fetched_at) < CODEX_BANKED_RESET_CACHE_TTL)
+    {
+        return cache.available_count;
+    }
+
+    cache.available_count = match fetch_codex_banked_reset_count() {
+        Ok(count) => count,
+        Err(error) => {
+            log_codex_banked_reset_error(error);
+            None
+        }
+    };
+    cache.fetched_at = Some(Instant::now());
+    cache.available_count
 }
 
 fn build_agent() -> Result<ureq::Agent, PollError> {
@@ -1087,6 +1357,24 @@ fn fetch_codex_usage(token: &str, account_id: Option<&str>) -> Result<UsageData,
     };
 
     codex_usage_from_response(response).ok_or(PollError::RequestFailed)
+}
+
+fn fetch_codex_usage_with_banked_reset(
+    token: &str,
+    account_id: Option<&str>,
+) -> Result<UsageData, PollError> {
+    let usage = fetch_codex_usage(token, account_id)?;
+    Ok(with_banked_reset_count(
+        usage,
+        cached_codex_banked_reset_count(),
+    ))
+}
+
+fn with_banked_reset_count(mut usage: UsageData, available_count: Option<u64>) -> UsageData {
+    usage.banked_reset_count = available_count
+        .map(BankedResetCount::Available)
+        .unwrap_or(BankedResetCount::Unavailable);
+    usage
 }
 
 /// AUM-CODEX-WINDOW-CLASSIFICATION-HF2: the 5h/session window's real length,
@@ -2178,6 +2466,87 @@ mod tests {
         assert!(usage.session_available());
         assert_eq!(usage.session.percentage, 0.0);
         assert!(!usage.weekly_available());
+    }
+
+    fn reset_count_from_json(json: &str) -> Result<Option<u64>, CodexAppServerError> {
+        let response = serde_json::from_str::<CodexAppServerResponse>(json)
+            .map_err(|_| CodexAppServerError::Protocol)?;
+        banked_reset_count_from_response(response)
+    }
+
+    #[test]
+    fn codex_banked_reset_available_count_one_is_preserved() {
+        let count = reset_count_from_json(
+            r#"{"id":2,"result":{"rateLimits":{},"rateLimitResetCredits":{"availableCount":1,"credits":null}}}"#,
+        )
+        .expect("valid app-server response should parse");
+
+        assert_eq!(count, Some(1));
+    }
+
+    #[test]
+    fn codex_banked_reset_available_count_zero_is_preserved() {
+        let count = reset_count_from_json(
+            r#"{"id":2,"result":{"rateLimits":{},"rateLimitResetCredits":{"availableCount":0}}}"#,
+        )
+        .expect("valid app-server response should parse");
+
+        assert_eq!(count, Some(0));
+    }
+
+    #[test]
+    fn codex_banked_reset_missing_or_null_is_unavailable() {
+        let missing = reset_count_from_json(r#"{"id":2,"result":{"rateLimits":{}}}"#)
+            .expect("missing optional field should parse");
+        let null = reset_count_from_json(
+            r#"{"id":2,"result":{"rateLimits":{},"rateLimitResetCredits":null}}"#,
+        )
+        .expect("null optional field should parse");
+
+        assert_eq!(missing, None);
+        assert_eq!(null, None);
+    }
+
+    #[test]
+    fn codex_banked_reset_uses_summary_count_not_detail_rows() {
+        let count = reset_count_from_json(
+            r#"{"id":2,"result":{"rateLimits":{},"rateLimitResetCredits":{"availableCount":3,"credits":[{}]}}}"#,
+        )
+        .expect("detail rows should be ignored");
+
+        assert_eq!(count, Some(3));
+    }
+
+    #[test]
+    fn codex_banked_reset_malformed_summary_is_a_protocol_error() {
+        let result = reset_count_from_json(
+            r#"{"id":2,"result":{"rateLimits":{},"rateLimitResetCredits":{}}}"#,
+        );
+
+        assert_eq!(result, Err(CodexAppServerError::Protocol));
+    }
+
+    #[test]
+    fn codex_banked_reset_protocol_failure_does_not_remove_existing_usage() {
+        let usage = usage_with_session_percent(42.0);
+        let response = serde_json::from_str::<CodexAppServerResponse>(
+            r#"{"id":2,"error":{"code":-32603,"message":"request failed"}}"#,
+        )
+        .expect("error envelope should parse without retaining its contents");
+        let count = banked_reset_count_from_response(response).ok().flatten();
+        let usage = with_banked_reset_count(usage, count);
+
+        assert!(usage.session_available());
+        assert_eq!(usage.session.percentage, 42.0);
+        assert_eq!(usage.banked_reset_count, BankedResetCount::Unavailable);
+    }
+
+    #[test]
+    fn codex_banked_reset_count_is_independent_of_credit_details() {
+        let usage = with_banked_reset_count(usage_with_session_percent(42.0), Some(2));
+
+        assert_eq!(usage.banked_reset_count, BankedResetCount::Available(2));
+        assert!(usage.session_available());
     }
 
     #[test]

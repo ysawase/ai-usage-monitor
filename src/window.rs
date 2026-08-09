@@ -20,7 +20,7 @@ use crate::diagnose;
 use crate::localization::{self, LanguageId, Strings};
 #[cfg(test)]
 use crate::models::UsageData;
-use crate::models::{AppUsageData, UsageSection};
+use crate::models::{AppUsageData, BankedResetCount, UsageSection};
 #[cfg(feature = "self-update")]
 use crate::native_interop::TIMER_UPDATE_CHECK;
 use crate::native_interop::{
@@ -87,6 +87,8 @@ struct AppState {
     codex_weekly_text: String,
     codex_weekly_pace: Option<PaceGuidanceLines>,
     codex_weekly_remaining_text: Option<String>,
+    codex_banked_reset_count: BankedResetCount,
+    codex_banked_reset_text: String,
     antigravity_session_state: CellState,
     antigravity_session_percent: Option<f64>,
     antigravity_session_text: String,
@@ -336,6 +338,15 @@ fn status_text(state: CellState, strings: Strings) -> &'static str {
     }
 }
 
+fn format_banked_reset_text(count: BankedResetCount, strings: Strings) -> String {
+    match count {
+        BankedResetCount::Available(count) => format!("{}: {count}", strings.full_reset),
+        BankedResetCount::Unavailable => {
+            format!("{}: {}", strings.full_reset, strings.not_available)
+        }
+    }
+}
+
 fn render_cell(
     state: CellState,
     section: Option<&UsageSection>,
@@ -385,6 +396,15 @@ fn poll_cell_states(outcome: &poller::ProviderPollOutcome) -> (CellState, CellSt
             (state, state)
         }
         poller::ProviderPollOutcome::Disabled => (CellState::NotAvailable, CellState::NotAvailable),
+    }
+}
+
+fn banked_reset_count_for_poll(outcome: &poller::ProviderPollOutcome) -> BankedResetCount {
+    match outcome {
+        poller::ProviderPollOutcome::Success { usage, .. } => usage.banked_reset_count,
+        poller::ProviderPollOutcome::Disabled | poller::ProviderPollOutcome::Error { .. } => {
+            BankedResetCount::Unavailable
+        }
     }
 }
 
@@ -1985,6 +2005,8 @@ fn refresh_usage_texts(state: &mut AppState) {
         now,
         strings,
     );
+    state.codex_banked_reset_text =
+        format_banked_reset_text(state.codex_banked_reset_count, strings);
 
     let antigravity = data.and_then(|d| d.antigravity.as_ref());
     let antigravity_session = render_cell(
@@ -3200,6 +3222,8 @@ pub fn run() {
                 codex_weekly_text: String::new(),
                 codex_weekly_pace: None,
                 codex_weekly_remaining_text: None,
+                codex_banked_reset_count: BankedResetCount::Unavailable,
+                codex_banked_reset_text: String::new(),
                 antigravity_session_state: CellState::Loading,
                 antigravity_session_percent: None,
                 antigravity_session_text: String::new(),
@@ -3340,6 +3364,7 @@ fn render_layered() {
         codex_weekly_text,
         codex_weekly_pace,
         codex_weekly_remaining_text,
+        codex_banked_reset_text,
         antigravity_session_state,
         antigravity_session_pct,
         antigravity_session_text,
@@ -3378,6 +3403,7 @@ fn render_layered() {
                 s.codex_weekly_text.clone(),
                 s.codex_weekly_pace.clone(),
                 s.codex_weekly_remaining_text.clone(),
+                s.codex_banked_reset_text.clone(),
                 s.antigravity_session_state,
                 s.antigravity_session_percent,
                 s.antigravity_session_text.clone(),
@@ -3479,6 +3505,7 @@ fn render_layered() {
             &codex_weekly_text,
             codex_weekly_pace.as_ref(),
             codex_weekly_remaining_text.as_deref(),
+            &codex_banked_reset_text,
             antigravity_session_state,
             antigravity_session_pct,
             &antigravity_session_text,
@@ -3575,6 +3602,7 @@ fn paint_content(
     codex_weekly_text: &str,
     codex_weekly_pace: Option<&PaceGuidanceLines>,
     codex_weekly_remaining_text: Option<&str>,
+    codex_banked_reset_text: &str,
     antigravity_session_state: CellState,
     antigravity_session_pct: Option<f64>,
     antigravity_session_text: &str,
@@ -3742,6 +3770,7 @@ fn paint_content(
             weekly_remaining_text,
             codex_weekly_remaining_text,
             antigravity_weekly_remaining_text,
+            codex_banked_reset_text,
         );
 
         // AUM-PACE-GUIDANCE-01: when a provider has usable weekly pace
@@ -4007,6 +4036,7 @@ fn do_poll(send_hwnd: SendHwnd) {
                 let (codex_session_state, codex_weekly_state) = poll_cell_states(&report.codex);
                 s.codex_session_state = codex_session_state;
                 s.codex_weekly_state = codex_weekly_state;
+                s.codex_banked_reset_count = banked_reset_count_for_poll(&report.codex);
                 let (antigravity_session_state, antigravity_weekly_state) =
                     poll_cell_states(&report.antigravity);
                 s.antigravity_session_state = antigravity_session_state;
@@ -4081,6 +4111,7 @@ fn do_poll(send_hwnd: SendHwnd) {
                     let (codex_session_state, codex_weekly_state) = poll_cell_states(&report.codex);
                     s.codex_session_state = codex_session_state;
                     s.codex_weekly_state = codex_weekly_state;
+                    s.codex_banked_reset_count = banked_reset_count_for_poll(&report.codex);
                     let (antigravity_session_state, antigravity_weekly_state) =
                         poll_cell_states(&report.antigravity);
                     s.antigravity_session_state = antigravity_session_state;
@@ -5772,6 +5803,7 @@ fn paint(hdc: HDC, hwnd: HWND) {
         codex_weekly_text,
         codex_weekly_pace,
         codex_weekly_remaining_text,
+        codex_banked_reset_text,
         antigravity_session_state,
         antigravity_session_pct,
         antigravity_session_text,
@@ -5807,6 +5839,7 @@ fn paint(hdc: HDC, hwnd: HWND) {
                 s.codex_weekly_text.clone(),
                 s.codex_weekly_pace.clone(),
                 s.codex_weekly_remaining_text.clone(),
+                s.codex_banked_reset_text.clone(),
                 s.antigravity_session_state,
                 s.antigravity_session_percent,
                 s.antigravity_session_text.clone(),
@@ -5876,6 +5909,7 @@ fn paint(hdc: HDC, hwnd: HWND) {
             &codex_weekly_text,
             codex_weekly_pace.as_ref(),
             codex_weekly_remaining_text.as_deref(),
+            &codex_banked_reset_text,
             antigravity_session_state,
             antigravity_session_pct,
             &antigravity_session_text,
@@ -5926,6 +5960,7 @@ fn draw_provider_header_row(
     claude_weekly_remaining: Option<&str>,
     codex_weekly_remaining: Option<&str>,
     antigravity_weekly_remaining: Option<&str>,
+    codex_banked_reset_text: &str,
 ) {
     let active_models = active_model_count(show_claude_code, show_codex, show_antigravity);
     let segment_count = row_bar_segment_count(active_models);
@@ -5950,7 +5985,8 @@ fn draw_provider_header_row(
             model_x += column_width + sc(MODEL_RIGHT_MARGIN);
         }
         if show_codex {
-            draw_header_label(hdc, model_x, y, column_width, strings.codex_model);
+            let codex_header = format!("{} · {}", strings.codex_model, codex_banked_reset_text);
+            draw_header_label(hdc, model_x, y, column_width, &codex_header);
             if show_weekly_remaining {
                 draw_header_remaining_if_fits(
                     hdc,
@@ -5958,7 +5994,7 @@ fn draw_provider_header_row(
                     y,
                     column_width,
                     !show_antigravity,
-                    strings.codex_model,
+                    &codex_header,
                     codex_weekly_remaining,
                 );
             }
@@ -5994,7 +6030,7 @@ fn draw_header_label(hdc: HDC, x: i32, y: i32, width: i32, label: &str) {
             hdc,
             &mut label_wide,
             &mut label_rect,
-            DT_LEFT | DT_VCENTER | DT_SINGLELINE,
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
         );
     }
 }
@@ -6751,6 +6787,31 @@ mod tests {
         assert_eq!(display_value(DisplayBasis::UsedPercentage, 150.0), 100.0);
         assert_eq!(display_value(DisplayBasis::RemainingAllowance, -5.0), 100.0);
         assert_eq!(display_value(DisplayBasis::RemainingAllowance, 150.0), 0.0);
+    }
+
+    #[test]
+    fn banked_reset_text_distinguishes_zero_one_and_unavailable() {
+        let strings = LanguageId::English.strings();
+
+        assert_eq!(
+            format_banked_reset_text(BankedResetCount::Available(0), strings),
+            "Full reset: 0"
+        );
+        assert_eq!(
+            format_banked_reset_text(BankedResetCount::Available(1), strings),
+            "Full reset: 1"
+        );
+        assert_eq!(
+            format_banked_reset_text(BankedResetCount::Unavailable, strings),
+            "Full reset: Not available"
+        );
+    }
+
+    #[test]
+    fn every_language_has_a_full_reset_label() {
+        for language in LanguageId::ALL {
+            assert!(!language.strings().full_reset.trim().is_empty());
+        }
     }
 
     #[test]

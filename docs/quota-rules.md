@@ -1,7 +1,7 @@
 # Quota Rules
 
-`Quota rules revision: 2026-08-08-01`
-`Last verified: 2026-08-08`
+`Quota rules revision: 2026-08-09-01`
+`Last verified: 2026-08-09`
 
 This is the specification of record for how this app interprets and labels
 provider usage data. It is not user-facing copy — README stays short and
@@ -67,16 +67,37 @@ in — do not invent a different shape per provider.
 |---|---|
 | Display name | ChatGPT |
 | Internal identifier | `codex` (`AppUsageData.codex`), `poll_codex`, `codex_usage_from_response`, `apply_codex_window` |
-| Source | `https://chatgpt.com/backend-api/wham/usage`, authenticated with the Codex CLI's OAuth token, sent with a `ChatGPT-Account-Id` header |
+| Source | 5h/7d usage: `https://chatgpt.com/backend-api/wham/usage`, authenticated with the Codex CLI's OAuth token and a `ChatGPT-Account-Id` header. Banked Full reset count: the stable Codex app-server method `account/rateLimits/read` |
 | Quota scope | Shared — the fetch target is literally the ChatGPT backend, reached via the Codex CLI's credentials |
 | Short window | Window classified by `limit_window_seconds == 18_000` (5 hours), independent of window position in the API response |
 | Long window | Window classified by `limit_window_seconds == 604_800` (7 days), independent of window position in the API response |
-| Fallback behavior | None |
-| Unavailable conditions | No Codex CLI credentials found |
-| Minimum fetchable unit | A single aggregate percentage + reset time per window |
+| Fallback behavior | None for 5h/7d usage. Banked reset retrieval is isolated: if the CLI, app-server lifecycle, timeout, protocol, or response shape fails, only the Full reset count becomes unavailable and the existing usage windows remain valid |
+| Unavailable conditions | No Codex CLI credentials found for usage. The Full reset count is independently unavailable when `rateLimitResetCredits` or `availableCount` cannot be obtained; unavailable is not converted to zero |
+| Minimum fetchable unit | A single aggregate percentage + reset time per usage window, plus `rateLimitResetCredits.availableCount` for banked resets |
 | Display caveats | The label reads "ChatGPT" but the data is fetched through the Codex CLI's login — displayed this way because the endpoint and account are ChatGPT's, not because this is a separate ChatGPT-app-specific integration |
-| Last verified | 2026-08-08 |
-| Rule revision | 2026-08-08-01 |
+| Last verified | 2026-08-09 |
+| Rule revision | 2026-08-09-01 |
+
+Banked reset rules:
+
+- The count authority is `rateLimitResetCredits.availableCount`; the number of
+  optional credit detail rows is never used as the count.
+- The monitor checks banked resets only from the existing provider refresh and
+  caches the result for five minutes. When that cache expires, it starts
+  `codex app-server`, sends `initialize`, `initialized`, and
+  `account/rateLimits/read`, then closes the subprocess. It does not add a
+  separate high-frequency timer.
+- Private backend endpoints are not called, and reset consume/redeem operations
+  are never invoked.
+- Raw app-server responses, credit IDs, auth tokens, cookies, and credentials
+  are not logged or displayed. Credit detail rows and expiry metadata are not
+  retained by the UI data model.
+- If app-server retrieval fails or the reset-credit field is absent or
+  malformed, Full reset is unavailable while the already-fetched 5h/7d usage
+  remains unchanged.
+- Final live-protocol verification on 2026-08-09 confirmed the stable method
+  and `availableCount` shape; the implementation relies only on that minimum
+  shape.
 
 ### Antigravity
 
@@ -126,4 +147,5 @@ column that misrepresents what is actually being measured.
 
 | Revision | Date | Change |
 |---|---|---|
+| 2026-08-09-01 | 2026-08-09 | Adds the ChatGPT/Codex banked Full reset count from the stable app-server method, including zero-vs-unavailable semantics, lifecycle, failure isolation, refresh, and non-retention rules. |
 | 2026-08-08-01 | 2026-08-08 | Initial version. Documents Claude, ChatGPT, and Antigravity as of the `Claude Code`→`Claude` and `Codex`→`ChatGPT` display-label changes, and the Antigravity release-build feature-flag fix. |
