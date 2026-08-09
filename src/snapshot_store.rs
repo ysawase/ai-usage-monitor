@@ -637,7 +637,8 @@ mod tests {
     use std::{ffi::OsString, os::windows::ffi::OsStringExt};
 
     use crate::snapshot_schema::{
-        deserialize_validated_snapshot, ProviderSnapshot, Providers, SnapshotV1,
+        deserialize_validated_snapshot, ProviderSnapshot, ProviderSource, ProviderUsage, Providers,
+        SnapshotV1, UsageWindow,
     };
 
     static TEST_DIRECTORY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -703,6 +704,28 @@ mod tests {
                 ProviderSnapshot::disabled(),
                 ProviderSnapshot::disabled(),
                 ProviderSnapshot::disabled(),
+            ),
+        )
+    }
+
+    fn antigravity_snapshot(machine_id: &str, generated_at: u64) -> SnapshotV1 {
+        SnapshotV1::new(
+            machine_id.to_string(),
+            generated_at,
+            generated_at,
+            generated_at,
+            Providers::new(
+                ProviderSnapshot::disabled(),
+                ProviderSnapshot::disabled(),
+                ProviderSnapshot::success(
+                    ProviderSource::AntigravityQuotaUsage,
+                    generated_at,
+                    generated_at,
+                    ProviderUsage::new(
+                        Some(UsageWindow::new(Some(42.5), Some(generated_at + 1_000))),
+                        None,
+                    ),
+                ),
             ),
         )
     }
@@ -1624,6 +1647,31 @@ mod tests {
                 history: PersistResult::Saved,
             }
         );
+        let current_json = fs::read_to_string(paths.current_snapshot()).unwrap();
+        assert_eq!(
+            deserialize_validated_snapshot(&current_json).unwrap(),
+            expected
+        );
+        let history_bytes = fs::read(paths.history()).unwrap();
+        let lines = history_entries(&history_bytes);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(deserialize_validated_snapshot(lines[0]).unwrap(), expected);
+    }
+
+    #[test]
+    fn persist_snapshot_saves_and_reads_antigravity_usage() {
+        let root = TestRoot::uncreated("persist-antigravity");
+        let paths = root.snapshot_paths();
+        let expected = antigravity_snapshot("home", 1_725_000_000_200);
+
+        assert_eq!(
+            persist_snapshot(&paths, &expected),
+            SnapshotPersistOutcome {
+                current: PersistResult::Saved,
+                history: PersistResult::Saved,
+            }
+        );
+
         let current_json = fs::read_to_string(paths.current_snapshot()).unwrap();
         assert_eq!(
             deserialize_validated_snapshot(&current_json).unwrap(),

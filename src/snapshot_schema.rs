@@ -16,7 +16,6 @@ const MAX_PROVIDER_ERROR_MESSAGE_LEN: usize = 32;
 pub(crate) enum SnapshotConversionError {
     TimestampBeforeUnixEpoch,
     TimestampMillisOverflow,
-    UnsupportedProviderSource,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -111,7 +110,7 @@ fn provider_snapshot_from_outcome(
             acquired_at,
             usage,
         } => Ok(ProviderSnapshot::success(
-            provider_source(*source)?,
+            provider_source(*source),
             system_time_to_unix_millis(*attempted_at)?,
             system_time_to_unix_millis(*acquired_at)?,
             provider_usage(usage)?,
@@ -121,20 +120,18 @@ fn provider_snapshot_from_outcome(
             attempted_at,
             error,
         } => Ok(ProviderSnapshot::error(
-            Some(provider_source(*source)?),
+            Some(provider_source(*source)),
             system_time_to_unix_millis(*attempted_at)?,
             provider_error(*error),
         )),
     }
 }
 
-fn provider_source(source: ProviderPollSource) -> Result<ProviderSource, SnapshotConversionError> {
+fn provider_source(source: ProviderPollSource) -> ProviderSource {
     match source {
-        ProviderPollSource::AnthropicOauthUsage => Ok(ProviderSource::AnthropicOauthUsage),
-        ProviderPollSource::ChatgptWhamUsage => Ok(ProviderSource::ChatgptWhamUsage),
-        ProviderPollSource::AntigravityQuotaUsage => {
-            Err(SnapshotConversionError::UnsupportedProviderSource)
-        }
+        ProviderPollSource::AnthropicOauthUsage => ProviderSource::AnthropicOauthUsage,
+        ProviderPollSource::ChatgptWhamUsage => ProviderSource::ChatgptWhamUsage,
+        ProviderPollSource::AntigravityQuotaUsage => ProviderSource::AntigravityQuotaUsage,
     }
 }
 
@@ -296,7 +293,8 @@ impl Providers {
             .validate(Some(ProviderSource::AnthropicOauthUsage))?;
         self.codex
             .validate(Some(ProviderSource::ChatgptWhamUsage))?;
-        self.antigravity.validate(None)
+        self.antigravity
+            .validate(Some(ProviderSource::AntigravityQuotaUsage))
     }
 }
 
@@ -463,6 +461,7 @@ pub enum ProviderStatus {
 pub enum ProviderSource {
     AnthropicOauthUsage,
     ChatgptWhamUsage,
+    AntigravityQuotaUsage,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -759,6 +758,10 @@ mod tests {
             json!("chatgpt_wham_usage")
         );
         assert_eq!(
+            serde_json::to_value(ProviderSource::AntigravityQuotaUsage).unwrap(),
+            json!("antigravity_quota_usage")
+        );
+        assert_eq!(
             serde_json::to_value(ProviderErrorCode::AuthRequired).unwrap(),
             json!("auth_required")
         );
@@ -1041,7 +1044,7 @@ mod tests {
     }
 
     #[test]
-    fn validation_rejects_non_disabled_antigravity() {
+    fn validation_accepts_non_disabled_antigravity_with_expected_source() {
         let snapshot = SnapshotV1::new(
             "home".to_string(),
             1_725_000_000_200,
@@ -1051,17 +1054,14 @@ mod tests {
                 ProviderSnapshot::disabled(),
                 ProviderSnapshot::disabled(),
                 ProviderSnapshot::error(
-                    None,
+                    Some(ProviderSource::AntigravityQuotaUsage),
                     1_725_000_000_000,
                     ProviderError::from_code(ProviderErrorCode::RequestFailed),
                 ),
             ),
         );
 
-        assert_eq!(
-            snapshot.validate(),
-            Err(SnapshotValidationError::InvalidProviderSource)
-        );
+        assert_eq!(snapshot.validate(), Ok(()));
     }
 
     #[test]
@@ -1544,7 +1544,7 @@ mod tests {
     }
 
     #[test]
-    fn non_disabled_antigravity_is_rejected_by_schema_v1() {
+    fn non_disabled_antigravity_builds_and_round_trips_in_schema_v1() {
         let report = PollReport {
             claude_code: ProviderPollOutcome::Disabled,
             codex: ProviderPollOutcome::Disabled,
@@ -1554,9 +1554,90 @@ mod tests {
             ),
         };
 
+        let snapshot =
+            snapshot_from_poll_report(&machine_id(), &report, at_millis(1_725_000_000_200))
+                .expect("known Antigravity source should not reject the whole snapshot");
+        assert_eq!(snapshot.validate(), Ok(()));
+
+        let json = serde_json::to_string(&snapshot).expect("snapshot should serialize");
+        let value: Value = serde_json::from_str(&json).expect("snapshot JSON should parse");
+        let provider = &value["providers"]["antigravity"];
+        assert_eq!(provider["requested"], json!(true));
+        assert_eq!(provider["status"], json!("success"));
+        assert_eq!(provider["source"], json!("antigravity_quota_usage"));
+        assert_eq!(provider["usage"]["session"]["used_percent"], json!(1.0));
+        assert_eq!(provider["usage"]["weekly"], Value::Null);
         assert_eq!(
-            snapshot_from_poll_report(&machine_id(), &report, at_millis(1_725_000_000_200)),
-            Err(SnapshotConversionError::UnsupportedProviderSource)
+            deserialize_validated_snapshot(&json).expect("snapshot should deserialize"),
+            snapshot
+        );
+    }
+
+    #[test]
+    fn antigravity_error_and_disabled_remain_distinct() {
+        let error_report = PollReport {
+            claude_code: success_outcome(
+                ProviderPollSource::AnthropicOauthUsage,
+                poll_usage(Some((10.0, None)), None),
+            ),
+            codex: ProviderPollOutcome::Disabled,
+            antigravity: error_outcome(
+                ProviderPollSource::AntigravityQuotaUsage,
+                PollError::RequestFailed,
+            ),
+        };
+        let error_value = converted_value(&error_report);
+        let unavailable = &error_value["providers"]["antigravity"];
+        assert_eq!(unavailable["requested"], json!(true));
+        assert_eq!(unavailable["status"], json!("error"));
+        assert_eq!(unavailable["source"], json!("antigravity_quota_usage"));
+        assert_eq!(unavailable["usage"], Value::Null);
+        assert_eq!(unavailable["error"]["code"], json!("request_failed"));
+
+        let disabled_report = PollReport {
+            claude_code: ProviderPollOutcome::Disabled,
+            codex: ProviderPollOutcome::Disabled,
+            antigravity: ProviderPollOutcome::Disabled,
+        };
+        let disabled_value = converted_value(&disabled_report);
+        let disabled = &disabled_value["providers"]["antigravity"];
+        assert_eq!(disabled["requested"], json!(false));
+        assert_eq!(disabled["status"], json!("disabled"));
+        assert_eq!(disabled["source"], Value::Null);
+        assert_eq!(disabled["error"], Value::Null);
+    }
+
+    #[test]
+    fn mixed_provider_snapshot_with_antigravity_validates() {
+        let report = PollReport {
+            claude_code: success_outcome(
+                ProviderPollSource::AnthropicOauthUsage,
+                poll_usage(Some((10.0, None)), Some((20.0, None))),
+            ),
+            codex: success_outcome(
+                ProviderPollSource::ChatgptWhamUsage,
+                poll_usage(Some((30.0, None)), Some((40.0, None))),
+            ),
+            antigravity: success_outcome(
+                ProviderPollSource::AntigravityQuotaUsage,
+                poll_usage(Some((50.0, None)), Some((60.0, None))),
+            ),
+        };
+
+        let snapshot =
+            snapshot_from_poll_report(&machine_id(), &report, at_millis(1_725_000_000_200))
+                .expect("all known providers should convert together");
+        assert_eq!(snapshot.validate(), Ok(()));
+    }
+
+    #[test]
+    fn pre_antigravity_source_v1_snapshot_still_deserializes() {
+        let snapshot = snapshot_with(ProviderSnapshot::disabled());
+        let json = serde_json::to_string(&snapshot).expect("legacy v1 snapshot should serialize");
+
+        assert_eq!(
+            deserialize_validated_snapshot(&json).expect("legacy v1 snapshot should remain valid"),
+            snapshot
         );
     }
 }

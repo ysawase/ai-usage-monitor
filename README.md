@@ -159,7 +159,7 @@ What the app stores locally:
 - Last update check time
 - Displayed model preferences
 - A local, app-specific machine ID (a random identifier generated on this PC, not a hardware or OS ID)
-- Usage snapshots for Claude Code and Codex. Antigravity snapshot storage is not supported yet.
+- Usage snapshots for Claude Code, Codex, and Antigravity.
 
 Usage snapshots and the machine ID are stored under:
 
