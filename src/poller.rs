@@ -4,10 +4,11 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 #[cfg(feature = "antigravity")]
 use std::ffi::c_void;
+use std::ffi::OsStr;
 #[cfg(feature = "antigravity")]
 use std::hash::{Hash, Hasher};
 use std::io::{BufRead, BufReader, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Mutex, OnceLock};
@@ -22,6 +23,7 @@ use crate::localization::Strings;
 use crate::models::{
     AppUsageData, BankedResetCount, QuotaFamily, QuotaFamilyId, QuotaFamilyStatus, QuotaItem,
     QuotaItemAvailability, QuotaMetric, QuotaUnit, UsageData, UsageSection,
+    GITHUB_COPILOT_MONTHLY_ITEM_ID,
 };
 
 const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
@@ -621,7 +623,7 @@ fn poll_github_copilot(plan: GithubCopilotPlan) -> Result<UsageData, PollError> 
 }
 
 fn run_gh_api(args: &[&str]) -> Result<String, PollError> {
-    let mut command = Command::new("gh.exe");
+    let mut command = Command::new(resolve_github_cli_executable());
     command
         .arg("api")
         .args(args)
@@ -634,6 +636,43 @@ fn run_gh_api(args: &[&str]) -> Result<String, PollError> {
         return Err(PollError::AuthRequired);
     }
     String::from_utf8(output.stdout).map_err(|_| PollError::RequestFailed)
+}
+
+fn resolve_github_cli_executable() -> PathBuf {
+    let path = std::env::var_os("PATH");
+    let program_files = std::env::var_os("ProgramFiles");
+    resolve_github_cli_executable_with(path.as_deref(), program_files.as_deref(), |candidate| {
+        candidate.is_file()
+    })
+}
+
+fn resolve_github_cli_executable_with<F>(
+    path: Option<&OsStr>,
+    program_files: Option<&OsStr>,
+    is_file: F,
+) -> PathBuf
+where
+    F: Fn(&Path) -> bool,
+{
+    if let Some(path) = path {
+        for directory in std::env::split_paths(path) {
+            let candidate = directory.join("gh.exe");
+            if is_file(&candidate) {
+                return candidate;
+            }
+        }
+    }
+
+    if let Some(program_files) = program_files {
+        let candidate = PathBuf::from(program_files)
+            .join("GitHub CLI")
+            .join("gh.exe");
+        if is_file(&candidate) {
+            return candidate;
+        }
+    }
+
+    PathBuf::from("gh.exe")
 }
 
 fn github_copilot_usage_from_response(
@@ -668,7 +707,7 @@ fn github_copilot_usage_from_response(
         limit: plan.allowance(),
     };
     Ok(UsageData::from_quota_items(vec![QuotaItem {
-        id: "monthly_ai_credits".to_string(),
+        id: GITHUB_COPILOT_MONTHLY_ITEM_ID.to_string(),
         label: "Monthly AI credits".to_string(),
         availability: QuotaItemAvailability::Available,
         metric: Some(metric),
@@ -3024,6 +3063,7 @@ mod tests {
             github_copilot_usage_from_response(response, GithubCopilotPlan::Pro, UNIX_EPOCH)
                 .expect("Copilot credit rows should aggregate");
         let item = usage.quota_items().pop().unwrap();
+        assert_eq!(item.id, GITHUB_COPILOT_MONTHLY_ITEM_ID);
         assert_eq!(
             item.metric,
             Some(QuotaMetric::Used {
@@ -3031,6 +3071,28 @@ mod tests {
                 limit: Some(1_500.0),
             })
         );
+    }
+
+    #[test]
+    fn github_cli_resolution_prefers_path_then_standard_program_files_install() {
+        let path = std::ffi::OsString::from(r"C:\custom-gh;C:\other");
+        let program_files = std::ffi::OsString::from(r"C:\Program Files");
+        let path_candidate = PathBuf::from(r"C:\custom-gh\gh.exe");
+        let standard_candidate = PathBuf::from(r"C:\Program Files\GitHub CLI\gh.exe");
+
+        let resolved = resolve_github_cli_executable_with(
+            Some(path.as_os_str()),
+            Some(program_files.as_os_str()),
+            |candidate| candidate == path_candidate || candidate == standard_candidate,
+        );
+        assert_eq!(resolved, path_candidate);
+
+        let resolved = resolve_github_cli_executable_with(
+            Some(path.as_os_str()),
+            Some(program_files.as_os_str()),
+            |candidate| candidate == standard_candidate,
+        );
+        assert_eq!(resolved, standard_candidate);
     }
 
     #[test]

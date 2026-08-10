@@ -1,5 +1,7 @@
 use std::time::SystemTime;
 
+pub const GITHUB_COPILOT_MONTHLY_ITEM_ID: &str = "monthly_ai_credits";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum QuotaFamilyId {
     Claude,

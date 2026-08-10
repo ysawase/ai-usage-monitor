@@ -20,6 +20,7 @@ use crate::diagnose;
 use crate::localization::{self, LanguageId, Strings};
 #[cfg(test)]
 use crate::models::UsageData;
+use crate::models::GITHUB_COPILOT_MONTHLY_ITEM_ID;
 use crate::models::{AppUsageData, BankedResetCount, QuotaFamilyId, QuotaMetric, UsageSection};
 #[cfg(feature = "self-update")]
 use crate::native_interop::TIMER_UPDATE_CHECK;
@@ -1289,6 +1290,25 @@ fn app_theme_for_menu_id(id: u16) -> Option<AppTheme> {
     }
 }
 
+fn github_copilot_plan_for_menu_id(id: u16) -> Option<poller::GithubCopilotPlan> {
+    match id {
+        IDM_GITHUB_COPILOT_PLAN_UNKNOWN => Some(poller::GithubCopilotPlan::Unknown),
+        IDM_GITHUB_COPILOT_PLAN_PRO => Some(poller::GithubCopilotPlan::Pro),
+        IDM_GITHUB_COPILOT_PLAN_PRO_PLUS => Some(poller::GithubCopilotPlan::ProPlus),
+        IDM_GITHUB_COPILOT_PLAN_MAX => Some(poller::GithubCopilotPlan::Max),
+        _ => None,
+    }
+}
+
+fn apply_github_copilot_plan_selection(
+    show_github_copilot: &mut bool,
+    github_copilot_plan: &mut poller::GithubCopilotPlan,
+    plan: poller::GithubCopilotPlan,
+) {
+    *show_github_copilot = true;
+    *github_copilot_plan = plan;
+}
+
 const WM_DPICHANGED_MSG: u32 = 0x02E0;
 #[cfg(feature = "self-update")]
 const WM_APP_UPDATE_CHECK_COMPLETE: u32 = WM_APP + 2;
@@ -1626,6 +1646,7 @@ fn load_settings() -> SettingsFile {
         Err(_) => return SettingsFile::default(),
     };
     let mut settings: SettingsFile = serde_json::from_str(&content).unwrap_or_default();
+    normalize_github_copilot_settings(&mut settings);
     #[cfg(not(feature = "antigravity"))]
     {
         settings.show_antigravity = false;
@@ -1638,6 +1659,12 @@ fn load_settings() -> SettingsFile {
         settings.show_claude_code = true;
     }
     settings
+}
+
+fn normalize_github_copilot_settings(settings: &mut SettingsFile) {
+    if settings.github_copilot_plan != poller::GithubCopilotPlan::Unknown {
+        settings.show_github_copilot = true;
+    }
 }
 
 fn save_settings(settings: &SettingsFile) {
@@ -1748,7 +1775,7 @@ fn tray_icon_data_from_state() -> Vec<tray_icon::TrayIconData> {
                 .data
                 .as_ref()
                 .and_then(|data| data.family(QuotaFamilyId::GithubCopilot))
-                .and_then(|family| family.item("monthly_ai_credits"));
+                .and_then(|family| family.item(GITHUB_COPILOT_MONTHLY_ITEM_ID));
             let github_copilot_used = render_generic_quota_item(
                 s.github_copilot_state,
                 github_copilot_item,
@@ -2175,7 +2202,7 @@ fn refresh_usage_texts(state: &mut AppState) {
 
     let github_copilot_item = data
         .and_then(|data| data.family(QuotaFamilyId::GithubCopilot))
-        .and_then(|family| family.item("monthly"));
+        .and_then(|family| family.item(GITHUB_COPILOT_MONTHLY_ITEM_ID));
     let github_copilot = render_generic_quota_item(
         state.github_copilot_state,
         github_copilot_item,
@@ -5409,6 +5436,10 @@ unsafe extern "system" fn wnd_proc(
                                         || !s.show_github_copilot
                                     {
                                         s.show_github_copilot = !s.show_github_copilot;
+                                        if !s.show_github_copilot {
+                                            s.github_copilot_plan =
+                                                poller::GithubCopilotPlan::Unknown;
+                                        }
                                     }
                                 }
                                 _ => {}
@@ -5467,21 +5498,22 @@ unsafe extern "system" fn wnd_proc(
                 | IDM_GITHUB_COPILOT_PLAN_PRO
                 | IDM_GITHUB_COPILOT_PLAN_PRO_PLUS
                 | IDM_GITHUB_COPILOT_PLAN_MAX => {
-                    let plan = match id {
-                        IDM_GITHUB_COPILOT_PLAN_PRO => poller::GithubCopilotPlan::Pro,
-                        IDM_GITHUB_COPILOT_PLAN_PRO_PLUS => poller::GithubCopilotPlan::ProPlus,
-                        IDM_GITHUB_COPILOT_PLAN_MAX => poller::GithubCopilotPlan::Max,
-                        _ => poller::GithubCopilotPlan::Unknown,
-                    };
+                    let plan = github_copilot_plan_for_menu_id(id)
+                        .expect("matched GitHub Copilot plan menu ID");
                     {
                         let mut state = lock_state();
                         if let Some(s) = state.as_mut() {
-                            s.github_copilot_plan = plan;
+                            apply_github_copilot_plan_selection(
+                                &mut s.show_github_copilot,
+                                &mut s.github_copilot_plan,
+                                plan,
+                            );
                             s.github_copilot_state = CellState::Loading;
                             refresh_usage_texts(s);
                         }
                     }
                     save_state_settings();
+                    position_at_taskbar();
                     render_layered();
                     sync_tray_icons(hwnd);
                     let sh = SendHwnd::from_hwnd(hwnd);
@@ -7358,6 +7390,43 @@ mod tests {
             poller::GithubCopilotPlan::ProPlus
         );
         assert!(json.contains("\"github_copilot_plan\":\"pro_plus\""));
+    }
+
+    #[test]
+    fn saved_paid_copilot_plan_migrates_the_family_to_enabled() {
+        let mut settings = SettingsFile {
+            show_github_copilot: false,
+            github_copilot_plan: poller::GithubCopilotPlan::Pro,
+            ..SettingsFile::default()
+        };
+        normalize_github_copilot_settings(&mut settings);
+        assert!(settings.show_github_copilot);
+        assert_eq!(settings.github_copilot_plan, poller::GithubCopilotPlan::Pro);
+    }
+
+    #[test]
+    fn selecting_any_copilot_plan_enables_the_family() {
+        for (id, expected) in [
+            (
+                IDM_GITHUB_COPILOT_PLAN_UNKNOWN,
+                poller::GithubCopilotPlan::Unknown,
+            ),
+            (IDM_GITHUB_COPILOT_PLAN_PRO, poller::GithubCopilotPlan::Pro),
+            (
+                IDM_GITHUB_COPILOT_PLAN_PRO_PLUS,
+                poller::GithubCopilotPlan::ProPlus,
+            ),
+            (IDM_GITHUB_COPILOT_PLAN_MAX, poller::GithubCopilotPlan::Max),
+        ] {
+            let plan = github_copilot_plan_for_menu_id(id).unwrap();
+            assert_eq!(plan, expected);
+            let mut shown = false;
+            let mut selected = poller::GithubCopilotPlan::Unknown;
+            apply_github_copilot_plan_selection(&mut shown, &mut selected, plan);
+            assert!(shown);
+            assert_eq!(selected, expected);
+        }
+        assert_eq!(github_copilot_plan_for_menu_id(u16::MAX), None);
     }
 
     #[test]
