@@ -251,6 +251,7 @@ enum CellState {
     FetchFailed,
     Retrying,
     NotConfigured,
+    Disabled,
     NotAvailable,
 }
 
@@ -333,6 +334,7 @@ fn status_text(state: CellState, strings: Strings) -> &'static str {
         CellState::FetchFailed => strings.fetch_failed,
         CellState::Retrying => strings.retrying,
         CellState::NotConfigured => strings.not_configured,
+        CellState::Disabled => strings.not_available,
         CellState::NotAvailable => strings.not_available,
         CellState::Ok => {
             debug_assert!(
@@ -501,6 +503,19 @@ fn poll_cell_states(outcome: &poller::ProviderPollOutcome) -> (CellState, CellSt
             (state, state)
         }
         poller::ProviderPollOutcome::Disabled => (CellState::NotAvailable, CellState::NotAvailable),
+    }
+}
+
+fn poll_quota_item_state(outcome: &poller::ProviderPollOutcome, item_id: &str) -> CellState {
+    match outcome {
+        poller::ProviderPollOutcome::Success { usage, .. } => usage
+            .quota_items()
+            .into_iter()
+            .find(|item| item.id == item_id)
+            .filter(|item| item.availability != crate::models::QuotaItemAvailability::Unavailable)
+            .map_or(CellState::NotAvailable, |_| CellState::Ok),
+        poller::ProviderPollOutcome::Error { .. } => poll_cell_states(outcome).0,
+        poller::ProviderPollOutcome::Disabled => CellState::Disabled,
     }
 }
 
@@ -4356,7 +4371,8 @@ fn do_poll(send_hwnd: SendHwnd) {
                     poll_cell_states(&report.antigravity);
                 s.antigravity_session_state = antigravity_session_state;
                 s.antigravity_weekly_state = antigravity_weekly_state;
-                s.github_copilot_state = poll_cell_states(&report.github_copilot).0;
+                s.github_copilot_state =
+                    poll_quota_item_state(&report.github_copilot, GITHUB_COPILOT_MONTHLY_ITEM_ID);
 
                 // Stop fast-poll if reset data is now fresh
                 if !poller::app_is_past_reset(&data) {
@@ -4442,7 +4458,10 @@ fn do_poll(send_hwnd: SendHwnd) {
                         poll_cell_states(&report.antigravity);
                     s.antigravity_session_state = antigravity_session_state;
                     s.antigravity_weekly_state = antigravity_weekly_state;
-                    s.github_copilot_state = poll_cell_states(&report.github_copilot).0;
+                    s.github_copilot_state = poll_quota_item_state(
+                        &report.github_copilot,
+                        GITHUB_COPILOT_MONTHLY_ITEM_ID,
+                    );
                     // No-op in practice today (a total-failure `report` never
                     // contains a `Success` outcome), but keeps this branch
                     // using the exact same update path as the success branch
@@ -6945,6 +6964,133 @@ mod tests {
             unit: QuotaUnit::AiCredits,
             resets_at,
         }
+    }
+
+    fn copilot_item(used: f64) -> QuotaItem {
+        QuotaItem {
+            id: GITHUB_COPILOT_MONTHLY_ITEM_ID.to_string(),
+            label: "Monthly AI credits".to_string(),
+            availability: QuotaItemAvailability::Available,
+            metric: Some(QuotaMetric::Used {
+                used,
+                limit: Some(1_500.0),
+            }),
+            unit: QuotaUnit::AiCredits,
+            resets_at: None,
+        }
+    }
+
+    fn copilot_success(items: Vec<QuotaItem>) -> poller::ProviderPollOutcome {
+        poller::ProviderPollOutcome::Success {
+            source: poller::ProviderPollSource::GithubBillingApi,
+            attempted_at: SystemTime::UNIX_EPOCH,
+            acquired_at: SystemTime::UNIX_EPOCH,
+            usage: UsageData::from_quota_items(items),
+        }
+    }
+
+    #[test]
+    fn copilot_positive_usage_is_ok() {
+        let outcome = copilot_success(vec![copilot_item(0.681855)]);
+        assert_eq!(
+            poll_quota_item_state(&outcome, GITHUB_COPILOT_MONTHLY_ITEM_ID),
+            CellState::Ok
+        );
+    }
+
+    #[test]
+    fn copilot_zero_usage_is_ok_and_not_not_available() {
+        let item = copilot_item(0.0);
+        let outcome = copilot_success(vec![item.clone()]);
+        let state = poll_quota_item_state(&outcome, GITHUB_COPILOT_MONTHLY_ITEM_ID);
+        assert_eq!(state, CellState::Ok);
+        assert_ne!(
+            render_generic_quota_item(
+                state,
+                Some(&item),
+                DisplayBasis::UsedPercentage,
+                LanguageId::English.strings(),
+            )
+            .text,
+            LanguageId::English.strings().not_available
+        );
+    }
+
+    #[test]
+    fn copilot_missing_or_unavailable_target_item_is_not_available() {
+        let other = QuotaItem {
+            id: "other".to_string(),
+            ..copilot_item(1.0)
+        };
+        assert_eq!(
+            poll_quota_item_state(
+                &copilot_success(vec![other]),
+                GITHUB_COPILOT_MONTHLY_ITEM_ID,
+            ),
+            CellState::NotAvailable
+        );
+
+        let unavailable = QuotaItem {
+            availability: QuotaItemAvailability::Unavailable,
+            metric: None,
+            ..copilot_item(1.0)
+        };
+        assert_eq!(
+            poll_quota_item_state(
+                &copilot_success(vec![unavailable]),
+                GITHUB_COPILOT_MONTHLY_ITEM_ID,
+            ),
+            CellState::NotAvailable
+        );
+    }
+
+    #[test]
+    fn copilot_errors_keep_existing_error_state_mapping() {
+        for (error, expected) in [
+            (poller::PollError::RequestFailed, CellState::Retrying),
+            (poller::PollError::AuthRequired, CellState::FetchFailed),
+            (poller::PollError::NoCredentials, CellState::NotConfigured),
+        ] {
+            let outcome = poller::ProviderPollOutcome::Error {
+                source: poller::ProviderPollSource::GithubBillingApi,
+                attempted_at: SystemTime::UNIX_EPOCH,
+                error,
+            };
+            assert_eq!(
+                poll_quota_item_state(&outcome, GITHUB_COPILOT_MONTHLY_ITEM_ID),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn copilot_disabled_has_distinct_state() {
+        assert_eq!(
+            poll_quota_item_state(
+                &poller::ProviderPollOutcome::Disabled,
+                GITHUB_COPILOT_MONTHLY_ITEM_ID,
+            ),
+            CellState::Disabled
+        );
+    }
+
+    #[test]
+    fn legacy_session_weekly_state_classification_is_unchanged() {
+        let mut usage = UsageData::default();
+        usage.set_session(UsageSection {
+            percentage: 25.0,
+            resets_at: None,
+        });
+        let outcome = poller::ProviderPollOutcome::Success {
+            source: poller::ProviderPollSource::AnthropicOauthUsage,
+            attempted_at: SystemTime::UNIX_EPOCH,
+            acquired_at: SystemTime::UNIX_EPOCH,
+            usage,
+        };
+        assert_eq!(
+            poll_cell_states(&outcome),
+            (CellState::Ok, CellState::NotAvailable)
+        );
     }
 
     #[test]
