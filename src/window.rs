@@ -2952,7 +2952,11 @@ fn widget_height_for_state(state: &AppState) -> i32 {
         weekly_pace_extra_lines(state),
         needs_session_row(state),
     );
-    let extra_rows = i32::from(state.show_github_copilot);
+    widget_height_for_rows(rows, state.show_github_copilot)
+}
+
+fn widget_height_for_rows(rows: VisibleRows, show_github_copilot: bool) -> i32 {
+    let extra_rows = i32::from(show_github_copilot);
     sc(popup_height_logical(rows) + extra_rows * (ROW_GAP_H + SEGMENT_H))
 }
 
@@ -4806,6 +4810,36 @@ fn position_at_taskbar() {
     ));
 }
 
+fn window_size_needs_sync(
+    current_rect: Option<RECT>,
+    required_width: i32,
+    required_height: i32,
+) -> bool {
+    current_rect.map_or(true, |rect| {
+        rect.right - rect.left != required_width || rect.bottom - rect.top != required_height
+    })
+}
+
+fn sync_usage_geometry_if_needed(hwnd: HWND) {
+    let required_size = {
+        let state = lock_state();
+        state
+            .as_ref()
+            .map(|s| (total_widget_width_for_state(s), widget_height_for_state(s)))
+    };
+    let Some((required_width, required_height)) = required_size else {
+        return;
+    };
+
+    if window_size_needs_sync(
+        native_interop::get_window_rect_safe(hwnd),
+        required_width,
+        required_height,
+    ) {
+        position_at_taskbar();
+    }
+}
+
 /// Compute the popup's top-left Y so its bottom edge sits flush with
 /// `work_area_bottom` (the taskbar's top edge, for a bottom-docked
 /// taskbar), extending upward into the work area. If the popup is taller
@@ -5016,6 +5050,7 @@ unsafe extern "system" fn wnd_proc(
         WM_APP_USAGE_UPDATED => {
             check_theme_change();
             check_language_change();
+            sync_usage_geometry_if_needed(hwnd);
             render_layered();
             schedule_countdown_timer();
             suppress_tray_reposition_for(Duration::from_millis(
@@ -7357,6 +7392,84 @@ mod tests {
         };
         let (x, y) = compute_auto_popup_position(work_area, 3800, 300, 46, 0);
         assert_eq!((x, y), (3500, 1034));
+    }
+
+    #[test]
+    fn usage_geometry_sync_is_requested_only_when_window_size_differs() {
+        let current = RECT {
+            left: 400,
+            top: 700,
+            right: 700,
+            bottom: 785,
+        };
+        assert!(!window_size_needs_sync(Some(current), 300, 85));
+        assert!(window_size_needs_sync(Some(current), 320, 85));
+        assert!(window_size_needs_sync(Some(current), 300, 113));
+        assert!(window_size_needs_sync(None, 300, 85));
+
+        // Position is deliberately not part of this poll-time decision. A
+        // manually placed popup with the right size must not be re-anchored.
+        let same_size_at_manual_position = RECT {
+            left: -500,
+            top: 250,
+            right: -200,
+            bottom: 335,
+        };
+        assert!(!window_size_needs_sync(
+            Some(same_size_at_manual_position),
+            300,
+            85
+        ));
+    }
+
+    #[test]
+    fn four_provider_poll_growth_has_current_height_visible_header_and_safe_bottom() {
+        let loading_rows = visible_rows(PopupLayout::Standard, 0, true);
+        let polled_rows = visible_rows(PopupLayout::Standard, 2, true);
+        let loading_height = widget_height_for_rows(loading_rows, true);
+        let polled_height = widget_height_for_rows(polled_rows, true);
+
+        assert_eq!(active_family_count(true, true, true, true), 4);
+        assert!(polled_height > loading_height);
+        assert!(polled_height > widget_height_for_rows(polled_rows, false));
+
+        let width = total_widget_width_for(4);
+        let stale_loading_rect = RECT {
+            left: 1500,
+            top: 900,
+            right: 1500 + width,
+            bottom: 900 + loading_height,
+        };
+        assert!(window_size_needs_sync(
+            Some(stale_loading_rect),
+            width,
+            polled_height
+        ));
+
+        let work_area = RECT {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1040,
+        };
+        let (_, y) = compute_auto_popup_position(work_area, 1900, width, polled_height, 0);
+        assert!(y + polled_height <= work_area.bottom);
+
+        let copilot_row_height = sc(ROW_GAP_H + SEGMENT_H);
+        let layout = pace_row_layout(polled_height - copilot_row_height, polled_rows);
+        assert!(layout.provider_header_y >= 0);
+
+        let synchronized_rect = RECT {
+            left: 1500,
+            top: y,
+            right: 1500 + width,
+            bottom: y + polled_height,
+        };
+        assert!(!window_size_needs_sync(
+            Some(synchronized_rect),
+            width,
+            polled_height
+        ));
     }
 
     // ── AUM-WINDOW-UI-01C-2-STEP2 (drag UX): is_drag_region_point ───────────
