@@ -20,7 +20,7 @@ use crate::diagnose;
 use crate::localization::{self, LanguageId, Strings};
 #[cfg(test)]
 use crate::models::UsageData;
-use crate::models::{AppUsageData, BankedResetCount, UsageSection};
+use crate::models::{AppUsageData, BankedResetCount, QuotaFamilyId, QuotaMetric, UsageSection};
 #[cfg(feature = "self-update")]
 use crate::native_interop::TIMER_UPDATE_CHECK;
 use crate::native_interop::{
@@ -98,9 +98,14 @@ struct AppState {
     antigravity_weekly_text: String,
     antigravity_weekly_pace: Option<PaceGuidanceLines>,
     antigravity_weekly_remaining_text: Option<String>,
+    github_copilot_state: CellState,
+    github_copilot_percent: Option<f64>,
+    github_copilot_text: String,
     show_claude_code: bool,
     show_codex: bool,
     show_antigravity: bool,
+    show_github_copilot: bool,
+    github_copilot_plan: poller::GithubCopilotPlan,
 
     data: Option<AppUsageData>,
 
@@ -365,6 +370,105 @@ fn render_cell(
     }
 }
 
+fn quota_item_section(
+    data: Option<&AppUsageData>,
+    family_id: QuotaFamilyId,
+    item_id: &str,
+) -> Option<UsageSection> {
+    let item = data?.family(family_id)?.item(item_id)?;
+    Some(UsageSection {
+        percentage: item.used_percentage()?,
+        resets_at: item.resets_at,
+    })
+}
+
+fn format_quota_number(value: f64) -> String {
+    if (value - value.round()).abs() < 0.000_001 {
+        format!("{value:.0}")
+    } else {
+        format!("{value:.2}")
+    }
+}
+
+fn render_generic_quota_item(
+    state: CellState,
+    item: Option<&crate::models::QuotaItem>,
+    basis: DisplayBasis,
+    strings: Strings,
+) -> CellDisplay {
+    if state != CellState::Ok {
+        return CellDisplay {
+            bar_percent: None,
+            text: status_text(state, strings).to_string(),
+        };
+    }
+    let Some(item) = item else {
+        return CellDisplay {
+            bar_percent: None,
+            text: strings.not_available.to_string(),
+        };
+    };
+    if item.availability == crate::models::QuotaItemAvailability::Unavailable {
+        return CellDisplay {
+            bar_percent: None,
+            text: strings.not_available.to_string(),
+        };
+    }
+
+    let used_percent = item.used_percentage();
+    let bar_percent = used_percent.map(|value| display_value(basis, value));
+    let metric_text = match item.metric.as_ref() {
+        Some(QuotaMetric::Percentage(value)) => {
+            format!("{:.0}%", display_value(basis, *value))
+        }
+        Some(QuotaMetric::Used { used, limit }) => match (basis, limit) {
+            (DisplayBasis::UsedPercentage, Some(limit)) => format!(
+                "{} / {} {}",
+                format_quota_number(*used),
+                format_quota_number(*limit),
+                item.unit.as_str()
+            ),
+            (DisplayBasis::RemainingAllowance, Some(limit)) => format!(
+                "{} / {} {}",
+                format_quota_number((*limit - *used).max(0.0)),
+                format_quota_number(*limit),
+                item.unit.as_str()
+            ),
+            (_, None) => format!("{} {}", format_quota_number(*used), item.unit.as_str()),
+        },
+        Some(QuotaMetric::Remaining { remaining, limit }) => match (basis, limit) {
+            (DisplayBasis::RemainingAllowance, Some(limit)) => format!(
+                "{} / {} {}",
+                format_quota_number(*remaining),
+                format_quota_number(*limit),
+                item.unit.as_str()
+            ),
+            (DisplayBasis::UsedPercentage, Some(limit)) => format!(
+                "{} / {} {}",
+                format_quota_number((*limit - *remaining).max(0.0)),
+                format_quota_number(*limit),
+                item.unit.as_str()
+            ),
+            (_, None) => format!(
+                "{} {} remaining",
+                format_quota_number(*remaining),
+                item.unit.as_str()
+            ),
+        },
+        None => String::new(),
+    };
+    let text = match (
+        metric_text.is_empty(),
+        countdown_text(item.resets_at, strings),
+    ) {
+        (false, Some(countdown)) => format!("{metric_text} · {} {countdown}", strings.reset_in),
+        (false, None) => metric_text,
+        (true, Some(countdown)) => format!("{} {countdown}", strings.reset_in),
+        (true, None) => strings.not_available.to_string(),
+    };
+    CellDisplay { bar_percent, text }
+}
+
 /// Classify a just-completed provider poll into session/weekly cell states.
 /// `Disabled` (provider not requested this poll) is not a normal render
 /// target — it maps to `NotAvailable` rather than `Loading`, since it does
@@ -420,13 +524,20 @@ fn banked_reset_count_for_poll(outcome: &poller::ProviderPollOutcome) -> BankedR
 fn merge_successful_providers(data: &mut Option<AppUsageData>, report: &poller::PollReport) {
     let data = data.get_or_insert_with(AppUsageData::default);
     if let poller::ProviderPollOutcome::Success { usage, .. } = &report.claude_code {
-        data.claude_code = Some(usage.clone());
+        data.upsert(usage.clone().into_quota_family(QuotaFamilyId::Claude));
     }
     if let poller::ProviderPollOutcome::Success { usage, .. } = &report.codex {
-        data.codex = Some(usage.clone());
+        data.upsert(usage.clone().into_quota_family(QuotaFamilyId::Codex));
     }
     if let poller::ProviderPollOutcome::Success { usage, .. } = &report.antigravity {
-        data.antigravity = Some(usage.clone());
+        data.upsert(usage.clone().into_quota_family(QuotaFamilyId::Antigravity));
+    }
+    if let poller::ProviderPollOutcome::Success { usage, .. } = &report.github_copilot {
+        data.upsert(
+            usage
+                .clone()
+                .into_quota_family(QuotaFamilyId::GithubCopilot),
+        );
     }
 }
 
@@ -1098,6 +1209,7 @@ const IDM_MODEL_CLAUDE_CODE: u16 = 60;
 const IDM_MODEL_CODEX: u16 = 61;
 #[cfg(feature = "antigravity")]
 const IDM_MODEL_ANTIGRAVITY: u16 = 62;
+const IDM_MODEL_GITHUB_COPILOT: u16 = 63;
 // 70 is `tray_icon::IDM_TOGGLE_WIDGET`, not redefined here — it shares the
 // same `WM_COMMAND` id space as every constant in this block, so it must be
 // treated as already taken (71 is skipped too, to leave no ambiguity next
@@ -1120,6 +1232,10 @@ const IDM_POPUP_LAYOUT_STANDARD: u16 = 90;
 const IDM_APP_THEME_RECOMMENDED_DARK: u16 = 91;
 const IDM_APP_THEME_LIGHT: u16 = 92;
 const IDM_APP_THEME_HIGH_VISIBILITY: u16 = 93;
+const IDM_GITHUB_COPILOT_PLAN_UNKNOWN: u16 = 94;
+const IDM_GITHUB_COPILOT_PLAN_PRO: u16 = 95;
+const IDM_GITHUB_COPILOT_PLAN_PRO_PLUS: u16 = 96;
+const IDM_GITHUB_COPILOT_PLAN_MAX: u16 = 97;
 
 /// Pure `menu ID -> enum value` lookups, shared by `show_context_menu`
 /// (which sets which item starts checked) and the `WM_COMMAND` handler
@@ -1363,6 +1479,10 @@ struct SettingsFile {
     show_codex: bool,
     #[serde(default = "default_show_antigravity")]
     show_antigravity: bool,
+    #[serde(default)]
+    show_github_copilot: bool,
+    #[serde(default)]
+    github_copilot_plan: poller::GithubCopilotPlan,
     #[serde(default, deserialize_with = "deserialize_display_basis")]
     display_basis: DisplayBasis,
     #[serde(default, deserialize_with = "deserialize_display_density")]
@@ -1393,6 +1513,8 @@ impl Default for SettingsFile {
             show_claude_code: true,
             show_codex: false,
             show_antigravity: false,
+            show_github_copilot: false,
+            github_copilot_plan: poller::GithubCopilotPlan::Unknown,
             display_basis: DisplayBasis::default(),
             display_density: DisplayDensity::default(),
             short_window_visibility: ShortWindowVisibility::default(),
@@ -1508,7 +1630,11 @@ fn load_settings() -> SettingsFile {
     {
         settings.show_antigravity = false;
     }
-    if !settings.show_claude_code && !settings.show_codex && !settings.show_antigravity {
+    if !settings.show_claude_code
+        && !settings.show_codex
+        && !settings.show_antigravity
+        && !settings.show_github_copilot
+    {
         settings.show_claude_code = true;
     }
     settings
@@ -1540,6 +1666,8 @@ fn save_state_settings() {
             show_claude_code: s.show_claude_code,
             show_codex: s.show_codex,
             show_antigravity: s.show_antigravity,
+            show_github_copilot: s.show_github_copilot,
+            github_copilot_plan: s.github_copilot_plan,
             display_basis: s.display_basis,
             display_density: s.display_density,
             short_window_visibility: s.short_window_visibility,
@@ -1567,71 +1695,63 @@ fn tray_icon_data_from_state() -> Vec<tray_icon::TrayIconData> {
             // `s.display_basis`; the popup keeps the user's chosen basis.
             let strings = s.language.strings();
 
-            let claude_session = s
-                .data
-                .as_ref()
-                .and_then(|d| d.claude_code.as_ref())
-                .map(|u| &u.session);
-            let claude_weekly = s
-                .data
-                .as_ref()
-                .and_then(|d| d.claude_code.as_ref())
-                .map(|u| &u.weekly);
+            let claude_session =
+                quota_item_section(s.data.as_ref(), QuotaFamilyId::Claude, "session");
+            let claude_weekly =
+                quota_item_section(s.data.as_ref(), QuotaFamilyId::Claude, "weekly");
             let claude_session_used = render_cell(
                 s.session_state,
-                claude_session,
+                claude_session.as_ref(),
                 DisplayBasis::UsedPercentage,
                 strings,
             );
             let claude_weekly_used = render_cell(
                 s.weekly_state,
-                claude_weekly,
+                claude_weekly.as_ref(),
                 DisplayBasis::UsedPercentage,
                 strings,
             );
 
-            let codex_session = s
-                .data
-                .as_ref()
-                .and_then(|d| d.codex.as_ref())
-                .map(|u| &u.session);
-            let codex_weekly = s
-                .data
-                .as_ref()
-                .and_then(|d| d.codex.as_ref())
-                .map(|u| &u.weekly);
+            let codex_session =
+                quota_item_section(s.data.as_ref(), QuotaFamilyId::Codex, "session");
+            let codex_weekly = quota_item_section(s.data.as_ref(), QuotaFamilyId::Codex, "weekly");
             let codex_session_used = render_cell(
                 s.codex_session_state,
-                codex_session,
+                codex_session.as_ref(),
                 DisplayBasis::UsedPercentage,
                 strings,
             );
             let codex_weekly_used = render_cell(
                 s.codex_weekly_state,
-                codex_weekly,
+                codex_weekly.as_ref(),
                 DisplayBasis::UsedPercentage,
                 strings,
             );
 
-            let antigravity_session = s
-                .data
-                .as_ref()
-                .and_then(|d| d.antigravity.as_ref())
-                .map(|u| &u.session);
-            let antigravity_weekly = s
-                .data
-                .as_ref()
-                .and_then(|d| d.antigravity.as_ref())
-                .map(|u| &u.weekly);
+            let antigravity_session =
+                quota_item_section(s.data.as_ref(), QuotaFamilyId::Antigravity, "session");
+            let antigravity_weekly =
+                quota_item_section(s.data.as_ref(), QuotaFamilyId::Antigravity, "weekly");
             let antigravity_session_used = render_cell(
                 s.antigravity_session_state,
-                antigravity_session,
+                antigravity_session.as_ref(),
                 DisplayBasis::UsedPercentage,
                 strings,
             );
             let antigravity_weekly_used = render_cell(
                 s.antigravity_weekly_state,
-                antigravity_weekly,
+                antigravity_weekly.as_ref(),
+                DisplayBasis::UsedPercentage,
+                strings,
+            );
+            let github_copilot_item = s
+                .data
+                .as_ref()
+                .and_then(|data| data.family(QuotaFamilyId::GithubCopilot))
+                .and_then(|family| family.item("monthly_ai_credits"));
+            let github_copilot_used = render_generic_quota_item(
+                s.github_copilot_state,
+                github_copilot_item,
                 DisplayBasis::UsedPercentage,
                 strings,
             );
@@ -1676,6 +1796,13 @@ fn tray_icon_data_from_state() -> Vec<tray_icon::TrayIconData> {
                     ),
                 });
             }
+            if s.show_github_copilot {
+                icons.push(tray_icon::TrayIconData {
+                    kind: tray_icon::TrayIconKind::GithubCopilot,
+                    percent: github_copilot_used.bar_percent,
+                    tooltip: format!("GitHub Copilot | {}", github_copilot_used.text),
+                });
+            }
             icons
         }
         Some(s) => {
@@ -1699,6 +1826,13 @@ fn tray_icon_data_from_state() -> Vec<tray_icon::TrayIconData> {
                     kind: tray_icon::TrayIconKind::Antigravity,
                     percent: None,
                     tooltip: s.language.strings().antigravity_window_title.to_string(),
+                });
+            }
+            if s.show_github_copilot {
+                icons.push(tray_icon::TrayIconData {
+                    kind: tray_icon::TrayIconKind::GithubCopilot,
+                    percent: None,
+                    tooltip: "GitHub Copilot Usage Monitor".to_string(),
                 });
             }
             icons
@@ -1924,51 +2058,39 @@ fn refresh_usage_texts(state: &mut AppState) {
     let now = SystemTime::now();
     let data = state.data.as_ref();
 
-    let claude_code = data.and_then(|d| d.claude_code.as_ref());
-    let session = render_cell(
-        state.session_state,
-        claude_code.map(|u| &u.session),
-        basis,
-        strings,
-    );
+    let claude_session = quota_item_section(data, QuotaFamilyId::Claude, "session");
+    let claude_weekly = quota_item_section(data, QuotaFamilyId::Claude, "weekly");
+    let session = render_cell(state.session_state, claude_session.as_ref(), basis, strings);
     state.session_percent = session.bar_percent;
     state.session_text = session.text;
     state.session_pace = session_pace_for_cell(
         state.session_state,
-        claude_code.map(|u| &u.session),
+        claude_session.as_ref(),
         now,
         basis,
         visibility,
         sensitivity,
         strings,
     );
-    let weekly = render_cell(
-        state.weekly_state,
-        claude_code.map(|u| &u.weekly),
-        basis,
-        strings,
-    );
+    let weekly = render_cell(state.weekly_state, claude_weekly.as_ref(), basis, strings);
     state.weekly_percent = weekly.bar_percent;
     state.weekly_text = weekly.text;
     state.weekly_pace = weekly_pace_for_cell(
         state.weekly_state,
-        claude_code.map(|u| &u.weekly),
+        claude_weekly.as_ref(),
         now,
         basis,
         density,
         strings,
     );
-    state.weekly_remaining_text = compact_weekly_remaining_for_cell(
-        state.weekly_state,
-        claude_code.map(|u| &u.weekly),
-        now,
-        strings,
-    );
+    state.weekly_remaining_text =
+        compact_weekly_remaining_for_cell(state.weekly_state, claude_weekly.as_ref(), now, strings);
 
-    let codex = data.and_then(|d| d.codex.as_ref());
+    let codex_session_section = quota_item_section(data, QuotaFamilyId::Codex, "session");
+    let codex_weekly_section = quota_item_section(data, QuotaFamilyId::Codex, "weekly");
     let codex_session = render_cell(
         state.codex_session_state,
-        codex.map(|u| &u.session),
+        codex_session_section.as_ref(),
         basis,
         strings,
     );
@@ -1976,7 +2098,7 @@ fn refresh_usage_texts(state: &mut AppState) {
     state.codex_session_text = codex_session.text;
     state.codex_session_pace = session_pace_for_cell(
         state.codex_session_state,
-        codex.map(|u| &u.session),
+        codex_session_section.as_ref(),
         now,
         basis,
         visibility,
@@ -1985,7 +2107,7 @@ fn refresh_usage_texts(state: &mut AppState) {
     );
     let codex_weekly = render_cell(
         state.codex_weekly_state,
-        codex.map(|u| &u.weekly),
+        codex_weekly_section.as_ref(),
         basis,
         strings,
     );
@@ -1993,7 +2115,7 @@ fn refresh_usage_texts(state: &mut AppState) {
     state.codex_weekly_text = codex_weekly.text;
     state.codex_weekly_pace = weekly_pace_for_cell(
         state.codex_weekly_state,
-        codex.map(|u| &u.weekly),
+        codex_weekly_section.as_ref(),
         now,
         basis,
         density,
@@ -2001,17 +2123,19 @@ fn refresh_usage_texts(state: &mut AppState) {
     );
     state.codex_weekly_remaining_text = compact_weekly_remaining_for_cell(
         state.codex_weekly_state,
-        codex.map(|u| &u.weekly),
+        codex_weekly_section.as_ref(),
         now,
         strings,
     );
     state.codex_banked_reset_text =
         format_banked_reset_text(state.codex_banked_reset_count, strings);
 
-    let antigravity = data.and_then(|d| d.antigravity.as_ref());
+    let antigravity_session_section =
+        quota_item_section(data, QuotaFamilyId::Antigravity, "session");
+    let antigravity_weekly_section = quota_item_section(data, QuotaFamilyId::Antigravity, "weekly");
     let antigravity_session = render_cell(
         state.antigravity_session_state,
-        antigravity.map(|u| &u.session),
+        antigravity_session_section.as_ref(),
         basis,
         strings,
     );
@@ -2019,7 +2143,7 @@ fn refresh_usage_texts(state: &mut AppState) {
     state.antigravity_session_text = antigravity_session.text;
     state.antigravity_session_pace = session_pace_for_cell(
         state.antigravity_session_state,
-        antigravity.map(|u| &u.session),
+        antigravity_session_section.as_ref(),
         now,
         basis,
         visibility,
@@ -2028,7 +2152,7 @@ fn refresh_usage_texts(state: &mut AppState) {
     );
     let antigravity_weekly = render_cell(
         state.antigravity_weekly_state,
-        antigravity.map(|u| &u.weekly),
+        antigravity_weekly_section.as_ref(),
         basis,
         strings,
     );
@@ -2036,7 +2160,7 @@ fn refresh_usage_texts(state: &mut AppState) {
     state.antigravity_weekly_text = antigravity_weekly.text;
     state.antigravity_weekly_pace = weekly_pace_for_cell(
         state.antigravity_weekly_state,
-        antigravity.map(|u| &u.weekly),
+        antigravity_weekly_section.as_ref(),
         now,
         basis,
         density,
@@ -2044,10 +2168,22 @@ fn refresh_usage_texts(state: &mut AppState) {
     );
     state.antigravity_weekly_remaining_text = compact_weekly_remaining_for_cell(
         state.antigravity_weekly_state,
-        antigravity.map(|u| &u.weekly),
+        antigravity_weekly_section.as_ref(),
         now,
         strings,
     );
+
+    let github_copilot_item = data
+        .and_then(|data| data.family(QuotaFamilyId::GithubCopilot))
+        .and_then(|family| family.item("monthly"));
+    let github_copilot = render_generic_quota_item(
+        state.github_copilot_state,
+        github_copilot_item,
+        basis,
+        strings,
+    );
+    state.github_copilot_percent = github_copilot.bar_percent;
+    state.github_copilot_text = github_copilot.text;
 }
 
 fn set_window_title(hwnd: HWND, strings: Strings) {
@@ -2774,7 +2910,8 @@ fn widget_height_for_state(state: &AppState) -> i32 {
         weekly_pace_extra_lines(state),
         needs_session_row(state),
     );
-    sc(popup_height_logical(rows))
+    let extra_rows = i32::from(state.show_github_copilot);
+    sc(popup_height_logical(rows) + extra_rows * (ROW_GAP_H + SEGMENT_H))
 }
 
 fn widget_height() -> i32 {
@@ -2844,7 +2981,8 @@ fn header_band_bottom(state: &AppState) -> i32 {
         needs_session_row(state),
     );
     let height = widget_height_for_state(state);
-    pace_row_layout(height, rows).weekly_row_y
+    let legacy_height = height - i32::from(state.show_github_copilot) * sc(ROW_GAP_H + SEGMENT_H);
+    pace_row_layout(legacy_height, rows).weekly_row_y
 }
 
 /// Whether `(client_x, client_y)` falls within the popup's draggable header
@@ -2898,6 +3036,19 @@ fn active_model_count(show_claude_code: bool, show_codex: bool, show_antigravity
     (show_claude_code as i32 + show_codex as i32 + show_antigravity as i32).max(1)
 }
 
+fn active_family_count(
+    show_claude_code: bool,
+    show_codex: bool,
+    show_antigravity: bool,
+    show_github_copilot: bool,
+) -> i32 {
+    (show_claude_code as i32
+        + show_codex as i32
+        + show_antigravity as i32
+        + show_github_copilot as i32)
+        .max(1)
+}
+
 fn row_bar_segment_count(active_models: i32) -> i32 {
     match active_models {
         1 => SEGMENT_COUNT,
@@ -2920,10 +3071,11 @@ fn total_widget_width_for(active_models: i32) -> i32 {
 }
 
 fn total_widget_width_for_state(state: &AppState) -> i32 {
-    total_widget_width_for(active_model_count(
+    total_widget_width_for(active_family_count(
         state.show_claude_code,
         state.show_codex,
         state.show_antigravity,
+        state.show_github_copilot,
     ))
 }
 
@@ -2932,7 +3084,14 @@ fn total_widget_width() -> i32 {
         let state = lock_state();
         state
             .as_ref()
-            .map(|s| active_model_count(s.show_claude_code, s.show_codex, s.show_antigravity))
+            .map(|s| {
+                active_family_count(
+                    s.show_claude_code,
+                    s.show_codex,
+                    s.show_antigravity,
+                    s.show_github_copilot,
+                )
+            })
             .unwrap_or(1)
     };
     total_widget_width_for(active_models)
@@ -2953,6 +3112,10 @@ fn codex_accent_color() -> Color {
 
 fn antigravity_accent_color() -> Color {
     Color::from_hex("#4285F4")
+}
+
+fn github_copilot_accent_color() -> Color {
+    Color::from_hex("#8250DF")
 }
 
 /// The popup's canonical color source (AUM-WINDOW-UI-01B). Both draw paths —
@@ -3233,9 +3396,14 @@ pub fn run() {
                 antigravity_weekly_text: String::new(),
                 antigravity_weekly_pace: None,
                 antigravity_weekly_remaining_text: None,
+                github_copilot_state: CellState::Loading,
+                github_copilot_percent: None,
+                github_copilot_text: String::new(),
                 show_claude_code: settings.show_claude_code,
                 show_codex: settings.show_codex,
                 show_antigravity: settings.show_antigravity,
+                show_github_copilot: settings.show_github_copilot,
+                github_copilot_plan: settings.github_copilot_plan,
                 data: None,
                 poll_interval_ms: settings.poll_interval_ms,
                 retry_count: 0,
@@ -3373,9 +3541,12 @@ fn render_layered() {
         antigravity_weekly_text,
         antigravity_weekly_pace,
         antigravity_weekly_remaining_text,
+        github_copilot_percent,
+        github_copilot_text,
         show_claude_code,
         show_codex,
         show_antigravity,
+        show_github_copilot,
         height,
     ) = {
         let state = lock_state();
@@ -3412,9 +3583,12 @@ fn render_layered() {
                 s.antigravity_weekly_text.clone(),
                 s.antigravity_weekly_pace.clone(),
                 s.antigravity_weekly_remaining_text.clone(),
+                s.github_copilot_percent,
+                s.github_copilot_text.clone(),
                 s.show_claude_code,
                 s.show_codex,
                 s.show_antigravity,
+                s.show_github_copilot,
                 widget_height_for_state(s),
             ),
             None => return,
@@ -3514,9 +3688,12 @@ fn render_layered() {
             &antigravity_weekly_text,
             antigravity_weekly_pace.as_ref(),
             antigravity_weekly_remaining_text.as_deref(),
+            github_copilot_percent,
+            &github_copilot_text,
             show_claude_code,
             show_codex,
             show_antigravity,
+            show_github_copilot,
             &codex_accent,
             &antigravity_accent,
             popup_layout,
@@ -3611,9 +3788,12 @@ fn paint_content(
     antigravity_weekly_text: &str,
     antigravity_weekly_pace: Option<&PaceGuidanceLines>,
     antigravity_weekly_remaining_text: Option<&str>,
+    github_copilot_percent: Option<f64>,
+    github_copilot_text: &str,
     show_claude_code: bool,
     show_codex: bool,
     show_antigravity: bool,
+    show_github_copilot: bool,
     codex_accent: &Color,
     antigravity_accent: &Color,
     popup_layout: PopupLayout,
@@ -3733,7 +3913,8 @@ fn paint_content(
             ),
         );
         let rows = visible_rows(popup_layout, weekly_lines, needs_session_row);
-        let layout = pace_row_layout(height, rows);
+        let legacy_height = height - i32::from(show_github_copilot) * sc(ROW_GAP_H + SEGMENT_H);
+        let layout = pace_row_layout(legacy_height, rows);
 
         let _ = SetBkMode(hdc, TRANSPARENT);
         let _ = SetTextColor(hdc, COLORREF(text_color.to_colorref()));
@@ -3766,6 +3947,7 @@ fn paint_content(
             show_claude_code,
             show_codex,
             show_antigravity,
+            show_github_copilot,
             popup_layout == PopupLayout::Compact,
             weekly_remaining_text,
             codex_weekly_remaining_text,
@@ -3789,33 +3971,57 @@ fn paint_content(
             .map(|l| l.primary.as_str())
             .unwrap_or(antigravity_weekly_text);
 
+        let github_copilot_accent = github_copilot_accent_color();
+        let mut weekly_cells = Vec::new();
+        if show_claude_code {
+            weekly_cells.push(RowCell {
+                percent: weekly_pct,
+                text: weekly_row_text,
+                accent,
+                provider_text_color: claude_usage_text_color(provider_tint_dark),
+                is_warning: false,
+            });
+        }
+        if show_codex {
+            weekly_cells.push(RowCell {
+                percent: codex_weekly_pct,
+                text: codex_weekly_row_text,
+                accent: codex_accent,
+                provider_text_color: codex_usage_text_color(provider_tint_dark),
+                is_warning: false,
+            });
+        }
+        if show_antigravity {
+            weekly_cells.push(RowCell {
+                percent: antigravity_weekly_pct,
+                text: antigravity_weekly_row_text,
+                accent: antigravity_accent,
+                provider_text_color: antigravity_usage_text_color(provider_tint_dark),
+                is_warning: false,
+            });
+        }
+        if show_github_copilot {
+            weekly_cells.push(RowCell {
+                percent: None,
+                text: "",
+                accent: &github_copilot_accent,
+                provider_text_color: github_copilot_accent,
+                is_warning: false,
+            });
+        }
+
         draw_row(
             hdc,
             content_x,
             layout.weekly_row_y,
-            provider_tint_dark,
             text_color,
             strings.weekly_window,
-            weekly_pct,
-            weekly_row_text,
-            codex_weekly_pct,
-            codex_weekly_row_text,
-            antigravity_weekly_pct,
-            antigravity_weekly_row_text,
-            show_claude_code,
-            show_codex,
-            show_antigravity,
-            accent,
-            codex_accent,
-            antigravity_accent,
+            &weekly_cells,
             track,
             warning,
             // The weekly row never carries a warning flag of its own — see
             // `weekly_pace_guidance_lines`, which always sets
             // `PaceGuidanceLines::is_warning` to `false`.
-            false,
-            false,
-            false,
             track_outline,
         );
 
@@ -3831,11 +4037,13 @@ fn paint_content(
                 show_claude_code,
                 show_codex,
                 show_antigravity,
+                show_github_copilot,
             );
-            let pace_column_width = model_usage_width(row_bar_segment_count(active_model_count(
+            let pace_column_width = model_usage_width(row_bar_segment_count(active_family_count(
                 show_claude_code,
                 show_codex,
                 show_antigravity,
+                show_github_copilot,
             )));
 
             if show_claude_code {
@@ -3880,30 +4088,101 @@ fn paint_content(
         // `layout.session_row_y`/`needs_session_row`) when no shown
         // provider's decision says to show anything.
         if let Some(session_row_y) = layout.session_row_y {
+            let mut session_cells = Vec::new();
+            if show_claude_code {
+                session_cells.push(RowCell {
+                    percent: claude_session_decision.1,
+                    text: claude_session_decision.2,
+                    accent,
+                    provider_text_color: claude_usage_text_color(provider_tint_dark),
+                    is_warning: claude_session_decision.3,
+                });
+            }
+            if show_codex {
+                session_cells.push(RowCell {
+                    percent: codex_session_decision.1,
+                    text: codex_session_decision.2,
+                    accent: codex_accent,
+                    provider_text_color: codex_usage_text_color(provider_tint_dark),
+                    is_warning: codex_session_decision.3,
+                });
+            }
+            if show_antigravity {
+                session_cells.push(RowCell {
+                    percent: antigravity_session_decision.1,
+                    text: antigravity_session_decision.2,
+                    accent: antigravity_accent,
+                    provider_text_color: antigravity_usage_text_color(provider_tint_dark),
+                    is_warning: antigravity_session_decision.3,
+                });
+            }
+            if show_github_copilot {
+                session_cells.push(RowCell {
+                    percent: None,
+                    text: "",
+                    accent: &github_copilot_accent,
+                    provider_text_color: github_copilot_accent,
+                    is_warning: false,
+                });
+            }
             draw_row(
                 hdc,
                 content_x,
                 session_row_y,
-                provider_tint_dark,
                 text_color,
                 strings.session_window,
-                claude_session_decision.1,
-                claude_session_decision.2,
-                codex_session_decision.1,
-                codex_session_decision.2,
-                antigravity_session_decision.1,
-                antigravity_session_decision.2,
-                show_claude_code,
-                show_codex,
-                show_antigravity,
-                accent,
-                codex_accent,
-                antigravity_accent,
+                &session_cells,
                 track,
                 warning,
-                claude_session_decision.3,
-                codex_session_decision.3,
-                antigravity_session_decision.3,
+                track_outline,
+            );
+        }
+
+        if show_github_copilot {
+            let mut monthly_cells = Vec::new();
+            if show_claude_code {
+                monthly_cells.push(RowCell {
+                    percent: None,
+                    text: "",
+                    accent,
+                    provider_text_color: claude_usage_text_color(provider_tint_dark),
+                    is_warning: false,
+                });
+            }
+            if show_codex {
+                monthly_cells.push(RowCell {
+                    percent: None,
+                    text: "",
+                    accent: codex_accent,
+                    provider_text_color: codex_usage_text_color(provider_tint_dark),
+                    is_warning: false,
+                });
+            }
+            if show_antigravity {
+                monthly_cells.push(RowCell {
+                    percent: None,
+                    text: "",
+                    accent: antigravity_accent,
+                    provider_text_color: antigravity_usage_text_color(provider_tint_dark),
+                    is_warning: false,
+                });
+            }
+            monthly_cells.push(RowCell {
+                percent: github_copilot_percent,
+                text: github_copilot_text,
+                accent: &github_copilot_accent,
+                provider_text_color: github_copilot_accent,
+                is_warning: false,
+            });
+            draw_row(
+                hdc,
+                content_x,
+                height - sc(5) - sc(SEGMENT_H),
+                text_color,
+                "Month",
+                &monthly_cells,
+                track,
+                warning,
                 track_outline,
             );
         }
@@ -3963,32 +4242,21 @@ fn paint_content(
         // already leave between columns, so it never overlaps a column's
         // text or bar.
         if show_column_dividers {
-            let (claude_col_x, codex_col_x, _antigravity_col_x) = provider_column_x_positions(
-                content_x,
+            let active_families = active_family_count(
                 show_claude_code,
                 show_codex,
                 show_antigravity,
+                show_github_copilot,
             );
-            let divider_column_width = model_usage_width(row_bar_segment_count(
-                active_model_count(show_claude_code, show_codex, show_antigravity),
-            ));
+            let divider_column_width = model_usage_width(row_bar_segment_count(active_families));
             let column_divider_w = sc(1).max(1);
             let column_divider_brush = CreateSolidBrush(COLORREF(border.to_colorref()));
-            if show_claude_code && show_codex {
-                let boundary_x = claude_col_x + divider_column_width + sc(MODEL_RIGHT_MARGIN) / 2;
-                FillRect(
-                    hdc,
-                    &RECT {
-                        left: boundary_x,
-                        top: 0,
-                        right: boundary_x + column_divider_w,
-                        bottom: height,
-                    },
-                    column_divider_brush,
-                );
-            }
-            if show_codex && show_antigravity {
-                let boundary_x = codex_col_x + divider_column_width + sc(MODEL_RIGHT_MARGIN) / 2;
+            let first_column_x = content_x + sc(LABEL_WIDTH) + sc(LABEL_RIGHT_MARGIN);
+            for index in 1..active_families {
+                let boundary_x = first_column_x
+                    + index * divider_column_width
+                    + (index - 1) * sc(MODEL_RIGHT_MARGIN)
+                    + sc(MODEL_RIGHT_MARGIN) / 2;
                 FillRect(
                     hdc,
                     &RECT {
@@ -4010,15 +4278,35 @@ fn paint_content(
 
 fn do_poll(send_hwnd: SendHwnd) {
     let hwnd = send_hwnd.to_hwnd();
-    let (show_claude_code, show_codex, show_antigravity) = {
+    let (show_claude_code, show_codex, show_antigravity, show_github_copilot, github_copilot_plan) = {
         let state = lock_state();
         state
             .as_ref()
-            .map(|s| (s.show_claude_code, s.show_codex, s.show_antigravity))
-            .unwrap_or((true, false, false))
+            .map(|s| {
+                (
+                    s.show_claude_code,
+                    s.show_codex,
+                    s.show_antigravity,
+                    s.show_github_copilot,
+                    s.github_copilot_plan,
+                )
+            })
+            .unwrap_or((
+                true,
+                false,
+                false,
+                false,
+                poller::GithubCopilotPlan::Unknown,
+            ))
     };
 
-    let report = poller::poll_report(show_claude_code, show_codex, show_antigravity);
+    let report = poller::poll_report_with_github_copilot(
+        show_claude_code,
+        show_codex,
+        show_antigravity,
+        show_github_copilot,
+        github_copilot_plan,
+    );
 
     match report.clone().into_app_usage_data() {
         Ok(data) => {
@@ -4041,6 +4329,7 @@ fn do_poll(send_hwnd: SendHwnd) {
                     poll_cell_states(&report.antigravity);
                 s.antigravity_session_state = antigravity_session_state;
                 s.antigravity_weekly_state = antigravity_weekly_state;
+                s.github_copilot_state = poll_cell_states(&report.github_copilot).0;
 
                 // Stop fast-poll if reset data is now fresh
                 if !poller::app_is_past_reset(&data) {
@@ -4073,6 +4362,16 @@ fn do_poll(send_hwnd: SendHwnd) {
         }
         Err(e) => {
             let auth_watch = match e {
+                poller::PollError::AuthRequired
+                | poller::PollError::TokenExpired
+                | poller::PollError::NoCredentials
+                    if show_github_copilot
+                        && !show_claude_code
+                        && !show_codex
+                        && !show_antigravity =>
+                {
+                    None
+                }
                 poller::PollError::AuthRequired | poller::PollError::TokenExpired
                     if show_antigravity && !show_claude_code && !show_codex =>
                 {
@@ -4116,6 +4415,7 @@ fn do_poll(send_hwnd: SendHwnd) {
                         poll_cell_states(&report.antigravity);
                     s.antigravity_session_state = antigravity_session_state;
                     s.antigravity_weekly_state = antigravity_weekly_state;
+                    s.github_copilot_state = poll_cell_states(&report.github_copilot).0;
                     // No-op in practice today (a total-failure `report` never
                     // contains a `Success` outcome), but keeps this branch
                     // using the exact same update path as the success branch
@@ -4272,27 +4572,12 @@ fn schedule_countdown_timer() {
         }
     }
 
-    let delays = [
-        data.claude_code
-            .as_ref()
-            .and_then(|usage| poller::time_until_display_change(usage.session.resets_at)),
-        data.claude_code
-            .as_ref()
-            .and_then(|usage| poller::time_until_display_change(usage.weekly.resets_at)),
-        data.codex
-            .as_ref()
-            .and_then(|usage| poller::time_until_display_change(usage.session.resets_at)),
-        data.codex
-            .as_ref()
-            .and_then(|usage| poller::time_until_display_change(usage.weekly.resets_at)),
-        data.antigravity
-            .as_ref()
-            .and_then(|usage| poller::time_until_display_change(usage.session.resets_at)),
-        data.antigravity
-            .as_ref()
-            .and_then(|usage| poller::time_until_display_change(usage.weekly.resets_at)),
-    ];
-    let min_delay = delays.into_iter().flatten().min();
+    let min_delay = data
+        .families
+        .iter()
+        .flat_map(|family| family.items.iter())
+        .filter_map(|item| poller::time_until_display_change(item.resets_at))
+        .min();
 
     let ms = min_delay
         .unwrap_or(Duration::from_secs(60))
@@ -5094,19 +5379,36 @@ unsafe extern "system" fn wnd_proc(
                     // Reset the poll timer with the new interval
                     SetTimer(hwnd, TIMER_POLL, new_interval, None);
                 }
-                IDM_MODEL_CLAUDE_CODE | IDM_MODEL_CODEX => {
+                IDM_MODEL_CLAUDE_CODE | IDM_MODEL_CODEX | IDM_MODEL_GITHUB_COPILOT => {
                     {
                         let mut state = lock_state();
                         if let Some(s) = state.as_mut() {
                             match id {
                                 IDM_MODEL_CLAUDE_CODE => {
-                                    if s.show_codex || s.show_antigravity || !s.show_claude_code {
+                                    if s.show_codex
+                                        || s.show_antigravity
+                                        || s.show_github_copilot
+                                        || !s.show_claude_code
+                                    {
                                         s.show_claude_code = !s.show_claude_code;
                                     }
                                 }
                                 IDM_MODEL_CODEX => {
-                                    if s.show_claude_code || s.show_antigravity || !s.show_codex {
+                                    if s.show_claude_code
+                                        || s.show_antigravity
+                                        || s.show_github_copilot
+                                        || !s.show_codex
+                                    {
                                         s.show_codex = !s.show_codex;
+                                    }
+                                }
+                                IDM_MODEL_GITHUB_COPILOT => {
+                                    if s.show_claude_code
+                                        || s.show_codex
+                                        || s.show_antigravity
+                                        || !s.show_github_copilot
+                                    {
+                                        s.show_github_copilot = !s.show_github_copilot;
                                     }
                                 }
                                 _ => {}
@@ -5117,6 +5419,7 @@ unsafe extern "system" fn wnd_proc(
                             s.codex_weekly_state = CellState::Loading;
                             s.antigravity_session_state = CellState::Loading;
                             s.antigravity_weekly_state = CellState::Loading;
+                            s.github_copilot_state = CellState::Loading;
                             refresh_usage_texts(s);
                         }
                     }
@@ -5134,7 +5437,11 @@ unsafe extern "system" fn wnd_proc(
                     {
                         let mut state = lock_state();
                         if let Some(s) = state.as_mut() {
-                            if s.show_claude_code || s.show_codex || !s.show_antigravity {
+                            if s.show_claude_code
+                                || s.show_codex
+                                || s.show_github_copilot
+                                || !s.show_antigravity
+                            {
                                 s.show_antigravity = !s.show_antigravity;
                             }
                             s.session_state = CellState::Loading;
@@ -5143,6 +5450,7 @@ unsafe extern "system" fn wnd_proc(
                             s.codex_weekly_state = CellState::Loading;
                             s.antigravity_session_state = CellState::Loading;
                             s.antigravity_weekly_state = CellState::Loading;
+                            s.github_copilot_state = CellState::Loading;
                             refresh_usage_texts(s);
                         }
                     }
@@ -5154,6 +5462,30 @@ unsafe extern "system" fn wnd_proc(
                     std::thread::spawn(move || {
                         do_poll(sh);
                     });
+                }
+                IDM_GITHUB_COPILOT_PLAN_UNKNOWN
+                | IDM_GITHUB_COPILOT_PLAN_PRO
+                | IDM_GITHUB_COPILOT_PLAN_PRO_PLUS
+                | IDM_GITHUB_COPILOT_PLAN_MAX => {
+                    let plan = match id {
+                        IDM_GITHUB_COPILOT_PLAN_PRO => poller::GithubCopilotPlan::Pro,
+                        IDM_GITHUB_COPILOT_PLAN_PRO_PLUS => poller::GithubCopilotPlan::ProPlus,
+                        IDM_GITHUB_COPILOT_PLAN_MAX => poller::GithubCopilotPlan::Max,
+                        _ => poller::GithubCopilotPlan::Unknown,
+                    };
+                    {
+                        let mut state = lock_state();
+                        if let Some(s) = state.as_mut() {
+                            s.github_copilot_plan = plan;
+                            s.github_copilot_state = CellState::Loading;
+                            refresh_usage_texts(s);
+                        }
+                    }
+                    save_state_settings();
+                    render_layered();
+                    sync_tray_icons(hwnd);
+                    let sh = SendHwnd::from_hwnd(hwnd);
+                    std::thread::spawn(move || do_poll(sh));
                 }
                 IDM_LANG_SYSTEM
                 | IDM_LANG_ENGLISH
@@ -5240,6 +5572,8 @@ fn show_context_menu(hwnd: HWND) {
             show_claude_code,
             show_codex,
             show_antigravity,
+            show_github_copilot,
+            github_copilot_plan,
             display_basis,
             display_density,
             short_window_visibility,
@@ -5261,6 +5595,8 @@ fn show_context_menu(hwnd: HWND) {
                     s.show_claude_code,
                     s.show_codex,
                     s.show_antigravity,
+                    s.show_github_copilot,
+                    s.github_copilot_plan,
                     s.display_basis,
                     s.display_density,
                     s.short_window_visibility,
@@ -5280,6 +5616,8 @@ fn show_context_menu(hwnd: HWND) {
                     true,
                     false,
                     false,
+                    false,
+                    poller::GithubCopilotPlan::Unknown,
                     DisplayBasis::default(),
                     DisplayDensity::default(),
                     ShortWindowVisibility::default(),
@@ -5375,12 +5713,69 @@ fn show_context_menu(hwnd: HWND) {
             );
         }
 
+        let github_copilot_model = native_interop::wide_str("GitHub Copilot");
+        let github_copilot_flags = if show_github_copilot {
+            MF_CHECKED
+        } else {
+            MENU_ITEM_FLAGS(0)
+        };
+        let _ = AppendMenuW(
+            models_menu,
+            github_copilot_flags,
+            IDM_MODEL_GITHUB_COPILOT as usize,
+            PCWSTR::from_raw(github_copilot_model.as_ptr()),
+        );
+
         let models_label = native_interop::wide_str(strings.models);
         let _ = AppendMenuW(
             menu,
             MF_POPUP,
             models_menu.0 as usize,
             PCWSTR::from_raw(models_label.as_ptr()),
+        );
+
+        let copilot_plan_menu = CreatePopupMenu().unwrap();
+        for (id, plan, label) in [
+            (
+                IDM_GITHUB_COPILOT_PLAN_UNKNOWN,
+                poller::GithubCopilotPlan::Unknown,
+                "Unknown (usage only)",
+            ),
+            (
+                IDM_GITHUB_COPILOT_PLAN_PRO,
+                poller::GithubCopilotPlan::Pro,
+                "Copilot Pro",
+            ),
+            (
+                IDM_GITHUB_COPILOT_PLAN_PRO_PLUS,
+                poller::GithubCopilotPlan::ProPlus,
+                "Copilot Pro+",
+            ),
+            (
+                IDM_GITHUB_COPILOT_PLAN_MAX,
+                poller::GithubCopilotPlan::Max,
+                "Copilot Max",
+            ),
+        ] {
+            let label = native_interop::wide_str(label);
+            let flags = if plan == github_copilot_plan {
+                MF_CHECKED
+            } else {
+                MENU_ITEM_FLAGS(0)
+            };
+            let _ = AppendMenuW(
+                copilot_plan_menu,
+                flags,
+                id as usize,
+                PCWSTR::from_raw(label.as_ptr()),
+            );
+        }
+        let copilot_plan_label = native_interop::wide_str("GitHub Copilot plan");
+        let _ = AppendMenuW(
+            menu,
+            MF_POPUP,
+            copilot_plan_menu.0 as usize,
+            PCWSTR::from_raw(copilot_plan_label.as_ptr()),
         );
 
         // Settings submenu
@@ -5812,9 +6207,12 @@ fn paint(hdc: HDC, hwnd: HWND) {
         antigravity_weekly_text,
         antigravity_weekly_pace,
         antigravity_weekly_remaining_text,
+        github_copilot_percent,
+        github_copilot_text,
         show_claude_code,
         show_codex,
         show_antigravity,
+        show_github_copilot,
     ) = {
         let state = lock_state();
         match state.as_ref() {
@@ -5848,9 +6246,12 @@ fn paint(hdc: HDC, hwnd: HWND) {
                 s.antigravity_weekly_text.clone(),
                 s.antigravity_weekly_pace.clone(),
                 s.antigravity_weekly_remaining_text.clone(),
+                s.github_copilot_percent,
+                s.github_copilot_text.clone(),
                 s.show_claude_code,
                 s.show_codex,
                 s.show_antigravity,
+                s.show_github_copilot,
             ),
             None => return,
         }
@@ -5918,9 +6319,12 @@ fn paint(hdc: HDC, hwnd: HWND) {
             &antigravity_weekly_text,
             antigravity_weekly_pace.as_ref(),
             antigravity_weekly_remaining_text.as_deref(),
+            github_copilot_percent,
+            &github_copilot_text,
             show_claude_code,
             show_codex,
             show_antigravity,
+            show_github_copilot,
             &codex_accent,
             &antigravity_accent,
             popup_layout,
@@ -5956,13 +6360,19 @@ fn draw_provider_header_row(
     show_claude_code: bool,
     show_codex: bool,
     show_antigravity: bool,
+    show_github_copilot: bool,
     show_weekly_remaining: bool,
     claude_weekly_remaining: Option<&str>,
     codex_weekly_remaining: Option<&str>,
     antigravity_weekly_remaining: Option<&str>,
     codex_banked_reset_text: &str,
 ) {
-    let active_models = active_model_count(show_claude_code, show_codex, show_antigravity);
+    let active_models = active_family_count(
+        show_claude_code,
+        show_codex,
+        show_antigravity,
+        show_github_copilot,
+    );
     let segment_count = row_bar_segment_count(active_models);
     let column_width = model_usage_width(segment_count);
 
@@ -6013,6 +6423,10 @@ fn draw_provider_header_row(
                     antigravity_weekly_remaining,
                 );
             }
+            model_x += column_width + sc(MODEL_RIGHT_MARGIN);
+        }
+        if show_github_copilot {
+            draw_header_label(hdc, model_x, y, column_width, "GitHub Copilot");
         }
     }
 }
@@ -6135,11 +6549,13 @@ fn provider_column_x_positions(
     show_claude_code: bool,
     show_codex: bool,
     show_antigravity: bool,
+    show_github_copilot: bool,
 ) -> (i32, i32, i32) {
-    let segment_count = row_bar_segment_count(active_model_count(
+    let segment_count = row_bar_segment_count(active_family_count(
         show_claude_code,
         show_codex,
         show_antigravity,
+        show_github_copilot,
     ));
     let column_width = model_usage_width(segment_count);
 
@@ -6214,62 +6630,33 @@ fn draw_weekly_pace_extra_lines(
     }
 }
 
+struct RowCell<'a> {
+    percent: Option<f64>,
+    text: &'a str,
+    accent: &'a Color,
+    provider_text_color: Color,
+    is_warning: bool,
+}
+
 fn draw_row(
     hdc: HDC,
     x: i32,
     y: i32,
-    provider_tint_dark: bool,
     text_color: &Color,
     label: &str,
-    claude_percent: Option<f64>,
-    claude_text: &str,
-    codex_percent: Option<f64>,
-    codex_text: &str,
-    antigravity_percent: Option<f64>,
-    antigravity_text: &str,
-    show_claude_code: bool,
-    show_codex: bool,
-    show_antigravity: bool,
-    claude_accent: &Color,
-    codex_accent: &Color,
-    antigravity_accent: &Color,
+    cells: &[RowCell<'_>],
     track: &Color,
     warning: &Color,
-    claude_is_warning: bool,
-    codex_is_warning: bool,
-    antigravity_is_warning: bool,
     track_outline: Option<&Color>,
 ) {
     let seg_h = sc(SEGMENT_H);
-    let active_models = active_model_count(show_claude_code, show_codex, show_antigravity);
+    let active_models = (cells.len() as i32).max(1);
     let segment_count = row_bar_segment_count(active_models);
     let use_model_text_colors = active_models > 1;
     // `is_warning` always wins the *value text* color, regardless of
     // `use_model_text_colors` — but never touches the bar segments below
     // (`draw_usage_bar`'s `accent` argument, passed separately), which stay
     // the provider's own identification color even while warning.
-    let claude_value_color = if claude_is_warning {
-        *warning
-    } else if use_model_text_colors {
-        claude_usage_text_color(provider_tint_dark)
-    } else {
-        *text_color
-    };
-    let codex_value_color = if codex_is_warning {
-        *warning
-    } else if use_model_text_colors {
-        codex_usage_text_color(provider_tint_dark)
-    } else {
-        *text_color
-    };
-    let antigravity_value_color = if antigravity_is_warning {
-        *warning
-    } else if use_model_text_colors {
-        antigravity_usage_text_color(provider_tint_dark)
-    } else {
-        *text_color
-    };
-
     unsafe {
         let _ = SetTextColor(hdc, COLORREF(text_color.to_colorref()));
         let mut label_wide: Vec<u16> = label.encode_utf16().collect();
@@ -6287,49 +6674,29 @@ fn draw_row(
         );
 
         let mut model_x = x + sc(LABEL_WIDTH) + sc(LABEL_RIGHT_MARGIN);
-        if show_claude_code {
+        for (index, cell) in cells.iter().enumerate() {
+            let value_color = if cell.is_warning {
+                *warning
+            } else if use_model_text_colors {
+                cell.provider_text_color
+            } else {
+                *text_color
+            };
             draw_usage_bar(
                 hdc,
                 model_x,
                 y,
                 segment_count,
-                claude_percent,
-                claude_text,
-                claude_accent,
+                cell.percent,
+                cell.text,
+                cell.accent,
                 track,
-                &claude_value_color,
+                &value_color,
                 track_outline,
             );
-            model_x += model_usage_width(segment_count) + sc(MODEL_RIGHT_MARGIN);
-        }
-        if show_codex {
-            draw_usage_bar(
-                hdc,
-                model_x,
-                y,
-                segment_count,
-                codex_percent,
-                codex_text,
-                codex_accent,
-                track,
-                &codex_value_color,
-                track_outline,
-            );
-            model_x += model_usage_width(segment_count) + sc(MODEL_RIGHT_MARGIN);
-        }
-        if show_antigravity {
-            draw_usage_bar(
-                hdc,
-                model_x,
-                y,
-                segment_count,
-                antigravity_percent,
-                antigravity_text,
-                antigravity_accent,
-                track,
-                &antigravity_value_color,
-                track_outline,
-            );
+            if index + 1 < cells.len() {
+                model_x += model_usage_width(segment_count) + sc(MODEL_RIGHT_MARGIN);
+            }
         }
     }
 }
@@ -6535,6 +6902,116 @@ fn draw_rounded_rect(hdc: HDC, rect: &RECT, color: &Color, radius: i32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::{QuotaItem, QuotaItemAvailability, QuotaUnit};
+
+    fn generic_item(metric: Option<QuotaMetric>, resets_at: Option<SystemTime>) -> QuotaItem {
+        QuotaItem {
+            id: "test".to_string(),
+            label: "Test".to_string(),
+            availability: QuotaItemAvailability::Available,
+            metric,
+            unit: QuotaUnit::AiCredits,
+            resets_at,
+        }
+    }
+
+    #[test]
+    fn generic_renderer_handles_percentage_limit_usage_only_and_remaining() {
+        let strings = LanguageId::English.strings();
+        let percentage = generic_item(Some(QuotaMetric::Percentage(25.0)), None);
+        let percentage_display = render_generic_quota_item(
+            CellState::Ok,
+            Some(&percentage),
+            DisplayBasis::UsedPercentage,
+            strings,
+        );
+        assert_eq!(percentage_display.bar_percent, Some(25.0));
+        assert_eq!(percentage_display.text, "25%");
+
+        let limited = generic_item(
+            Some(QuotaMetric::Used {
+                used: 375.0,
+                limit: Some(1_500.0),
+            }),
+            None,
+        );
+        let limited_display = render_generic_quota_item(
+            CellState::Ok,
+            Some(&limited),
+            DisplayBasis::UsedPercentage,
+            strings,
+        );
+        assert_eq!(limited_display.bar_percent, Some(25.0));
+        assert_eq!(limited_display.text, "375 / 1500 ai-credits");
+
+        let usage_only = generic_item(
+            Some(QuotaMetric::Used {
+                used: 17.5,
+                limit: None,
+            }),
+            None,
+        );
+        let usage_only_display = render_generic_quota_item(
+            CellState::Ok,
+            Some(&usage_only),
+            DisplayBasis::UsedPercentage,
+            strings,
+        );
+        assert_eq!(usage_only_display.bar_percent, None);
+        assert_eq!(usage_only_display.text, "17.50 ai-credits");
+
+        let remaining = generic_item(
+            Some(QuotaMetric::Remaining {
+                remaining: 300.0,
+                limit: Some(1_500.0),
+            }),
+            None,
+        );
+        assert_eq!(
+            render_generic_quota_item(
+                CellState::Ok,
+                Some(&remaining),
+                DisplayBasis::UsedPercentage,
+                strings,
+            )
+            .bar_percent,
+            Some(80.0)
+        );
+    }
+
+    #[test]
+    fn generic_renderer_keeps_reset_only_unavailable_and_zero_distinct() {
+        let strings = LanguageId::English.strings();
+        let reset_only = generic_item(None, Some(SystemTime::now() + Duration::from_secs(3_600)));
+        let reset_display = render_generic_quota_item(
+            CellState::Ok,
+            Some(&reset_only),
+            DisplayBasis::UsedPercentage,
+            strings,
+        );
+        assert_eq!(reset_display.bar_percent, None);
+        assert!(reset_display.text.contains(strings.reset_in));
+
+        let unavailable = QuotaItem::unavailable("missing", "Missing");
+        let unavailable_display = render_generic_quota_item(
+            CellState::Ok,
+            Some(&unavailable),
+            DisplayBasis::UsedPercentage,
+            strings,
+        );
+        assert_eq!(unavailable_display.bar_percent, None);
+        assert_eq!(unavailable_display.text, strings.not_available);
+
+        let zero = generic_item(Some(QuotaMetric::Percentage(0.0)), None);
+        let zero_display = render_generic_quota_item(
+            CellState::Ok,
+            Some(&zero),
+            DisplayBasis::UsedPercentage,
+            strings,
+        );
+        assert_eq!(zero_display.bar_percent, Some(0.0));
+        assert_eq!(zero_display.text, "0%");
+    }
 
     #[test]
     fn usage_bar_has_content_is_false_for_no_percent_and_empty_text() {
@@ -6853,6 +7330,41 @@ mod tests {
         let settings: SettingsFile =
             serde_json::from_str("{}").expect("legacy settings should deserialize");
         assert_eq!(settings.display_basis, DisplayBasis::UsedPercentage);
+    }
+
+    #[test]
+    fn legacy_settings_without_copilot_fields_default_to_disabled_unknown() {
+        let settings: SettingsFile =
+            serde_json::from_str("{}").expect("legacy settings should deserialize");
+        assert!(!settings.show_github_copilot);
+        assert_eq!(
+            settings.github_copilot_plan,
+            poller::GithubCopilotPlan::Unknown
+        );
+    }
+
+    #[test]
+    fn copilot_settings_round_trip_with_explicit_plan() {
+        let settings = SettingsFile {
+            show_github_copilot: true,
+            github_copilot_plan: poller::GithubCopilotPlan::ProPlus,
+            ..SettingsFile::default()
+        };
+        let json = serde_json::to_string(&settings).unwrap();
+        let decoded: SettingsFile = serde_json::from_str(&json).unwrap();
+        assert!(decoded.show_github_copilot);
+        assert_eq!(
+            decoded.github_copilot_plan,
+            poller::GithubCopilotPlan::ProPlus
+        );
+        assert!(json.contains("\"github_copilot_plan\":\"pro_plus\""));
+    }
+
+    #[test]
+    fn codex_display_name_is_not_chatgpt_in_any_language() {
+        for language in LanguageId::ALL {
+            assert_eq!(language.strings().codex_model, "Codex");
+        }
     }
 
     #[test]
@@ -7814,6 +8326,7 @@ mod tests {
             IDM_LANG_SIMPLIFIED_CHINESE,
             IDM_MODEL_CLAUDE_CODE,
             IDM_MODEL_CODEX,
+            IDM_MODEL_GITHUB_COPILOT,
             IDM_DISPLAY_BASIS_USED,
             IDM_DISPLAY_BASIS_REMAINING,
             IDM_DISPLAY_DENSITY_COMPACT,
@@ -7830,6 +8343,10 @@ mod tests {
             IDM_APP_THEME_RECOMMENDED_DARK,
             IDM_APP_THEME_LIGHT,
             IDM_APP_THEME_HIGH_VISIBILITY,
+            IDM_GITHUB_COPILOT_PLAN_UNKNOWN,
+            IDM_GITHUB_COPILOT_PLAN_PRO,
+            IDM_GITHUB_COPILOT_PLAN_PRO_PLUS,
+            IDM_GITHUB_COPILOT_PLAN_MAX,
             tray_icon::IDM_TOGGLE_WIDGET,
         ];
         #[cfg(feature = "self-update")]
@@ -9840,8 +10357,12 @@ mod tests {
         // Previous poll cached Claude at 10% and Codex at 20%.
         let mut cached: Option<AppUsageData> = Some({
             let mut data = AppUsageData::default();
-            data.claude_code = Some(usage_data_with_session_percent(10.0));
-            data.codex = Some(usage_data_with_session_percent(20.0));
+            data.upsert(
+                usage_data_with_session_percent(10.0).into_quota_family(QuotaFamilyId::Claude),
+            );
+            data.upsert(
+                usage_data_with_session_percent(20.0).into_quota_family(QuotaFamilyId::Codex),
+            );
             data
         });
 
@@ -9859,24 +10380,26 @@ mod tests {
                 error: poller::PollError::RequestFailed,
             },
             antigravity: poller::ProviderPollOutcome::Disabled,
+            github_copilot: poller::ProviderPollOutcome::Disabled,
         };
 
         merge_successful_providers(&mut cached, &report);
         let merged = cached.expect("merge must not drop the cache");
         let claude = merged
-            .claude_code
-            .as_ref()
+            .family(QuotaFamilyId::Claude)
             .expect("claude succeeded this poll");
-        assert_eq!(claude.session.percentage, 70.0);
+        assert_eq!(
+            claude.item("session").unwrap().used_percentage(),
+            Some(70.0)
+        );
 
         // Codex didn't succeed this poll, so its cache is left as-is (still
         // the previous 20%) — merge only overwrites providers that actually
         // succeeded this round.
         let codex = merged
-            .codex
-            .as_ref()
+            .family(QuotaFamilyId::Codex)
             .expect("previous Codex cache should remain untouched by merge");
-        assert_eq!(codex.session.percentage, 20.0);
+        assert_eq!(codex.item("session").unwrap().used_percentage(), Some(20.0));
 
         // Rendering with the states this same report would produce (as
         // do_poll does) must show Claude's fresh value, and must never show
@@ -9888,7 +10411,7 @@ mod tests {
         let (claude_session_state, _) = poll_cell_states(&report.claude_code);
         let claude_display = render_cell(
             claude_session_state,
-            Some(&claude.session),
+            quota_item_section(Some(&merged), QuotaFamilyId::Claude, "session").as_ref(),
             DisplayBasis::UsedPercentage,
             strings,
         );
@@ -9898,7 +10421,7 @@ mod tests {
         assert_eq!(codex_session_state, CellState::Retrying);
         let codex_display = render_cell(
             codex_session_state,
-            Some(&codex.session),
+            quota_item_section(Some(&merged), QuotaFamilyId::Codex, "session").as_ref(),
             DisplayBasis::UsedPercentage,
             strings,
         );

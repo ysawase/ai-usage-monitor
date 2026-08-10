@@ -19,7 +19,10 @@ use std::os::windows::process::CommandExt;
 
 use crate::diagnose;
 use crate::localization::Strings;
-use crate::models::{AppUsageData, BankedResetCount, UsageData, UsageSection};
+use crate::models::{
+    AppUsageData, BankedResetCount, QuotaFamily, QuotaFamilyId, QuotaFamilyStatus, QuotaItem,
+    QuotaItemAvailability, QuotaMetric, QuotaUnit, UsageData, UsageSection,
+};
 
 const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 #[cfg(feature = "claude-messages-fallback")]
@@ -27,6 +30,8 @@ const MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
 const CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 const CODEX_APP_SERVER_TIMEOUT: Duration = Duration::from_secs(10);
 const CODEX_BANKED_RESET_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
+const GITHUB_API_VERSION: &str = "2026-03-10";
+const GITHUB_COPILOT_USAGE_ENDPOINT_SUFFIX: &str = "/settings/billing/ai_credit/usage";
 #[cfg(feature = "antigravity")]
 const ANTIGRAVITY_CREDENTIAL_TARGET: &str = "gemini:antigravity";
 #[cfg(feature = "antigravity")]
@@ -48,11 +53,42 @@ pub enum PollError {
     RequestFailed,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum GithubCopilotPlan {
+    #[default]
+    Unknown,
+    Pro,
+    ProPlus,
+    Max,
+}
+
+impl GithubCopilotPlan {
+    pub(crate) const fn allowance(self) -> Option<f64> {
+        match self {
+            Self::Unknown => None,
+            Self::Pro => Some(1_500.0),
+            Self::ProPlus => Some(7_000.0),
+            Self::Max => Some(20_000.0),
+        }
+    }
+
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Unknown => "Unknown",
+            Self::Pro => "Pro",
+            Self::ProPlus => "Pro+",
+            Self::Max => "Max",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ProviderPollSource {
     AnthropicOauthUsage,
     ChatgptWhamUsage,
     AntigravityQuotaUsage,
+    GithubBillingApi,
 }
 
 #[derive(Clone, Debug)]
@@ -76,38 +112,37 @@ pub(crate) struct PollReport {
     pub(crate) claude_code: ProviderPollOutcome,
     pub(crate) codex: ProviderPollOutcome,
     pub(crate) antigravity: ProviderPollOutcome,
+    pub(crate) github_copilot: ProviderPollOutcome,
 }
 
 impl PollReport {
     pub(crate) fn into_app_usage_data(self) -> Result<AppUsageData, PollError> {
         let mut data = AppUsageData::default();
         let mut first_error = None;
+        let mut any_success = false;
 
-        match self.claude_code {
-            ProviderPollOutcome::Success { usage, .. } => data.claude_code = Some(usage),
-            ProviderPollOutcome::Error { error, .. } => {
-                first_error.get_or_insert(error);
+        for (id, outcome) in [
+            (QuotaFamilyId::Claude, self.claude_code),
+            (QuotaFamilyId::Codex, self.codex),
+            (QuotaFamilyId::Antigravity, self.antigravity),
+            (QuotaFamilyId::GithubCopilot, self.github_copilot),
+        ] {
+            match outcome {
+                ProviderPollOutcome::Success { usage, .. } => {
+                    any_success = true;
+                    data.upsert(usage.into_quota_family(id));
+                }
+                ProviderPollOutcome::Error { error, .. } => {
+                    first_error.get_or_insert(error);
+                    data.upsert(QuotaFamily::with_status(id, QuotaFamilyStatus::Unavailable));
+                }
+                ProviderPollOutcome::Disabled => {
+                    data.upsert(QuotaFamily::with_status(id, QuotaFamilyStatus::Disabled));
+                }
             }
-            ProviderPollOutcome::Disabled => {}
         }
 
-        match self.codex {
-            ProviderPollOutcome::Success { usage, .. } => data.codex = Some(usage),
-            ProviderPollOutcome::Error { error, .. } => {
-                first_error.get_or_insert(error);
-            }
-            ProviderPollOutcome::Disabled => {}
-        }
-
-        match self.antigravity {
-            ProviderPollOutcome::Success { usage, .. } => data.antigravity = Some(usage),
-            ProviderPollOutcome::Error { error, .. } => {
-                first_error.get_or_insert(error);
-            }
-            ProviderPollOutcome::Disabled => {}
-        }
-
-        if data.claude_code.is_none() && data.codex.is_none() && data.antigravity.is_none() {
+        if !any_success {
             Err(first_error.unwrap_or(PollError::RequestFailed))
         } else {
             Ok(data)
@@ -150,6 +185,22 @@ struct CodexTokenData {
 #[derive(Deserialize)]
 struct CodexUsageResponse {
     rate_limit: Option<Option<Box<CodexRateLimitDetails>>>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GithubAiCreditUsageResponse {
+    #[serde(default)]
+    usage_items: Vec<GithubAiCreditUsageItem>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GithubAiCreditUsageItem {
+    product: String,
+    sku: String,
+    unit_type: String,
+    gross_quantity: f64,
 }
 
 #[derive(Deserialize)]
@@ -347,6 +398,23 @@ pub(crate) fn poll_report(
     }
 }
 
+pub(crate) fn poll_report_with_github_copilot(
+    show_claude_code: bool,
+    show_codex: bool,
+    show_antigravity: bool,
+    show_github_copilot: bool,
+    github_copilot_plan: GithubCopilotPlan,
+) -> PollReport {
+    let mut report = poll_report(show_claude_code, show_codex, show_antigravity);
+    report.github_copilot = poll_provider(
+        show_github_copilot,
+        ProviderPollSource::GithubBillingApi,
+        &mut || poll_github_copilot(github_copilot_plan),
+        &mut SystemTime::now,
+    );
+    report
+}
+
 fn poll_with(
     show_claude_code: bool,
     show_codex: bool,
@@ -426,6 +494,7 @@ fn poll_report_with_clock(
         claude_code,
         codex,
         antigravity,
+        github_copilot: ProviderPollOutcome::Disabled,
     }
 }
 
@@ -529,6 +598,122 @@ fn poll_antigravity() -> Result<UsageData, PollError> {
     };
 
     fetch_antigravity_usage(&creds.access_token)
+}
+
+fn poll_github_copilot(plan: GithubCopilotPlan) -> Result<UsageData, PollError> {
+    let username = run_gh_api(&["user", "--jq", ".login"])?;
+    let username = username.trim();
+    if username.is_empty() || username.contains(['/', '\\', '?', '#']) {
+        return Err(PollError::RequestFailed);
+    }
+
+    let endpoint = format!("/users/{username}{GITHUB_COPILOT_USAGE_ENDPOINT_SUFFIX}");
+    let json = run_gh_api(&[
+        "-H",
+        "Accept: application/vnd.github+json",
+        "-H",
+        &format!("X-GitHub-Api-Version: {GITHUB_API_VERSION}"),
+        &endpoint,
+    ])?;
+    let response: GithubAiCreditUsageResponse =
+        serde_json::from_str(&json).map_err(|_| PollError::RequestFailed)?;
+    github_copilot_usage_from_response(response, plan, SystemTime::now())
+}
+
+fn run_gh_api(args: &[&str]) -> Result<String, PollError> {
+    let mut command = Command::new("gh.exe");
+    command
+        .arg("api")
+        .args(args)
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null());
+    let output =
+        run_with_timeout(&mut command, Duration::from_secs(20)).ok_or(PollError::NoCredentials)?;
+    if !output.status.success() {
+        return Err(PollError::AuthRequired);
+    }
+    String::from_utf8(output.stdout).map_err(|_| PollError::RequestFailed)
+}
+
+fn github_copilot_usage_from_response(
+    response: GithubAiCreditUsageResponse,
+    plan: GithubCopilotPlan,
+    now: SystemTime,
+) -> Result<UsageData, PollError> {
+    let had_items = !response.usage_items.is_empty();
+    let mut matched = false;
+    let mut gross_usage = 0.0;
+    for item in response.usage_items {
+        let product = item.product.to_ascii_lowercase();
+        let sku = item.sku.to_ascii_lowercase();
+        let unit = item.unit_type.to_ascii_lowercase();
+        let is_copilot_credit =
+            product.contains("copilot") && (sku.contains("ai credit") || unit.contains("credit"));
+        if !is_copilot_credit {
+            continue;
+        }
+        if !item.gross_quantity.is_finite() || item.gross_quantity < 0.0 {
+            return Err(PollError::RequestFailed);
+        }
+        matched = true;
+        gross_usage += item.gross_quantity;
+    }
+    if had_items && !matched {
+        return Err(PollError::RequestFailed);
+    }
+
+    let metric = QuotaMetric::Used {
+        used: gross_usage,
+        limit: plan.allowance(),
+    };
+    Ok(UsageData::from_quota_items(vec![QuotaItem {
+        id: "monthly_ai_credits".to_string(),
+        label: "Monthly AI credits".to_string(),
+        availability: QuotaItemAvailability::Available,
+        metric: Some(metric),
+        unit: QuotaUnit::AiCredits,
+        resets_at: next_calendar_month_utc(now),
+    }]))
+}
+
+fn next_calendar_month_utc(now: SystemTime) -> Option<SystemTime> {
+    let seconds = now.duration_since(UNIX_EPOCH).ok()?.as_secs();
+    let days = i64::try_from(seconds / 86_400).ok()?;
+    let (year, month, _) = civil_from_days(days);
+    let (next_year, next_month) = if month == 12 {
+        (year + 1, 1)
+    } else {
+        (year, month + 1)
+    };
+    let next_days = days_from_civil(next_year, next_month, 1);
+    let next_seconds = u64::try_from(next_days).ok()?.checked_mul(86_400)?;
+    Some(UNIX_EPOCH + Duration::from_secs(next_seconds))
+}
+
+fn civil_from_days(days_since_epoch: i64) -> (i32, u32, u32) {
+    let z = days_since_epoch + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let day_of_era = z - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let mut year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+    year += i64::from(month <= 2);
+    (year as i32, month as u32, day as u32)
+}
+
+fn days_from_civil(year: i32, month: u32, day: u32) -> i64 {
+    let year = i64::from(year) - i64::from(month <= 2);
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let year_of_era = year - era * 400;
+    let month = i64::from(month);
+    let day_of_year = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + i64::from(day) - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
 }
 
 #[cfg(feature = "legacy-auto-refresh")]
@@ -2190,9 +2375,13 @@ pub fn is_past_reset(data: &UsageData) -> bool {
 }
 
 pub fn app_is_past_reset(data: &AppUsageData) -> bool {
-    data.claude_code.as_ref().is_some_and(is_past_reset)
-        || data.codex.as_ref().is_some_and(is_past_reset)
-        || data.antigravity.as_ref().is_some_and(is_past_reset)
+    let now = SystemTime::now();
+    data.families.iter().any(|family| {
+        family
+            .items
+            .iter()
+            .any(|item| matches!(item.resets_at, Some(reset) if now.duration_since(reset).is_ok()))
+    })
 }
 
 #[cfg(test)]
@@ -2604,11 +2793,13 @@ mod tests {
         .into_app_usage_data()
         .expect("Codex data should keep the poll successful");
 
-        assert!(data.claude_code.is_none());
-        let codex = data.codex.unwrap();
-        assert_eq!(codex.session.percentage, 42.0);
-        assert!(codex.session_available());
-        assert!(!codex.weekly_available());
+        assert_eq!(
+            data.family(QuotaFamilyId::Claude).unwrap().status,
+            QuotaFamilyStatus::Unavailable
+        );
+        let codex = data.family(QuotaFamilyId::Codex).unwrap();
+        assert_eq!(codex.item("session").unwrap().used_percentage(), Some(42.0));
+        assert!(codex.item("weekly").is_none());
     }
 
     #[test]
@@ -2724,8 +2915,18 @@ mod tests {
         )
         .expect("codex data should keep the poll successful");
 
-        assert!(data.claude_code.is_none());
-        assert_eq!(data.codex.unwrap().session.percentage, 42.0);
+        assert_eq!(
+            data.family(QuotaFamilyId::Claude).unwrap().status,
+            QuotaFamilyStatus::Unavailable
+        );
+        assert_eq!(
+            data.family(QuotaFamilyId::Codex)
+                .unwrap()
+                .item("session")
+                .unwrap()
+                .used_percentage(),
+            Some(42.0)
+        );
     }
 
     #[test]
@@ -2740,8 +2941,18 @@ mod tests {
         )
         .expect("claude data should keep the poll successful");
 
-        assert_eq!(data.claude_code.unwrap().session.percentage, 64.0);
-        assert!(data.codex.is_none());
+        assert_eq!(
+            data.family(QuotaFamilyId::Claude)
+                .unwrap()
+                .item("session")
+                .unwrap()
+                .used_percentage(),
+            Some(64.0)
+        );
+        assert_eq!(
+            data.family(QuotaFamilyId::Codex).unwrap().status,
+            QuotaFamilyStatus::Unavailable
+        );
     }
 
     #[test]
@@ -2771,8 +2982,111 @@ mod tests {
         )
         .expect("codex data should keep the poll successful");
 
-        assert!(data.antigravity.is_none());
-        assert_eq!(data.codex.unwrap().session.percentage, 42.0);
+        assert_eq!(
+            data.family(QuotaFamilyId::Antigravity).unwrap().status,
+            QuotaFamilyStatus::Unavailable
+        );
+        assert_eq!(
+            data.family(QuotaFamilyId::Codex)
+                .unwrap()
+                .item("session")
+                .unwrap()
+                .used_percentage(),
+            Some(42.0)
+        );
+    }
+
+    #[test]
+    fn github_copilot_uses_gross_quantity_and_ignores_net_quantity() {
+        let response: GithubAiCreditUsageResponse = serde_json::from_str(
+            r#"{
+                "usageItems": [
+                    {
+                        "product": "Copilot",
+                        "sku": "Copilot AI Credits",
+                        "unitType": "credits",
+                        "grossQuantity": 0.681855,
+                        "netQuantity": 0
+                    },
+                    {
+                        "product": "Copilot",
+                        "sku": "Copilot AI Credits",
+                        "unitType": "credits",
+                        "grossQuantity": 1.25,
+                        "netQuantity": 999
+                    }
+                ]
+            }"#,
+        )
+        .expect("GitHub response should deserialize without retaining netQuantity");
+
+        let usage =
+            github_copilot_usage_from_response(response, GithubCopilotPlan::Pro, UNIX_EPOCH)
+                .expect("Copilot credit rows should aggregate");
+        let item = usage.quota_items().pop().unwrap();
+        assert_eq!(
+            item.metric,
+            Some(QuotaMetric::Used {
+                used: 1.931855,
+                limit: Some(1_500.0),
+            })
+        );
+    }
+
+    #[test]
+    fn github_copilot_plan_allowances_are_manual_and_unknown_is_usage_only() {
+        assert_eq!(GithubCopilotPlan::Unknown.allowance(), None);
+        assert_eq!(GithubCopilotPlan::Pro.allowance(), Some(1_500.0));
+        assert_eq!(GithubCopilotPlan::ProPlus.allowance(), Some(7_000.0));
+        assert_eq!(GithubCopilotPlan::Max.allowance(), Some(20_000.0));
+
+        let usage = github_copilot_usage_from_response(
+            GithubAiCreditUsageResponse {
+                usage_items: Vec::new(),
+            },
+            GithubCopilotPlan::Unknown,
+            UNIX_EPOCH,
+        )
+        .expect("an empty successful response is valid zero usage");
+        assert_eq!(
+            usage.quota_items()[0].metric,
+            Some(QuotaMetric::Used {
+                used: 0.0,
+                limit: None,
+            })
+        );
+    }
+
+    #[test]
+    fn github_copilot_unrecognized_nonempty_response_is_not_zero() {
+        let error = github_copilot_usage_from_response(
+            GithubAiCreditUsageResponse {
+                usage_items: vec![GithubAiCreditUsageItem {
+                    product: "Actions".to_string(),
+                    sku: "Linux minutes".to_string(),
+                    unit_type: "minutes".to_string(),
+                    gross_quantity: 12.0,
+                }],
+            },
+            GithubCopilotPlan::Pro,
+            UNIX_EPOCH,
+        )
+        .expect_err("an unexpected API shape must remain unavailable, never zero");
+        assert_eq!(error, PollError::RequestFailed);
+    }
+
+    #[test]
+    fn github_copilot_reset_is_first_day_of_next_calendar_month_utc() {
+        let now = UNIX_EPOCH
+            + Duration::from_secs(days_from_civil(2026, 12, 31) as u64 * 86_400 + 86_399);
+        let expected =
+            UNIX_EPOCH + Duration::from_secs(days_from_civil(2027, 1, 1) as u64 * 86_400);
+        assert_eq!(next_calendar_month_utc(now), Some(expected));
+
+        let february =
+            UNIX_EPOCH + Duration::from_secs(days_from_civil(2028, 2, 29) as u64 * 86_400 + 1);
+        let march = UNIX_EPOCH + Duration::from_secs(days_from_civil(2028, 3, 1) as u64 * 86_400);
+        assert_eq!(next_calendar_month_utc(february), Some(march));
     }
 
     #[cfg(not(feature = "antigravity"))]

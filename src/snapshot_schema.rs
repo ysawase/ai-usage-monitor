@@ -1,11 +1,14 @@
 use std::{
+    collections::BTreeMap,
     fmt,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::models::{UsageData, UsageSection};
+use crate::models::{
+    QuotaFamilyId, QuotaItem, QuotaItemAvailability, QuotaMetric, UsageData, UsageSection,
+};
 use crate::poller::{PollError, PollReport, ProviderPollOutcome, ProviderPollSource};
 use crate::snapshot_store::MachineId;
 
@@ -89,6 +92,11 @@ pub(crate) fn snapshot_from_poll_report(
         provider_snapshot_from_outcome(&report.codex)?,
         provider_snapshot_from_outcome(&report.antigravity)?,
     );
+    let mut providers = providers;
+    providers.insert(
+        QuotaFamilyId::GithubCopilot.stable_id(),
+        provider_snapshot_from_outcome(&report.github_copilot)?,
+    );
 
     Ok(SnapshotV1::new(
         machine_id.as_str().to_string(),
@@ -132,6 +140,7 @@ fn provider_source(source: ProviderPollSource) -> ProviderSource {
         ProviderPollSource::AnthropicOauthUsage => ProviderSource::AnthropicOauthUsage,
         ProviderPollSource::ChatgptWhamUsage => ProviderSource::ChatgptWhamUsage,
         ProviderPollSource::AntigravityQuotaUsage => ProviderSource::AntigravityQuotaUsage,
+        ProviderPollSource::GithubBillingApi => ProviderSource::GithubBillingApi,
     }
 }
 
@@ -156,7 +165,17 @@ fn provider_usage(usage: &UsageData) -> Result<ProviderUsage, SnapshotConversion
         .then(|| usage_window(&usage.weekly))
         .transpose()?;
 
-    Ok(ProviderUsage::new(session, weekly))
+    let quota_items = usage
+        .quota_items()
+        .iter()
+        .map(SnapshotQuotaItem::from_runtime)
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(ProviderUsage::with_quota_items(
+        session,
+        weekly,
+        quota_items,
+    ))
 }
 
 fn usage_window(section: &UsageSection) -> Result<UsageWindow, SnapshotConversionError> {
@@ -173,6 +192,7 @@ fn earliest_attempted_at(report: &PollReport) -> Option<SystemTime> {
         attempted_at(&report.claude_code),
         attempted_at(&report.codex),
         attempted_at(&report.antigravity),
+        attempted_at(&report.github_copilot),
     ]
     .into_iter()
     .flatten()
@@ -269,11 +289,8 @@ enum TimestampUnit {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct Providers {
-    claude_code: ProviderSnapshot,
-    codex: ProviderSnapshot,
-    antigravity: ProviderSnapshot,
-}
+#[serde(transparent)]
+pub struct Providers(BTreeMap<String, ProviderSnapshot>);
 
 impl Providers {
     pub fn new(
@@ -281,20 +298,33 @@ impl Providers {
         codex: ProviderSnapshot,
         antigravity: ProviderSnapshot,
     ) -> Self {
-        Self {
-            claude_code,
-            codex,
-            antigravity,
-        }
+        Self(BTreeMap::from([
+            ("claude_code".to_string(), claude_code),
+            ("codex".to_string(), codex),
+            ("antigravity".to_string(), antigravity),
+        ]))
+    }
+
+    pub fn insert(&mut self, family_id: impl Into<String>, snapshot: ProviderSnapshot) {
+        self.0.insert(family_id.into(), snapshot);
+    }
+
+    pub fn get(&self, family_id: &str) -> Option<&ProviderSnapshot> {
+        self.0.get(family_id)
     }
 
     fn validate(&self) -> Result<(), SnapshotValidationError> {
-        self.claude_code
-            .validate(Some(ProviderSource::AnthropicOauthUsage))?;
-        self.codex
-            .validate(Some(ProviderSource::ChatgptWhamUsage))?;
-        self.antigravity
-            .validate(Some(ProviderSource::AntigravityQuotaUsage))
+        for (family_id, provider) in &self.0 {
+            let expected_source = match family_id.as_str() {
+                "claude_code" | "claude" => Some(ProviderSource::AnthropicOauthUsage),
+                "codex" => Some(ProviderSource::ChatgptWhamUsage),
+                "antigravity" => Some(ProviderSource::AntigravityQuotaUsage),
+                "github_copilot" => Some(ProviderSource::GithubBillingApi),
+                _ => provider.source,
+            };
+            provider.validate(expected_source)?;
+        }
+        Ok(())
     }
 }
 
@@ -462,17 +492,36 @@ pub enum ProviderSource {
     AnthropicOauthUsage,
     ChatgptWhamUsage,
     AntigravityQuotaUsage,
+    GithubBillingApi,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ProviderUsage {
     session: Option<UsageWindow>,
     weekly: Option<UsageWindow>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    quota_items: Vec<SnapshotQuotaItem>,
 }
 
 impl ProviderUsage {
     pub fn new(session: Option<UsageWindow>, weekly: Option<UsageWindow>) -> Self {
-        Self { session, weekly }
+        Self {
+            session,
+            weekly,
+            quota_items: Vec::new(),
+        }
+    }
+
+    pub fn with_quota_items(
+        session: Option<UsageWindow>,
+        weekly: Option<UsageWindow>,
+        quota_items: Vec<SnapshotQuotaItem>,
+    ) -> Self {
+        Self {
+            session,
+            weekly,
+            quota_items,
+        }
     }
 
     fn validate(&self) -> Result<(), SnapshotValidationError> {
@@ -482,7 +531,103 @@ impl ProviderUsage {
         if let Some(window) = &self.weekly {
             window.validate()?;
         }
+        for item in &self.quota_items {
+            item.validate()?;
+        }
         Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SnapshotQuotaItem {
+    id: String,
+    label: String,
+    available: bool,
+    metric: Option<SnapshotQuotaMetric>,
+    unit: String,
+    resets_at: Option<u64>,
+}
+
+impl SnapshotQuotaItem {
+    fn from_runtime(item: &QuotaItem) -> Result<Self, SnapshotConversionError> {
+        let metric = item.metric.as_ref().map(|metric| match metric {
+            QuotaMetric::Percentage(value) => SnapshotQuotaMetric::Percentage { value: *value },
+            QuotaMetric::Used { used, limit } => SnapshotQuotaMetric::Used {
+                used: *used,
+                limit: *limit,
+            },
+            QuotaMetric::Remaining { remaining, limit } => SnapshotQuotaMetric::Remaining {
+                remaining: *remaining,
+                limit: *limit,
+            },
+        });
+        Ok(Self {
+            id: item.id.clone(),
+            label: item.label.clone(),
+            available: item.availability != QuotaItemAvailability::Unavailable,
+            metric,
+            unit: item.unit.as_str().to_string(),
+            resets_at: item.resets_at.map(system_time_to_unix_millis).transpose()?,
+        })
+    }
+
+    fn from_percentage(
+        id: &str,
+        label: &str,
+        section: &UsageSection,
+    ) -> Result<Self, SnapshotConversionError> {
+        Ok(Self {
+            id: id.to_string(),
+            label: label.to_string(),
+            available: true,
+            metric: Some(SnapshotQuotaMetric::Percentage {
+                value: section.percentage,
+            }),
+            unit: "percent".to_string(),
+            resets_at: section
+                .resets_at
+                .map(system_time_to_unix_millis)
+                .transpose()?,
+        })
+    }
+
+    fn validate(&self) -> Result<(), SnapshotValidationError> {
+        if self.id.is_empty() || self.label.is_empty() || self.unit.is_empty() {
+            return Err(SnapshotValidationError::InvalidUsageWindow);
+        }
+        if let Some(metric) = &self.metric {
+            metric.validate()?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SnapshotQuotaMetric {
+    Percentage { value: f64 },
+    Used { used: f64, limit: Option<f64> },
+    Remaining { remaining: f64, limit: Option<f64> },
+}
+
+impl SnapshotQuotaMetric {
+    fn validate(&self) -> Result<(), SnapshotValidationError> {
+        let valid = match self {
+            Self::Percentage { value } => value.is_finite() && *value >= 0.0,
+            Self::Used { used, limit } => {
+                used.is_finite()
+                    && *used >= 0.0
+                    && limit.is_none_or(|value| value.is_finite() && value >= 0.0)
+            }
+            Self::Remaining { remaining, limit } => {
+                remaining.is_finite()
+                    && *remaining >= 0.0
+                    && limit.is_none_or(|value| value.is_finite() && value >= 0.0)
+            }
+        };
+        valid
+            .then_some(())
+            .ok_or(SnapshotValidationError::InvalidUsageWindow)
     }
 }
 
@@ -559,6 +704,7 @@ pub enum ProviderErrorCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::{QuotaFamilyStatus, QuotaUnit};
     use serde_json::{json, Value};
 
     fn usage() -> ProviderUsage {
@@ -632,6 +778,7 @@ mod tests {
             claude_code,
             codex,
             antigravity: ProviderPollOutcome::Disabled,
+            github_copilot: ProviderPollOutcome::Disabled,
         }
     }
 
@@ -1455,13 +1602,17 @@ mod tests {
 
         assert_eq!(
             app_usage
-                .claude_code
+                .family(QuotaFamilyId::Claude)
                 .expect("Claude usage should remain")
-                .session
-                .percentage,
-            7.0
+                .item("session")
+                .expect("session item should remain")
+                .used_percentage(),
+            Some(7.0)
         );
-        assert!(app_usage.codex.is_none());
+        assert_eq!(
+            app_usage.family(QuotaFamilyId::Codex).unwrap().status,
+            QuotaFamilyStatus::Unavailable
+        );
     }
 
     #[test]
@@ -1552,6 +1703,7 @@ mod tests {
                 ProviderPollSource::AntigravityQuotaUsage,
                 poll_usage(Some((1.0, None)), None),
             ),
+            github_copilot: ProviderPollOutcome::Disabled,
         };
 
         let snapshot =
@@ -1585,6 +1737,7 @@ mod tests {
                 ProviderPollSource::AntigravityQuotaUsage,
                 PollError::RequestFailed,
             ),
+            github_copilot: ProviderPollOutcome::Disabled,
         };
         let error_value = converted_value(&error_report);
         let unavailable = &error_value["providers"]["antigravity"];
@@ -1598,6 +1751,7 @@ mod tests {
             claude_code: ProviderPollOutcome::Disabled,
             codex: ProviderPollOutcome::Disabled,
             antigravity: ProviderPollOutcome::Disabled,
+            github_copilot: ProviderPollOutcome::Disabled,
         };
         let disabled_value = converted_value(&disabled_report);
         let disabled = &disabled_value["providers"]["antigravity"];
@@ -1622,6 +1776,7 @@ mod tests {
                 ProviderPollSource::AntigravityQuotaUsage,
                 poll_usage(Some((50.0, None)), Some((60.0, None))),
             ),
+            github_copilot: ProviderPollOutcome::Disabled,
         };
 
         let snapshot =
@@ -1631,13 +1786,140 @@ mod tests {
     }
 
     #[test]
-    fn pre_antigravity_source_v1_snapshot_still_deserializes() {
-        let snapshot = snapshot_with(ProviderSnapshot::disabled());
-        let json = serde_json::to_string(&snapshot).expect("legacy v1 snapshot should serialize");
+    fn actual_pre_antigravity_json_without_new_provider_keys_still_deserializes() {
+        let json = r#"{
+            "schema_version": 1,
+            "timestamp_unit": "unix_ms",
+            "machine_id": "home",
+            "generated_at": 1725000000200,
+            "poll_started_at": 1725000000000,
+            "poll_finished_at": 1725000000100,
+            "providers": {
+                "claude_code": {
+                    "requested": false,
+                    "status": "disabled",
+                    "source": null,
+                    "attempted_at": null,
+                    "acquired_at": null,
+                    "last_success_at": null,
+                    "stale": false,
+                    "usage": null,
+                    "error": null
+                },
+                "codex": {
+                    "requested": false,
+                    "status": "disabled",
+                    "source": null,
+                    "attempted_at": null,
+                    "acquired_at": null,
+                    "last_success_at": null,
+                    "stale": false,
+                    "usage": null,
+                    "error": null
+                }
+            }
+        }"#;
 
+        let snapshot = deserialize_validated_snapshot(json)
+            .expect("an actual legacy object must remain readable without migration");
+        assert!(snapshot.providers.get("claude_code").is_some());
+        assert!(snapshot.providers.get("antigravity").is_none());
+        assert!(snapshot.providers.get("github_copilot").is_none());
         assert_eq!(
-            deserialize_validated_snapshot(&json).expect("legacy v1 snapshot should remain valid"),
-            snapshot
+            snapshot.providers.get("codex").unwrap().status,
+            ProviderStatus::Disabled
         );
+    }
+
+    #[test]
+    fn copilot_snapshot_uses_generic_quota_item_and_keeps_disabled_distinct() {
+        let usage = UsageData::from_quota_items(vec![QuotaItem {
+            id: "monthly_ai_credits".to_string(),
+            label: "Monthly AI credits".to_string(),
+            availability: QuotaItemAvailability::Available,
+            metric: Some(QuotaMetric::Used {
+                used: 375.0,
+                limit: Some(1_500.0),
+            }),
+            unit: QuotaUnit::AiCredits,
+            resets_at: Some(at_millis(1_725_000_000_000)),
+        }]);
+        let report = PollReport {
+            claude_code: ProviderPollOutcome::Disabled,
+            codex: ProviderPollOutcome::Disabled,
+            antigravity: ProviderPollOutcome::Disabled,
+            github_copilot: success_outcome(ProviderPollSource::GithubBillingApi, usage),
+        };
+        let value = converted_value(&report);
+        let copilot = &value["providers"]["github_copilot"];
+        assert_eq!(copilot["status"], json!("success"));
+        assert_eq!(copilot["source"], json!("github_billing_api"));
+        assert_eq!(copilot["usage"]["session"], Value::Null);
+        assert_eq!(
+            copilot["usage"]["quota_items"][0]["metric"],
+            json!({"kind": "used", "used": 375.0, "limit": 1500.0})
+        );
+        assert_eq!(
+            value["providers"]["claude_code"]["status"],
+            json!("disabled")
+        );
+    }
+
+    #[test]
+    fn legacy_fixed_reader_ignores_new_provider_and_quota_item_fields() {
+        #[derive(Deserialize)]
+        struct LegacyUsage {
+            session: Option<Value>,
+            weekly: Option<Value>,
+        }
+        #[derive(Deserialize)]
+        struct LegacyProvider {
+            usage: Option<LegacyUsage>,
+        }
+        #[derive(Deserialize)]
+        struct LegacyProviders {
+            claude_code: LegacyProvider,
+            codex: LegacyProvider,
+            antigravity: LegacyProvider,
+        }
+        #[derive(Deserialize)]
+        struct LegacySnapshot {
+            providers: LegacyProviders,
+        }
+
+        let report = PollReport {
+            claude_code: success_outcome(
+                ProviderPollSource::AnthropicOauthUsage,
+                poll_usage(Some((10.0, None)), Some((20.0, None))),
+            ),
+            codex: ProviderPollOutcome::Disabled,
+            antigravity: ProviderPollOutcome::Disabled,
+            github_copilot: success_outcome(
+                ProviderPollSource::GithubBillingApi,
+                UsageData::from_quota_items(vec![QuotaItem {
+                    id: "monthly_ai_credits".to_string(),
+                    label: "Monthly AI credits".to_string(),
+                    availability: QuotaItemAvailability::Available,
+                    metric: Some(QuotaMetric::Used {
+                        used: 1.0,
+                        limit: None,
+                    }),
+                    unit: QuotaUnit::AiCredits,
+                    resets_at: None,
+                }]),
+            ),
+        };
+        let new_json = serde_json::to_string(
+            &snapshot_from_poll_report(&machine_id(), &report, at_millis(1_725_000_000_200))
+                .unwrap(),
+        )
+        .unwrap();
+        let legacy: LegacySnapshot = serde_json::from_str(&new_json)
+            .expect("serde's old fixed reader must ignore additive fields");
+        let claude_usage = legacy.providers.claude_code.usage.unwrap();
+        assert!(claude_usage.session.is_some());
+        assert!(claude_usage.weekly.is_some());
+        assert!(legacy.providers.codex.usage.is_none());
+        assert!(legacy.providers.antigravity.usage.is_none());
     }
 }

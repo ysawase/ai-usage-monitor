@@ -5,9 +5,9 @@
 
 ![Screenshot](.github/animation.gif)
 
-A lightweight Windows taskbar widget for people already using Claude Code, with optional Codex and Google Antigravity usage display.
+A lightweight Windows taskbar widget for people already using Claude Code, with optional Codex, Google Antigravity, and GitHub Copilot usage display.
 
-It sits in your taskbar and shows how much of your Claude Code, Codex, and/or Antigravity usage window you have left, without needing to open the terminal or the provider site.
+It sits in your taskbar and shows your configured providers' available quota windows without needing to open the terminal or provider site.
 
 ## What You Get
 
@@ -26,7 +26,7 @@ It sits in your taskbar and shows how much of your Claude Code, Codex, and/or An
 
 This app is for Windows users who already have **Claude Code (CLI or App) installed and signed in**.
 
-Codex support is optional. To show Codex usage, install and sign in to the Codex CLI, then enable ChatGPT from the right-click **Models** menu.
+Codex support is optional. To show Codex usage, install and sign in to the Codex CLI, then enable Codex from the right-click **Models** menu.
 
 Antigravity support is optional too. To show Antigravity usage, install and sign in to Google Antigravity, then enable the **Antigravity** model from the right-click **Models** menu.
 
@@ -72,7 +72,7 @@ Once running, it will appear in your taskbar and as one or more tray icons in th
 Use the right-click **Models** menu to choose what the widget displays:
 
 - **Claude** is enabled by default
-- **ChatGPT** can be enabled alongside Claude or shown by itself
+- **Codex** can be enabled alongside Claude or shown by itself
 - **Antigravity** can be enabled alongside the other providers or shown by itself as its own model column
 
 When multiple models are shown, each model has its own usage bar and matching usage text color.
@@ -80,8 +80,8 @@ When multiple models are shown, each model has its own usage bar and matching us
 The widget keeps its labels short. Here's what each one actually represents:
 
 - **Claude** is the shared Claude / Claude Code usage window, not a Claude Code-specific metric
-- **ChatGPT** displays the usage data fetched through the Codex CLI's credentials and endpoint, shown under the ChatGPT name because that's what the underlying data represents
-- When available, the ChatGPT heading also shows the number of banked **Full resets** reported by the Codex CLI; an unavailable count is shown separately from zero
+- **Codex** displays usage fetched through the Codex CLI's credentials from the ChatGPT backend
+- When available, the Codex heading also shows the number of banked **Full resets** reported by the Codex CLI; an unavailable count is shown separately from zero
 - **Antigravity** is shown as its own provider column. Its number prefers Google's Gemini quota summary when available, and falls back to model quota data when it isn't
 - Antigravity's quota summary can include several model families (Gemini, Claude, GPT, image models), so its number isn't a dedicated Gemini metric
 - Gemini is not shown as its own separate provider, since the underlying quota isn't guaranteed to always be Gemini specifically
@@ -95,7 +95,7 @@ The tray icon shows your current 5-hour usage as a percentage badge.
 
 If multiple providers are enabled, the app shows one tray icon per provider. If only one model is enabled, it shows one tray icon.
 
-The Claude tray icon uses the same warm usage colors as the Claude bar. The ChatGPT tray icon uses a black and white badge style. The Antigravity tray icon uses a blue badge style.
+The Claude tray icon uses the same warm usage colors as the Claude bar. The Codex tray icon uses a black and white badge style. The Antigravity tray icon uses a blue badge style, and GitHub Copilot uses purple.
 
 Hovering over a tray icon shows the usage values for that model.
 

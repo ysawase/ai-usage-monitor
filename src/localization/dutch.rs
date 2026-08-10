@@ -12,7 +12,7 @@ pub(super) const STRINGS: Strings = Strings {
     one_hour: "1 uur",
     models: "Modellen",
     claude_code_model: "Claude",
-    codex_model: "ChatGPT",
+    codex_model: "Codex",
     full_reset: "Volledige reset",
     antigravity_model: "Antigravity",
     settings: "Instellingen",
