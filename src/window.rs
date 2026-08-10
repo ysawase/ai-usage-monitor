@@ -8434,6 +8434,14 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "antigravity")]
+    #[test]
+    fn antigravity_model_menu_entry_matches_the_registered_quota_family() {
+        assert_eq!(IDM_MODEL_ANTIGRAVITY, 62);
+        assert_eq!(QuotaFamilyId::Antigravity.stable_id(), "antigravity");
+        assert_eq!(QuotaFamilyId::Antigravity.display_name(), "Antigravity");
+    }
+
     #[test]
     fn all_languages_have_non_empty_pace_display_menu_strings() {
         for language in LanguageId::ALL {
