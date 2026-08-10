@@ -630,12 +630,20 @@ fn run_gh_api(args: &[&str]) -> Result<String, PollError> {
         .creation_flags(CREATE_NO_WINDOW)
         .stdin(Stdio::null())
         .stderr(Stdio::null());
-    let output =
-        run_with_timeout(&mut command, Duration::from_secs(20)).ok_or(PollError::NoCredentials)?;
+    let output = run_with_captured_stdout(&mut command, Duration::from_secs(20))
+        .ok_or(PollError::NoCredentials)?;
     if !output.status.success() {
         return Err(PollError::AuthRequired);
     }
     String::from_utf8(output.stdout).map_err(|_| PollError::RequestFailed)
+}
+
+fn run_with_captured_stdout(
+    command: &mut Command,
+    timeout: Duration,
+) -> Option<std::process::Output> {
+    command.stdout(Stdio::piped());
+    run_with_timeout(command, timeout)
 }
 
 fn resolve_github_cli_executable() -> PathBuf {
@@ -3093,6 +3101,21 @@ mod tests {
             |candidate| candidate == standard_candidate,
         );
         assert_eq!(resolved, standard_candidate);
+    }
+
+    #[test]
+    fn github_cli_runner_captures_child_stdout() {
+        let mut command = Command::new("cmd.exe");
+        command.args(["/D", "/C", "echo safe-output"]);
+
+        let output = run_with_captured_stdout(&mut command, Duration::from_secs(5))
+            .expect("test child should finish");
+
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap().trim(),
+            "safe-output"
+        );
     }
 
     #[test]
