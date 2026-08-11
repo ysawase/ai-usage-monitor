@@ -5755,6 +5755,57 @@ fn show_context_menu(hwnd: HWND) {
             PCWSTR::from_raw(refresh_str.as_ptr()),
         );
 
+        let reset_pos_str = native_interop::wide_str(strings.reset_position);
+        let _ = AppendMenuW(
+            menu,
+            MENU_ITEM_FLAGS(0),
+            IDM_RESET_POSITION as usize,
+            PCWSTR::from_raw(reset_pos_str.as_ptr()),
+        );
+
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+
+        let widget_label = native_interop::wide_str(strings.show_widget);
+        let widget_flags = if widget_visible {
+            MF_CHECKED
+        } else {
+            MENU_ITEM_FLAGS(0)
+        };
+        let _ = AppendMenuW(
+            menu,
+            widget_flags,
+            tray_icon::IDM_TOGGLE_WIDGET as usize,
+            PCWSTR::from_raw(widget_label.as_ptr()),
+        );
+
+        let always_on_top_str = native_interop::wide_str(strings.always_on_top);
+        let always_on_top_flags = if always_on_top {
+            MF_CHECKED
+        } else {
+            MENU_ITEM_FLAGS(0)
+        };
+        let _ = AppendMenuW(
+            menu,
+            always_on_top_flags,
+            IDM_ALWAYS_ON_TOP as usize,
+            PCWSTR::from_raw(always_on_top_str.as_ptr()),
+        );
+
+        let startup_str = native_interop::wide_str(strings.start_with_windows);
+        let startup_flags = if is_startup_enabled() {
+            MF_CHECKED
+        } else {
+            MENU_ITEM_FLAGS(0)
+        };
+        let _ = AppendMenuW(
+            menu,
+            startup_flags,
+            IDM_START_WITH_WINDOWS as usize,
+            PCWSTR::from_raw(startup_str.as_ptr()),
+        );
+
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+
         // Update Frequency submenu
         let freq_menu = CreatePopupMenu().unwrap();
         let freq_items: [(u16, u32, &str); 4] = [
@@ -5778,6 +5829,20 @@ fn show_context_menu(hwnd: HWND) {
             );
         }
 
+        let selected_frequency_id = match current_interval {
+            POLL_1_MIN => IDM_FREQ_1MIN,
+            POLL_5_MIN => IDM_FREQ_5MIN,
+            POLL_1_HOUR => IDM_FREQ_1HOUR,
+            _ => IDM_FREQ_15MIN,
+        };
+        let _ = CheckMenuRadioItem(
+            freq_menu,
+            IDM_FREQ_1MIN as u32,
+            IDM_FREQ_1HOUR as u32,
+            selected_frequency_id as u32,
+            MF_BYCOMMAND,
+        );
+
         let freq_label = native_interop::wide_str(strings.update_frequency);
         let _ = AppendMenuW(
             menu,
@@ -5786,8 +5851,8 @@ fn show_context_menu(hwnd: HWND) {
             PCWSTR::from_raw(freq_label.as_ptr()),
         );
 
-        // Models submenu
-        let models_menu = CreatePopupMenu().unwrap();
+        // AI visibility submenu
+        let displayed_ai_menu = CreatePopupMenu().unwrap();
         let claude_model = native_interop::wide_str(strings.claude_code_model);
         let claude_flags = if show_claude_code {
             MF_CHECKED
@@ -5795,7 +5860,7 @@ fn show_context_menu(hwnd: HWND) {
             MENU_ITEM_FLAGS(0)
         };
         let _ = AppendMenuW(
-            models_menu,
+            displayed_ai_menu,
             claude_flags,
             IDM_MODEL_CLAUDE_CODE as usize,
             PCWSTR::from_raw(claude_model.as_ptr()),
@@ -5808,7 +5873,7 @@ fn show_context_menu(hwnd: HWND) {
             MENU_ITEM_FLAGS(0)
         };
         let _ = AppendMenuW(
-            models_menu,
+            displayed_ai_menu,
             codex_flags,
             IDM_MODEL_CODEX as usize,
             PCWSTR::from_raw(codex_model.as_ptr()),
@@ -5823,32 +5888,32 @@ fn show_context_menu(hwnd: HWND) {
                 MENU_ITEM_FLAGS(0)
             };
             let _ = AppendMenuW(
-                models_menu,
+                displayed_ai_menu,
                 antigravity_flags,
                 IDM_MODEL_ANTIGRAVITY as usize,
                 PCWSTR::from_raw(antigravity_model.as_ptr()),
             );
         }
 
-        let github_copilot_model = native_interop::wide_str("GitHub Copilot");
+        let github_copilot_model = native_interop::wide_str(strings.github_copilot);
         let github_copilot_flags = if show_github_copilot {
             MF_CHECKED
         } else {
             MENU_ITEM_FLAGS(0)
         };
         let _ = AppendMenuW(
-            models_menu,
+            displayed_ai_menu,
             github_copilot_flags,
             IDM_MODEL_GITHUB_COPILOT as usize,
             PCWSTR::from_raw(github_copilot_model.as_ptr()),
         );
 
-        let models_label = native_interop::wide_str(strings.models);
+        let displayed_ai_label = native_interop::wide_str(strings.displayed_ai);
         let _ = AppendMenuW(
             menu,
             MF_POPUP,
-            models_menu.0 as usize,
-            PCWSTR::from_raw(models_label.as_ptr()),
+            displayed_ai_menu.0 as usize,
+            PCWSTR::from_raw(displayed_ai_label.as_ptr()),
         );
 
         let copilot_plan_menu = CreatePopupMenu().unwrap();
@@ -5856,22 +5921,22 @@ fn show_context_menu(hwnd: HWND) {
             (
                 IDM_GITHUB_COPILOT_PLAN_UNKNOWN,
                 poller::GithubCopilotPlan::Unknown,
-                "Unknown (usage only)",
+                strings.github_copilot_plan_unknown,
             ),
             (
                 IDM_GITHUB_COPILOT_PLAN_PRO,
                 poller::GithubCopilotPlan::Pro,
-                "Copilot Pro",
+                strings.github_copilot_plan_pro,
             ),
             (
                 IDM_GITHUB_COPILOT_PLAN_PRO_PLUS,
                 poller::GithubCopilotPlan::ProPlus,
-                "Copilot Pro+",
+                strings.github_copilot_plan_pro_plus,
             ),
             (
                 IDM_GITHUB_COPILOT_PLAN_MAX,
                 poller::GithubCopilotPlan::Max,
-                "Copilot Max",
+                strings.github_copilot_plan_max,
             ),
         ] {
             let label = native_interop::wide_str(label);
@@ -5887,49 +5952,18 @@ fn show_context_menu(hwnd: HWND) {
                 PCWSTR::from_raw(label.as_ptr()),
             );
         }
-        let copilot_plan_label = native_interop::wide_str("GitHub Copilot plan");
-        let _ = AppendMenuW(
-            menu,
-            MF_POPUP,
-            copilot_plan_menu.0 as usize,
-            PCWSTR::from_raw(copilot_plan_label.as_ptr()),
-        );
-
-        // Settings submenu
-        let settings_menu = CreatePopupMenu().unwrap();
-
-        let startup_str = native_interop::wide_str(strings.start_with_windows);
-        let startup_flags = if is_startup_enabled() {
-            MF_CHECKED
-        } else {
-            MENU_ITEM_FLAGS(0)
+        let selected_copilot_plan_id = match github_copilot_plan {
+            poller::GithubCopilotPlan::Unknown => IDM_GITHUB_COPILOT_PLAN_UNKNOWN,
+            poller::GithubCopilotPlan::Pro => IDM_GITHUB_COPILOT_PLAN_PRO,
+            poller::GithubCopilotPlan::ProPlus => IDM_GITHUB_COPILOT_PLAN_PRO_PLUS,
+            poller::GithubCopilotPlan::Max => IDM_GITHUB_COPILOT_PLAN_MAX,
         };
-        let _ = AppendMenuW(
-            settings_menu,
-            startup_flags,
-            IDM_START_WITH_WINDOWS as usize,
-            PCWSTR::from_raw(startup_str.as_ptr()),
-        );
-
-        let always_on_top_str = native_interop::wide_str(strings.always_on_top);
-        let always_on_top_flags = if always_on_top {
-            MF_CHECKED
-        } else {
-            MENU_ITEM_FLAGS(0)
-        };
-        let _ = AppendMenuW(
-            settings_menu,
-            always_on_top_flags,
-            IDM_ALWAYS_ON_TOP as usize,
-            PCWSTR::from_raw(always_on_top_str.as_ptr()),
-        );
-
-        let reset_pos_str = native_interop::wide_str(strings.reset_position);
-        let _ = AppendMenuW(
-            settings_menu,
-            MENU_ITEM_FLAGS(0),
-            IDM_RESET_POSITION as usize,
-            PCWSTR::from_raw(reset_pos_str.as_ptr()),
+        let _ = CheckMenuRadioItem(
+            copilot_plan_menu,
+            IDM_GITHUB_COPILOT_PLAN_UNKNOWN as u32,
+            IDM_GITHUB_COPILOT_PLAN_MAX as u32,
+            selected_copilot_plan_id as u32,
+            MF_BYCOMMAND,
         );
 
         let language_menu = CreatePopupMenu().unwrap();
@@ -5973,17 +6007,31 @@ fn show_context_menu(hwnd: HWND) {
                 PCWSTR::from_raw(label_str.as_ptr()),
             );
         }
-
-        let language_label = native_interop::wide_str(strings.language);
-        let _ = AppendMenuW(
-            settings_menu,
-            MF_POPUP,
-            language_menu.0 as usize,
-            PCWSTR::from_raw(language_label.as_ptr()),
+        let selected_language_id = match language_override {
+            None => IDM_LANG_SYSTEM,
+            Some(LanguageId::English) => IDM_LANG_ENGLISH,
+            Some(LanguageId::Dutch) => IDM_LANG_DUTCH,
+            Some(LanguageId::Spanish) => IDM_LANG_SPANISH,
+            Some(LanguageId::French) => IDM_LANG_FRENCH,
+            Some(LanguageId::German) => IDM_LANG_GERMAN,
+            Some(LanguageId::Japanese) => IDM_LANG_JAPANESE,
+            Some(LanguageId::Korean) => IDM_LANG_KOREAN,
+            Some(LanguageId::TraditionalChinese) => IDM_LANG_TRADITIONAL_CHINESE,
+            Some(LanguageId::SimplifiedChinese) => IDM_LANG_SIMPLIFIED_CHINESE,
+            Some(LanguageId::Russian) => IDM_LANG_RUSSIAN,
+            Some(LanguageId::PortugueseBrazil) => IDM_LANG_PORTUGUESE_BRAZIL,
+        };
+        let _ = CheckMenuRadioItem(
+            language_menu,
+            IDM_LANG_SYSTEM as u32,
+            IDM_LANG_SIMPLIFIED_CHINESE as u32,
+            selected_language_id as u32,
+            MF_BYCOMMAND,
         );
 
-        // Display basis submenu: mutually exclusive, radio-style, same
-        // pattern as the language submenu above.
+        let display_settings_menu = CreatePopupMenu().unwrap();
+
+        // Display basis submenu: mutually exclusive, radio-style.
         let display_basis_menu = CreatePopupMenu().unwrap();
 
         let used_percentage_str = native_interop::wide_str(strings.used_percentage);
@@ -6011,13 +6059,16 @@ fn show_context_menu(hwnd: HWND) {
             IDM_DISPLAY_BASIS_REMAINING as usize,
             PCWSTR::from_raw(remaining_allowance_str.as_ptr()),
         );
-
-        let display_basis_label = native_interop::wide_str(strings.usage_display_basis);
-        let _ = AppendMenuW(
-            settings_menu,
-            MF_POPUP,
-            display_basis_menu.0 as usize,
-            PCWSTR::from_raw(display_basis_label.as_ptr()),
+        let selected_display_basis_id = match display_basis {
+            DisplayBasis::UsedPercentage => IDM_DISPLAY_BASIS_USED,
+            DisplayBasis::RemainingAllowance => IDM_DISPLAY_BASIS_REMAINING,
+        };
+        let _ = CheckMenuRadioItem(
+            display_basis_menu,
+            IDM_DISPLAY_BASIS_USED as u32,
+            IDM_DISPLAY_BASIS_REMAINING as u32,
+            selected_display_basis_id as u32,
+            MF_BYCOMMAND,
         );
 
         // Display density submenu: mutually exclusive, radio-style, same
@@ -6055,14 +6106,18 @@ fn show_context_menu(hwnd: HWND) {
                 PCWSTR::from_raw(label_str.as_ptr()),
             );
         }
-        let display_density_label = native_interop::wide_str(strings.display_density);
-        let _ = AppendMenuW(
-            settings_menu,
-            MF_POPUP,
-            display_density_menu.0 as usize,
-            PCWSTR::from_raw(display_density_label.as_ptr()),
+        let selected_display_density_id = match display_density {
+            DisplayDensity::Compact => IDM_DISPLAY_DENSITY_COMPACT,
+            DisplayDensity::Standard => IDM_DISPLAY_DENSITY_STANDARD,
+            DisplayDensity::Detailed => IDM_DISPLAY_DENSITY_DETAILED,
+        };
+        let _ = CheckMenuRadioItem(
+            display_density_menu,
+            IDM_DISPLAY_DENSITY_COMPACT as u32,
+            IDM_DISPLAY_DENSITY_DETAILED as u32,
+            selected_display_density_id as u32,
+            MF_BYCOMMAND,
         );
-
         // Popup layout submenu: mutually exclusive, radio-style, same
         // pattern as the display-density submenu above. A separate setting
         // from `DisplayDensity` (which only controls how much text each
@@ -6095,14 +6150,17 @@ fn show_context_menu(hwnd: HWND) {
                 PCWSTR::from_raw(label_str.as_ptr()),
             );
         }
-        let popup_layout_label = native_interop::wide_str(strings.popup_layout);
-        let _ = AppendMenuW(
-            settings_menu,
-            MF_POPUP,
-            popup_layout_menu.0 as usize,
-            PCWSTR::from_raw(popup_layout_label.as_ptr()),
+        let selected_popup_layout_id = match popup_layout {
+            PopupLayout::Compact => IDM_POPUP_LAYOUT_COMPACT,
+            PopupLayout::Standard => IDM_POPUP_LAYOUT_STANDARD,
+        };
+        let _ = CheckMenuRadioItem(
+            popup_layout_menu,
+            IDM_POPUP_LAYOUT_COMPACT as u32,
+            IDM_POPUP_LAYOUT_STANDARD as u32,
+            selected_popup_layout_id as u32,
+            MF_BYCOMMAND,
         );
-
         // App theme submenu: mutually exclusive, radio-style, same pattern
         // as the popup-layout submenu above. Only affects popup colors
         // (`PopupPalette`/`popup_palette`) — never row count or height.
@@ -6138,14 +6196,18 @@ fn show_context_menu(hwnd: HWND) {
                 PCWSTR::from_raw(label_str.as_ptr()),
             );
         }
-        let app_theme_label = native_interop::wide_str(strings.app_theme);
-        let _ = AppendMenuW(
-            settings_menu,
-            MF_POPUP,
-            app_theme_menu.0 as usize,
-            PCWSTR::from_raw(app_theme_label.as_ptr()),
+        let selected_app_theme_id = match app_theme {
+            AppTheme::RecommendedDark => IDM_APP_THEME_RECOMMENDED_DARK,
+            AppTheme::Light => IDM_APP_THEME_LIGHT,
+            AppTheme::HighVisibility => IDM_APP_THEME_HIGH_VISIBILITY,
+        };
+        let _ = CheckMenuRadioItem(
+            app_theme_menu,
+            IDM_APP_THEME_RECOMMENDED_DARK as u32,
+            IDM_APP_THEME_HIGH_VISIBILITY as u32,
+            selected_app_theme_id as u32,
+            MF_BYCOMMAND,
         );
-
         // Short-window (5h) visibility submenu.
         let short_window_visibility_menu = CreatePopupMenu().unwrap();
         let short_window_visibility_items: [(u16, ShortWindowVisibility, &str); 3] = [
@@ -6179,15 +6241,18 @@ fn show_context_menu(hwnd: HWND) {
                 PCWSTR::from_raw(label_str.as_ptr()),
             );
         }
-        let short_window_visibility_label =
-            native_interop::wide_str(strings.short_window_visibility);
-        let _ = AppendMenuW(
-            settings_menu,
-            MF_POPUP,
-            short_window_visibility_menu.0 as usize,
-            PCWSTR::from_raw(short_window_visibility_label.as_ptr()),
+        let selected_short_window_visibility_id = match short_window_visibility {
+            ShortWindowVisibility::Always => IDM_SHORT_WINDOW_VISIBILITY_ALWAYS,
+            ShortWindowVisibility::WarningOnly => IDM_SHORT_WINDOW_VISIBILITY_WARNING_ONLY,
+            ShortWindowVisibility::Hidden => IDM_SHORT_WINDOW_VISIBILITY_HIDDEN,
+        };
+        let _ = CheckMenuRadioItem(
+            short_window_visibility_menu,
+            IDM_SHORT_WINDOW_VISIBILITY_ALWAYS as u32,
+            IDM_SHORT_WINDOW_VISIBILITY_HIDDEN as u32,
+            selected_short_window_visibility_id as u32,
+            MF_BYCOMMAND,
         );
-
         // Short-window (5h) alert sensitivity submenu.
         let short_window_alert_sensitivity_menu = CreatePopupMenu().unwrap();
         let short_window_alert_sensitivity_items: [(u16, ShortWindowAlertSensitivity, &str); 3] = [
@@ -6221,18 +6286,120 @@ fn show_context_menu(hwnd: HWND) {
                 PCWSTR::from_raw(label_str.as_ptr()),
             );
         }
+        let selected_short_window_alert_sensitivity_id = match short_window_alert_sensitivity {
+            ShortWindowAlertSensitivity::Sensitive => {
+                IDM_SHORT_WINDOW_ALERT_SENSITIVITY_SENSITIVE
+            }
+            ShortWindowAlertSensitivity::Standard => IDM_SHORT_WINDOW_ALERT_SENSITIVITY_STANDARD,
+            ShortWindowAlertSensitivity::Relaxed => IDM_SHORT_WINDOW_ALERT_SENSITIVITY_RELAXED,
+        };
+        let _ = CheckMenuRadioItem(
+            short_window_alert_sensitivity_menu,
+            IDM_SHORT_WINDOW_ALERT_SENSITIVITY_SENSITIVE as u32,
+            IDM_SHORT_WINDOW_ALERT_SENSITIVITY_RELAXED as u32,
+            selected_short_window_alert_sensitivity_id as u32,
+            MF_BYCOMMAND,
+        );
+        // Assemble Display Settings in semantic groups: content/judgment,
+        // then visual density/layout/theme.
+        let display_basis_label = native_interop::wide_str(strings.usage_display_basis);
+        let _ = AppendMenuW(
+            display_settings_menu,
+            MF_POPUP,
+            display_basis_menu.0 as usize,
+            PCWSTR::from_raw(display_basis_label.as_ptr()),
+        );
+
+        let short_window_menu = CreatePopupMenu().unwrap();
+        let short_window_visibility_label =
+            native_interop::wide_str(strings.short_window_visibility);
+        let _ = AppendMenuW(
+            short_window_menu,
+            MF_POPUP,
+            short_window_visibility_menu.0 as usize,
+            PCWSTR::from_raw(short_window_visibility_label.as_ptr()),
+        );
         let short_window_alert_sensitivity_label =
             native_interop::wide_str(strings.short_window_alert_sensitivity);
         let _ = AppendMenuW(
-            settings_menu,
+            short_window_menu,
             MF_POPUP,
             short_window_alert_sensitivity_menu.0 as usize,
             PCWSTR::from_raw(short_window_alert_sensitivity_label.as_ptr()),
         );
+        let short_window_label = native_interop::wide_str(strings.session_window_label);
+        let _ = AppendMenuW(
+            display_settings_menu,
+            MF_POPUP,
+            short_window_menu.0 as usize,
+            PCWSTR::from_raw(short_window_label.as_ptr()),
+        );
 
+        let _ = AppendMenuW(display_settings_menu, MF_SEPARATOR, 0, PCWSTR::null());
+
+        let display_density_label = native_interop::wide_str(strings.display_density);
+        let _ = AppendMenuW(
+            display_settings_menu,
+            MF_POPUP,
+            display_density_menu.0 as usize,
+            PCWSTR::from_raw(display_density_label.as_ptr()),
+        );
+        let popup_layout_label = native_interop::wide_str(strings.popup_layout);
+        let _ = AppendMenuW(
+            display_settings_menu,
+            MF_POPUP,
+            popup_layout_menu.0 as usize,
+            PCWSTR::from_raw(popup_layout_label.as_ptr()),
+        );
+        let app_theme_label = native_interop::wide_str(strings.app_theme);
+        let _ = AppendMenuW(
+            display_settings_menu,
+            MF_POPUP,
+            app_theme_menu.0 as usize,
+            PCWSTR::from_raw(app_theme_label.as_ptr()),
+        );
+
+        let display_settings_label = native_interop::wide_str(strings.display_settings);
+        let _ = AppendMenuW(
+            menu,
+            MF_POPUP,
+            display_settings_menu.0 as usize,
+            PCWSTR::from_raw(display_settings_label.as_ptr()),
+        );
+
+        let language_label = native_interop::wide_str(strings.language);
+        let _ = AppendMenuW(
+            menu,
+            MF_POPUP,
+            language_menu.0 as usize,
+            PCWSTR::from_raw(language_label.as_ptr()),
+        );
+
+        let github_copilot_label = native_interop::wide_str(strings.github_copilot);
+        let _ = AppendMenuW(
+            menu,
+            MF_POPUP,
+            copilot_plan_menu.0 as usize,
+            PCWSTR::from_raw(github_copilot_label.as_ptr()),
+        );
+
+        let help_menu = CreatePopupMenu().unwrap();
+        for label in [
+            strings.help_readme_placeholder,
+            strings.help_update_placeholder,
+            strings.help_version_placeholder,
+        ] {
+            let label_str = native_interop::wide_str(label);
+            let _ = AppendMenuW(
+                help_menu,
+                MF_GRAYED,
+                0,
+                PCWSTR::from_raw(label_str.as_ptr()),
+            );
+        }
         #[cfg(feature = "self-update")]
         {
-            let _ = AppendMenuW(settings_menu, MF_SEPARATOR, 0, PCWSTR::null());
+            let _ = AppendMenuW(help_menu, MF_SEPARATOR, 0, PCWSTR::null());
 
             let version_label =
                 version_action_label(strings, language, install_channel, &update_status);
@@ -6246,32 +6413,19 @@ fn show_context_menu(hwnd: HWND) {
                 MENU_ITEM_FLAGS(0)
             };
             let _ = AppendMenuW(
-                settings_menu,
+                help_menu,
                 version_flags,
                 IDM_VERSION_ACTION as usize,
                 PCWSTR::from_raw(version_str.as_ptr()),
             );
         }
 
-        let settings_label = native_interop::wide_str(strings.settings);
+        let help_label = native_interop::wide_str(strings.help);
         let _ = AppendMenuW(
             menu,
             MF_POPUP,
-            settings_menu.0 as usize,
-            PCWSTR::from_raw(settings_label.as_ptr()),
-        );
-
-        let widget_label = native_interop::wide_str(strings.show_widget);
-        let widget_flags = if widget_visible {
-            MF_CHECKED
-        } else {
-            MENU_ITEM_FLAGS(0)
-        };
-        let _ = AppendMenuW(
-            menu,
-            widget_flags,
-            tray_icon::IDM_TOGGLE_WIDGET as usize,
-            PCWSTR::from_raw(widget_label.as_ptr()),
+            help_menu.0 as usize,
+            PCWSTR::from_raw(help_label.as_ptr()),
         );
 
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
@@ -8870,9 +9024,20 @@ mod tests {
     }
 
     #[test]
-    fn all_languages_have_non_empty_pace_display_menu_strings() {
+    fn all_languages_have_non_empty_organized_menu_strings() {
         for language in LanguageId::ALL {
             let strings = language.strings();
+            assert!(!strings.displayed_ai.is_empty());
+            assert!(!strings.display_settings.is_empty());
+            assert!(!strings.github_copilot.is_empty());
+            assert!(!strings.github_copilot_plan_unknown.is_empty());
+            assert!(!strings.github_copilot_plan_pro.is_empty());
+            assert!(!strings.github_copilot_plan_pro_plus.is_empty());
+            assert!(!strings.github_copilot_plan_max.is_empty());
+            assert!(!strings.help.is_empty());
+            assert!(!strings.help_readme_placeholder.is_empty());
+            assert!(!strings.help_update_placeholder.is_empty());
+            assert!(!strings.help_version_placeholder.is_empty());
             assert!(!strings.display_density.is_empty());
             assert!(!strings.display_density_compact.is_empty());
             assert!(!strings.standard_level.is_empty());
