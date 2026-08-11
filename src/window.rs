@@ -248,9 +248,10 @@ impl Default for ShortWindowVisibility {
 enum CellState {
     Loading,
     Ok,
+    AuthenticationExpired,
+    AuthenticationProblem,
+    CredentialsUnavailable,
     FetchFailed,
-    Retrying,
-    NotConfigured,
     Disabled,
     NotAvailable,
 }
@@ -331,9 +332,10 @@ fn format_cell_text(basis: DisplayBasis, section: &UsageSection, strings: String
 fn status_text(state: CellState, strings: Strings) -> &'static str {
     match state {
         CellState::Loading => strings.loading,
+        CellState::AuthenticationExpired => strings.authentication_expired,
+        CellState::AuthenticationProblem => strings.authentication_problem,
+        CellState::CredentialsUnavailable => strings.credentials_unavailable,
         CellState::FetchFailed => strings.fetch_failed,
-        CellState::Retrying => strings.retrying,
-        CellState::NotConfigured => strings.not_configured,
         CellState::Disabled => strings.not_available,
         CellState::NotAvailable => strings.not_available,
         CellState::Ok => {
@@ -478,7 +480,30 @@ fn render_generic_quota_item(
 /// not mean "waiting for first data"; the genuine "never polled yet" state
 /// is `CellState::Loading` set once at `AppState` construction and left
 /// alone here.
-fn poll_cell_states(outcome: &poller::ProviderPollOutcome) -> (CellState, CellState) {
+fn provider_error_cell_state(provider: QuotaFamilyId, error: poller::PollError) -> CellState {
+    match (provider, error) {
+        (QuotaFamilyId::Claude, poller::PollError::TokenExpired) => {
+            CellState::AuthenticationExpired
+        }
+        (
+            QuotaFamilyId::Claude | QuotaFamilyId::Codex | QuotaFamilyId::Antigravity,
+            poller::PollError::NoCredentials,
+        ) => CellState::CredentialsUnavailable,
+        (
+            QuotaFamilyId::Claude | QuotaFamilyId::Codex | QuotaFamilyId::Antigravity,
+            poller::PollError::AuthRequired,
+        )
+        | (QuotaFamilyId::Codex, poller::PollError::TokenExpired) => {
+            CellState::AuthenticationProblem
+        }
+        _ => CellState::FetchFailed,
+    }
+}
+
+fn poll_cell_states(
+    provider: QuotaFamilyId,
+    outcome: &poller::ProviderPollOutcome,
+) -> (CellState, CellState) {
     match outcome {
         poller::ProviderPollOutcome::Success { usage, .. } => (
             if usage.session_available() {
@@ -493,20 +518,18 @@ fn poll_cell_states(outcome: &poller::ProviderPollOutcome) -> (CellState, CellSt
             },
         ),
         poller::ProviderPollOutcome::Error { error, .. } => {
-            let state = match error {
-                poller::PollError::AuthRequired | poller::PollError::TokenExpired => {
-                    CellState::FetchFailed
-                }
-                poller::PollError::NoCredentials => CellState::NotConfigured,
-                poller::PollError::RequestFailed => CellState::Retrying,
-            };
+            let state = provider_error_cell_state(provider, *error);
             (state, state)
         }
         poller::ProviderPollOutcome::Disabled => (CellState::NotAvailable, CellState::NotAvailable),
     }
 }
 
-fn poll_quota_item_state(outcome: &poller::ProviderPollOutcome, item_id: &str) -> CellState {
+fn poll_quota_item_state(
+    provider: QuotaFamilyId,
+    outcome: &poller::ProviderPollOutcome,
+    item_id: &str,
+) -> CellState {
     match outcome {
         poller::ProviderPollOutcome::Success { usage, .. } => usage
             .quota_items()
@@ -514,7 +537,7 @@ fn poll_quota_item_state(outcome: &poller::ProviderPollOutcome, item_id: &str) -
             .find(|item| item.id == item_id)
             .filter(|item| item.availability != crate::models::QuotaItemAvailability::Unavailable)
             .map_or(CellState::NotAvailable, |_| CellState::Ok),
-        poller::ProviderPollOutcome::Error { .. } => poll_cell_states(outcome).0,
+        poller::ProviderPollOutcome::Error { .. } => poll_cell_states(provider, outcome).0,
         poller::ProviderPollOutcome::Disabled => CellState::Disabled,
     }
 }
@@ -2739,8 +2762,8 @@ fn weekly_pace_extra_lines(state: &AppState) -> i32 {
 /// One provider's decision for the (repurposed, `ShortWindowVisibility`-
 /// gated) 5h bar row: whether this cell shows anything at all this poll,
 /// and if so, what `percent`/`text` to draw. `text` is `render_cell`'s
-/// output for this cell — the same status word (`Loading`/`FetchFailed`/
-/// `Retrying`/`NotConfigured`/`NotAvailable`) or plain percent+reset text
+/// output for this cell — the same loading, provider-error, or
+/// `NotAvailable` status word, or plain percent+reset text
 /// the cell would have shown before pace guidance existed. Branches on
 /// `state` itself (never on `text`'s content) so a status word never has to
 /// be pattern-matched or string-compared to be recognized as one.
@@ -2792,8 +2815,8 @@ fn session_cell_decision<'a>(
 /// status word when the row *is* shown for some other provider). A
 /// pace-driven warning (including HF1's "100%-used is always overpacing"
 /// case — see `short_window_is_overpacing`) always justifies the row. So
-/// does any other non-`Ok` status (`Loading`/`FetchFailed`/`Retrying`/
-/// `NotConfigured`) — a suppressed pace line must never hide a real error
+/// does any other non-`Ok` status (`Loading` or a provider error) — a
+/// suppressed pace line must never hide a real error
 /// or loading state, matching `session_cell_decision`'s own existing intent
 /// (see `session_row_visible_true_for_warning_only_when_one_provider_is_in_error`).
 /// Only `NotAvailable` — a provider that structurally has no such window
@@ -4364,19 +4387,24 @@ fn do_poll(send_hwnd: SendHwnd) {
                 // every provider (not just the ones that succeeded): a
                 // provider that failed this round while others succeeded
                 // must not keep showing its old percentage as current.
-                let (session_state, weekly_state) = poll_cell_states(&report.claude_code);
+                let (session_state, weekly_state) =
+                    poll_cell_states(QuotaFamilyId::Claude, &report.claude_code);
                 s.session_state = session_state;
                 s.weekly_state = weekly_state;
-                let (codex_session_state, codex_weekly_state) = poll_cell_states(&report.codex);
+                let (codex_session_state, codex_weekly_state) =
+                    poll_cell_states(QuotaFamilyId::Codex, &report.codex);
                 s.codex_session_state = codex_session_state;
                 s.codex_weekly_state = codex_weekly_state;
                 s.codex_banked_reset_count = banked_reset_count_for_poll(&report.codex);
                 let (antigravity_session_state, antigravity_weekly_state) =
-                    poll_cell_states(&report.antigravity);
+                    poll_cell_states(QuotaFamilyId::Antigravity, &report.antigravity);
                 s.antigravity_session_state = antigravity_session_state;
                 s.antigravity_weekly_state = antigravity_weekly_state;
-                s.github_copilot_state =
-                    poll_quota_item_state(&report.github_copilot, GITHUB_COPILOT_MONTHLY_ITEM_ID);
+                s.github_copilot_state = poll_quota_item_state(
+                    QuotaFamilyId::GithubCopilot,
+                    &report.github_copilot,
+                    GITHUB_COPILOT_MONTHLY_ITEM_ID,
+                );
 
                 // Stop fast-poll if reset data is now fresh
                 if !poller::app_is_past_reset(&data) {
@@ -4446,23 +4474,26 @@ fn do_poll(send_hwnd: SendHwnd) {
 
                     // The whole poll failed, but classify per-provider from
                     // `report` anyway (Disabled/Error only here): this
-                    // distinguishes NotConfigured/FetchFailed/Retrying per
-                    // provider instead of collapsing everything into one
-                    // generic error word, and `refresh_usage_texts` below
+                    // distinguishes provider-specific error states instead
+                    // of collapsing everything into one generic error word,
+                    // and `refresh_usage_texts` below
                     // reads these states to keep the bar unfilled rather
                     // than leaving the last successful percentage on screen.
-                    let (session_state, weekly_state) = poll_cell_states(&report.claude_code);
+                    let (session_state, weekly_state) =
+                        poll_cell_states(QuotaFamilyId::Claude, &report.claude_code);
                     s.session_state = session_state;
                     s.weekly_state = weekly_state;
-                    let (codex_session_state, codex_weekly_state) = poll_cell_states(&report.codex);
+                    let (codex_session_state, codex_weekly_state) =
+                        poll_cell_states(QuotaFamilyId::Codex, &report.codex);
                     s.codex_session_state = codex_session_state;
                     s.codex_weekly_state = codex_weekly_state;
                     s.codex_banked_reset_count = banked_reset_count_for_poll(&report.codex);
                     let (antigravity_session_state, antigravity_weekly_state) =
-                        poll_cell_states(&report.antigravity);
+                        poll_cell_states(QuotaFamilyId::Antigravity, &report.antigravity);
                     s.antigravity_session_state = antigravity_session_state;
                     s.antigravity_weekly_state = antigravity_weekly_state;
                     s.github_copilot_state = poll_quota_item_state(
+                        QuotaFamilyId::GithubCopilot,
                         &report.github_copilot,
                         GITHUB_COPILOT_MONTHLY_ITEM_ID,
                     );
@@ -7028,7 +7059,11 @@ mod tests {
     fn copilot_positive_usage_is_ok() {
         let outcome = copilot_success(vec![copilot_item(0.681855)]);
         assert_eq!(
-            poll_quota_item_state(&outcome, GITHUB_COPILOT_MONTHLY_ITEM_ID),
+            poll_quota_item_state(
+                QuotaFamilyId::GithubCopilot,
+                &outcome,
+                GITHUB_COPILOT_MONTHLY_ITEM_ID,
+            ),
             CellState::Ok
         );
     }
@@ -7037,7 +7072,11 @@ mod tests {
     fn copilot_zero_usage_is_ok_and_not_not_available() {
         let item = copilot_item(0.0);
         let outcome = copilot_success(vec![item.clone()]);
-        let state = poll_quota_item_state(&outcome, GITHUB_COPILOT_MONTHLY_ITEM_ID);
+        let state = poll_quota_item_state(
+            QuotaFamilyId::GithubCopilot,
+            &outcome,
+            GITHUB_COPILOT_MONTHLY_ITEM_ID,
+        );
         assert_eq!(state, CellState::Ok);
         assert_ne!(
             render_generic_quota_item(
@@ -7059,6 +7098,7 @@ mod tests {
         };
         assert_eq!(
             poll_quota_item_state(
+                QuotaFamilyId::GithubCopilot,
                 &copilot_success(vec![other]),
                 GITHUB_COPILOT_MONTHLY_ITEM_ID,
             ),
@@ -7072,6 +7112,7 @@ mod tests {
         };
         assert_eq!(
             poll_quota_item_state(
+                QuotaFamilyId::GithubCopilot,
                 &copilot_success(vec![unavailable]),
                 GITHUB_COPILOT_MONTHLY_ITEM_ID,
             ),
@@ -7080,11 +7121,132 @@ mod tests {
     }
 
     #[test]
-    fn copilot_errors_keep_existing_error_state_mapping() {
-        for (error, expected) in [
-            (poller::PollError::RequestFailed, CellState::Retrying),
-            (poller::PollError::AuthRequired, CellState::FetchFailed),
-            (poller::PollError::NoCredentials, CellState::NotConfigured),
+    fn provider_error_display_matrix_is_specific_only_for_high_confidence_cases() {
+        use poller::PollError::{AuthRequired, NoCredentials, RequestFailed, TokenExpired};
+
+        for (provider, error, expected) in [
+            (
+                QuotaFamilyId::Claude,
+                TokenExpired,
+                CellState::AuthenticationExpired,
+            ),
+            (
+                QuotaFamilyId::Claude,
+                NoCredentials,
+                CellState::CredentialsUnavailable,
+            ),
+            (
+                QuotaFamilyId::Claude,
+                AuthRequired,
+                CellState::AuthenticationProblem,
+            ),
+            (QuotaFamilyId::Claude, RequestFailed, CellState::FetchFailed),
+            (
+                QuotaFamilyId::Codex,
+                TokenExpired,
+                CellState::AuthenticationProblem,
+            ),
+            (
+                QuotaFamilyId::Codex,
+                NoCredentials,
+                CellState::CredentialsUnavailable,
+            ),
+            (
+                QuotaFamilyId::Codex,
+                AuthRequired,
+                CellState::AuthenticationProblem,
+            ),
+            (QuotaFamilyId::Codex, RequestFailed, CellState::FetchFailed),
+            (
+                QuotaFamilyId::Antigravity,
+                NoCredentials,
+                CellState::CredentialsUnavailable,
+            ),
+            (
+                QuotaFamilyId::Antigravity,
+                AuthRequired,
+                CellState::AuthenticationProblem,
+            ),
+            (
+                QuotaFamilyId::Antigravity,
+                RequestFailed,
+                CellState::FetchFailed,
+            ),
+            // Antigravity does not currently emit TokenExpired. Keeping this
+            // unrecognized provider/error combination generic verifies the
+            // conservative fallback.
+            (
+                QuotaFamilyId::Antigravity,
+                TokenExpired,
+                CellState::FetchFailed,
+            ),
+            (
+                QuotaFamilyId::GithubCopilot,
+                NoCredentials,
+                CellState::FetchFailed,
+            ),
+            (
+                QuotaFamilyId::GithubCopilot,
+                AuthRequired,
+                CellState::FetchFailed,
+            ),
+            (
+                QuotaFamilyId::GithubCopilot,
+                RequestFailed,
+                CellState::FetchFailed,
+            ),
+            (
+                QuotaFamilyId::GithubCopilot,
+                TokenExpired,
+                CellState::FetchFailed,
+            ),
+        ] {
+            assert_eq!(provider_error_cell_state(provider, error), expected);
+        }
+    }
+
+    #[test]
+    fn generic_request_failure_is_fetch_failed_not_retrying() {
+        let strings = LanguageId::Japanese.strings();
+        for provider in [
+            QuotaFamilyId::Claude,
+            QuotaFamilyId::Codex,
+            QuotaFamilyId::Antigravity,
+            QuotaFamilyId::GithubCopilot,
+        ] {
+            let state = provider_error_cell_state(provider, poller::PollError::RequestFailed);
+            assert_eq!(state, CellState::FetchFailed);
+            assert_eq!(status_text(state, strings), strings.fetch_failed);
+        }
+    }
+
+    #[test]
+    fn japanese_provider_error_statuses_keep_the_intended_conservative_wording() {
+        let strings = LanguageId::Japanese.strings();
+        assert_eq!(strings.authentication_expired, "認証切れ");
+        assert_eq!(strings.credentials_unavailable, "認証情報を確認できません");
+        assert_eq!(strings.authentication_problem, "認証を確認してください");
+        assert_eq!(strings.fetch_failed, "取得失敗");
+    }
+
+    #[test]
+    fn every_language_has_non_empty_provider_error_statuses() {
+        for language in LanguageId::ALL {
+            let strings = language.strings();
+            assert!(!strings.authentication_expired.trim().is_empty());
+            assert!(!strings.authentication_problem.trim().is_empty());
+            assert!(!strings.credentials_unavailable.trim().is_empty());
+            assert!(!strings.fetch_failed.trim().is_empty());
+        }
+    }
+
+    #[test]
+    fn copilot_errors_conservatively_fall_back_to_fetch_failed() {
+        for error in [
+            poller::PollError::RequestFailed,
+            poller::PollError::AuthRequired,
+            poller::PollError::NoCredentials,
+            poller::PollError::TokenExpired,
         ] {
             let outcome = poller::ProviderPollOutcome::Error {
                 source: poller::ProviderPollSource::GithubBillingApi,
@@ -7092,8 +7254,12 @@ mod tests {
                 error,
             };
             assert_eq!(
-                poll_quota_item_state(&outcome, GITHUB_COPILOT_MONTHLY_ITEM_ID),
-                expected
+                poll_quota_item_state(
+                    QuotaFamilyId::GithubCopilot,
+                    &outcome,
+                    GITHUB_COPILOT_MONTHLY_ITEM_ID,
+                ),
+                CellState::FetchFailed
             );
         }
     }
@@ -7102,6 +7268,7 @@ mod tests {
     fn copilot_disabled_has_distinct_state() {
         assert_eq!(
             poll_quota_item_state(
+                QuotaFamilyId::GithubCopilot,
                 &poller::ProviderPollOutcome::Disabled,
                 GITHUB_COPILOT_MONTHLY_ITEM_ID,
             ),
@@ -7123,7 +7290,7 @@ mod tests {
             usage,
         };
         assert_eq!(
-            poll_cell_states(&outcome),
+            poll_cell_states(QuotaFamilyId::Claude, &outcome),
             (CellState::Ok, CellState::NotAvailable)
         );
     }
@@ -7606,9 +7773,10 @@ mod tests {
         let strings = LanguageId::English.strings();
         for state in [
             CellState::Loading,
+            CellState::AuthenticationExpired,
+            CellState::AuthenticationProblem,
+            CellState::CredentialsUnavailable,
             CellState::FetchFailed,
-            CellState::Retrying,
-            CellState::NotConfigured,
             CellState::NotAvailable,
         ] {
             let display = render_cell(state, None, DisplayBasis::UsedPercentage, strings);
@@ -9288,9 +9456,10 @@ mod tests {
         };
         for state in [
             CellState::Loading,
+            CellState::AuthenticationExpired,
+            CellState::AuthenticationProblem,
+            CellState::CredentialsUnavailable,
             CellState::FetchFailed,
-            CellState::Retrying,
-            CellState::NotConfigured,
             CellState::NotAvailable,
         ] {
             assert_eq!(
@@ -9405,9 +9574,10 @@ mod tests {
         };
         for state in [
             CellState::Loading,
+            CellState::AuthenticationExpired,
+            CellState::AuthenticationProblem,
+            CellState::CredentialsUnavailable,
             CellState::FetchFailed,
-            CellState::Retrying,
-            CellState::NotConfigured,
             CellState::NotAvailable,
         ] {
             assert_eq!(
@@ -9479,9 +9649,10 @@ mod tests {
         };
         for state in [
             CellState::Loading,
+            CellState::AuthenticationExpired,
+            CellState::AuthenticationProblem,
+            CellState::CredentialsUnavailable,
             CellState::FetchFailed,
-            CellState::Retrying,
-            CellState::NotConfigured,
             CellState::NotAvailable,
         ] {
             assert_eq!(
@@ -9655,7 +9826,7 @@ mod tests {
 
     // ── session_cell_decision: existing status text vs. pace guidance,
     // per `ShortWindowVisibility` (regression fix — the existing 5h bar
-    // row must keep showing Loading/FetchFailed/Retrying/NotConfigured/
+    // row must keep showing Loading/provider errors/
     // NotAvailable, not just pace guidance) ─────────────────────────────
 
     #[test]
@@ -9713,33 +9884,33 @@ mod tests {
     }
 
     #[test]
-    fn session_cell_decision_always_retrying_keeps_existing_text() {
+    fn session_cell_decision_always_authentication_problem_keeps_existing_text() {
         let strings = LanguageId::English.strings();
         let (shows, percent, text, _is_warning) = session_cell_decision(
-            CellState::Retrying,
+            CellState::AuthenticationProblem,
             None,
-            strings.retrying,
+            strings.authentication_problem,
             None,
             ShortWindowVisibility::Always,
         );
         assert!(shows);
         assert_eq!(percent, None);
-        assert_eq!(text, strings.retrying);
+        assert_eq!(text, strings.authentication_problem);
     }
 
     #[test]
-    fn session_cell_decision_always_not_configured_keeps_existing_text() {
+    fn session_cell_decision_always_credentials_unavailable_keeps_existing_text() {
         let strings = LanguageId::English.strings();
         let (shows, percent, text, _is_warning) = session_cell_decision(
-            CellState::NotConfigured,
+            CellState::CredentialsUnavailable,
             None,
-            strings.not_configured,
+            strings.credentials_unavailable,
             None,
             ShortWindowVisibility::Always,
         );
         assert!(shows);
         assert_eq!(percent, None);
-        assert_eq!(text, strings.not_configured);
+        assert_eq!(text, strings.credentials_unavailable);
     }
 
     #[test]
@@ -9837,9 +10008,10 @@ mod tests {
         let strings = LanguageId::English.strings();
         for state in [
             CellState::Loading,
+            CellState::AuthenticationExpired,
+            CellState::AuthenticationProblem,
+            CellState::CredentialsUnavailable,
             CellState::FetchFailed,
-            CellState::Retrying,
-            CellState::NotConfigured,
             CellState::NotAvailable,
         ] {
             let text = status_text(state, strings);
@@ -9901,9 +10073,10 @@ mod tests {
         // Error states must also stay blank under Hidden.
         for state in [
             CellState::Loading,
+            CellState::AuthenticationExpired,
+            CellState::AuthenticationProblem,
+            CellState::CredentialsUnavailable,
             CellState::FetchFailed,
-            CellState::Retrying,
-            CellState::NotConfigured,
             CellState::NotAvailable,
         ] {
             let existing = status_text(state, strings);
@@ -10122,9 +10295,10 @@ mod tests {
         // preserved unchanged by this predicate).
         for state in [
             CellState::Loading,
+            CellState::AuthenticationExpired,
+            CellState::AuthenticationProblem,
+            CellState::CredentialsUnavailable,
             CellState::FetchFailed,
-            CellState::Retrying,
-            CellState::NotConfigured,
         ] {
             assert!(
                 session_cell_justifies_warning_only_row(state, None),
@@ -10377,15 +10551,26 @@ mod tests {
         ));
     }
 
-    /// Case 8: WarningOnly + Loading / Retrying / NotConfigured each still
-    /// justify the row on their own (existing intent preserved).
+    /// Case 8: WarningOnly + Loading / provider errors each still justify the
+    /// row on their own (existing intent preserved).
     #[test]
-    fn session_row_warning_only_shows_for_loading_retrying_not_configured() {
+    fn session_row_warning_only_shows_for_loading_and_provider_errors() {
         let strings = LanguageId::English.strings();
         for (state, text) in [
             (CellState::Loading, strings.loading),
-            (CellState::Retrying, strings.retrying),
-            (CellState::NotConfigured, strings.not_configured),
+            (
+                CellState::AuthenticationExpired,
+                strings.authentication_expired,
+            ),
+            (
+                CellState::AuthenticationProblem,
+                strings.authentication_problem,
+            ),
+            (
+                CellState::CredentialsUnavailable,
+                strings.credentials_unavailable,
+            ),
+            (CellState::FetchFailed, strings.fetch_failed),
         ] {
             let claude_shows =
                 session_row_cell_shows(state, None, text, None, ShortWindowVisibility::WarningOnly);
@@ -10740,11 +10925,12 @@ mod tests {
         // Rendering with the states this same report would produce (as
         // do_poll does) must show Claude's fresh value, and must never show
         // a bar for Codex — even though a real (stale) Codex section exists
-        // in the cache and is explicitly passed in here, `CellState::Retrying`
+        // in the cache and is explicitly passed in here, `CellState::FetchFailed`
         // (derived from the same report's `Error` outcome) must make
         // `render_cell` ignore it rather than display the old 20% as current.
         let strings = LanguageId::English.strings();
-        let (claude_session_state, _) = poll_cell_states(&report.claude_code);
+        let (claude_session_state, _) =
+            poll_cell_states(QuotaFamilyId::Claude, &report.claude_code);
         let claude_display = render_cell(
             claude_session_state,
             quota_item_section(Some(&merged), QuotaFamilyId::Claude, "session").as_ref(),
@@ -10753,8 +10939,8 @@ mod tests {
         );
         assert_eq!(claude_display.bar_percent, Some(70.0));
 
-        let (codex_session_state, _) = poll_cell_states(&report.codex);
-        assert_eq!(codex_session_state, CellState::Retrying);
+        let (codex_session_state, _) = poll_cell_states(QuotaFamilyId::Codex, &report.codex);
+        assert_eq!(codex_session_state, CellState::FetchFailed);
         let codex_display = render_cell(
             codex_session_state,
             quota_item_section(Some(&merged), QuotaFamilyId::Codex, "session").as_ref(),
@@ -10762,7 +10948,7 @@ mod tests {
             strings,
         );
         assert_eq!(codex_display.bar_percent, None);
-        assert_eq!(codex_display.text, strings.retrying);
+        assert_eq!(codex_display.text, strings.fetch_failed);
     }
 
     // ── remaining_secs_at ──────────────────────────────────────────────
