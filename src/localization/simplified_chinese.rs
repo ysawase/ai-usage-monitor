@@ -62,6 +62,8 @@ pub(super) const STRINGS: Strings = Strings {
     used_percentage: "已用百分比",
     remaining_allowance: "剩余额度",
     reset_in: "距重置",
+    reset_in_separator: "",
+    elapsed: "已过",
     loading: "获取中",
     authentication_expired: "身份验证已过期",
     authentication_problem: "请检查身份验证",

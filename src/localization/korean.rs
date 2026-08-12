@@ -62,6 +62,8 @@ pub(super) const STRINGS: Strings = Strings {
     used_percentage: "사용률",
     remaining_allowance: "남은 한도",
     reset_in: "초기화까지",
+    reset_in_separator: " ",
+    elapsed: "경과",
     loading: "불러오는 중",
     authentication_expired: "인증 만료",
     authentication_problem: "인증을 확인해 주세요",

@@ -310,6 +310,13 @@ fn countdown_text(resets_at: Option<SystemTime>, strings: Strings) -> Option<Str
     })
 }
 
+fn format_reset_time(duration: &str, strings: Strings) -> String {
+    format!(
+        "{}{}{}",
+        strings.reset_in, strings.reset_in_separator, duration
+    )
+}
+
 /// The display-basis prefix ("Used"/"Remaining") is chosen once via the
 /// settings menu (see `IDM_DISPLAY_BASIS_USED`/`IDM_DISPLAY_BASIS_REMAINING`)
 /// and isn't echoed anywhere in the popup body (AUM-WINDOW-UI-01C-1 removed
@@ -319,7 +326,10 @@ fn format_cell_text(basis: DisplayBasis, section: &UsageSection, strings: String
     let pct = display_value(basis, section.percentage);
     let pct_text = format!("{pct:.0}%");
     match countdown_text(section.resets_at, strings) {
-        Some(countdown) => format!("{pct_text} \u{00b7} {} {countdown}", strings.reset_in),
+        Some(countdown) => format!(
+            "{pct_text} \u{00b7} {}",
+            format_reset_time(&countdown, strings)
+        ),
         None => pct_text,
     }
 }
@@ -433,21 +443,17 @@ fn render_generic_quota_item(
                 format_quota_number(*limit),
                 item.unit.as_str()
             ),
-            (DisplayBasis::RemainingAllowance, Some(limit)) => format!(
-                "{} / {} {}",
-                format_quota_number((*limit - *used).max(0.0)),
-                format_quota_number(*limit),
-                item.unit.as_str()
-            ),
+            // The compact monthly row also carries reset time. Its bar
+            // already communicates the value relative to the configured
+            // plan limit, so keep the exact remaining amount and omit the
+            // repeated denominator/unit from this fixed-width text cell.
+            (DisplayBasis::RemainingAllowance, Some(limit)) => {
+                format_quota_number((*limit - *used).max(0.0))
+            }
             (_, None) => format!("{} {}", format_quota_number(*used), item.unit.as_str()),
         },
         Some(QuotaMetric::Remaining { remaining, limit }) => match (basis, limit) {
-            (DisplayBasis::RemainingAllowance, Some(limit)) => format!(
-                "{} / {} {}",
-                format_quota_number(*remaining),
-                format_quota_number(*limit),
-                item.unit.as_str()
-            ),
+            (DisplayBasis::RemainingAllowance, Some(_)) => format_quota_number(*remaining),
             (DisplayBasis::UsedPercentage, Some(limit)) => format!(
                 "{} / {} {}",
                 format_quota_number((*limit - *remaining).max(0.0)),
@@ -462,13 +468,21 @@ fn render_generic_quota_item(
         },
         None => String::new(),
     };
-    let text = match (
-        metric_text.is_empty(),
-        countdown_text(item.resets_at, strings),
-    ) {
-        (false, Some(countdown)) => format!("{metric_text} · {} {countdown}", strings.reset_in),
+    let time_text = match basis {
+        DisplayBasis::RemainingAllowance => remaining_secs_at(item.resets_at, SystemTime::now())
+            .map(|remaining_secs| {
+                let duration =
+                    format_duration(remaining_secs, DurationGranularity::LongWindow, strings);
+                format_reset_time(&duration, strings)
+            }),
+        // Generic quota items do not carry a safely-derived window start.
+        // Do not present their reset time as elapsed time.
+        DisplayBasis::UsedPercentage => None,
+    };
+    let text = match (metric_text.is_empty(), time_text) {
+        (false, Some(time_text)) => format!("{metric_text} · {time_text}"),
         (false, None) => metric_text,
-        (true, Some(countdown)) => format!("{} {countdown}", strings.reset_in),
+        (true, Some(time_text)) => time_text,
         (true, None) => strings.not_available.to_string(),
     };
     CellDisplay { bar_percent, text }
@@ -835,27 +849,52 @@ fn weekly_pace_status_text(status: WeeklyPaceStatus, strings: Strings) -> &'stat
     }
 }
 
-/// Two-unit duration text (e.g. "2日18時間" / "3時間10分" / "5分30秒"),
-/// reusing the existing day/hour/minute/second suffixes. More precise than
-/// `countdown_text`'s single-largest-unit style, which is intentionally
-/// terse for the existing 5h/7d bar rows this display model doesn't touch.
-fn format_remaining_duration(remaining_secs: u64, strings: Strings) -> String {
-    let days = remaining_secs / 86400;
-    let hours = (remaining_secs % 86400) / 3600;
-    let minutes = (remaining_secs % 3600) / 60;
-    if days >= 1 {
-        format!("{days}{}{hours}{}", strings.day_suffix, strings.hour_suffix)
-    } else if hours >= 1 {
-        format!(
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DurationGranularity {
+    LongWindow,
+    ShortWindow,
+}
+
+/// Window-aware duration text. Long windows use days + hours (or hours only),
+/// while the 5h window uses hours + minutes (or minutes only). Seconds are
+/// intentionally omitted from both directions of the time axis.
+fn format_duration(total_secs: u64, granularity: DurationGranularity, strings: Strings) -> String {
+    let days = total_secs / 86400;
+    let hours = (total_secs % 86400) / 3600;
+    let minutes = (total_secs % 3600) / 60;
+    match granularity {
+        DurationGranularity::LongWindow if days >= 1 => {
+            format!("{days}{}{hours}{}", strings.day_suffix, strings.hour_suffix)
+        }
+        DurationGranularity::LongWindow => format!("{hours}{}", strings.hour_suffix),
+        DurationGranularity::ShortWindow if hours >= 1 => format!(
             "{hours}{}{minutes}{}",
             strings.hour_suffix, strings.minute_suffix
-        )
-    } else {
-        let seconds = remaining_secs % 60;
-        format!(
-            "{minutes}{}{seconds}{}",
-            strings.minute_suffix, strings.second_suffix
-        )
+        ),
+        DurationGranularity::ShortWindow => format!("{minutes}{}", strings.minute_suffix),
+    }
+}
+
+/// Time-axis text for a fixed quota window. Used-percentage mode points
+/// backward from now to the safely-derived window start; remaining-allowance
+/// mode keeps pointing forward to reset. If the selected direction cannot be
+/// derived from the available reset data, no time text is shown.
+fn format_window_time(
+    basis: DisplayBasis,
+    remaining_secs: Option<u64>,
+    elapsed_secs: Option<u64>,
+    granularity: DurationGranularity,
+    strings: Strings,
+) -> Option<String> {
+    match basis {
+        DisplayBasis::UsedPercentage => {
+            let duration = format_duration(elapsed_secs?, granularity, strings);
+            Some(format!("{} {duration}", strings.elapsed))
+        }
+        DisplayBasis::RemainingAllowance => {
+            let duration = format_duration(remaining_secs?, granularity, strings);
+            Some(format_reset_time(&duration, strings))
+        }
     }
 }
 
@@ -931,7 +970,7 @@ fn weekly_exhaustion_lead_secs(
 }
 
 fn format_exhaustion_text(lead_secs: u64, strings: Strings) -> String {
-    let duration = format_remaining_duration(lead_secs, strings);
+    let duration = format_duration(lead_secs, DurationGranularity::LongWindow, strings);
     let before_reset = strings
         .exhaustion_before_reset
         .replace("{duration}", &duration);
@@ -993,15 +1032,17 @@ fn weekly_pace_guidance_lines(
         });
     };
 
-    let reset_text = format!(
-        "{} {}",
-        strings.reset_in,
-        format_remaining_duration(remaining_secs, strings)
-    );
+    let time_text = format_window_time(
+        basis,
+        Some(remaining_secs),
+        Some(elapsed_secs),
+        DurationGranularity::LongWindow,
+        strings,
+    )?;
 
     if density == DisplayDensity::Compact {
         return Some(PaceGuidanceLines {
-            primary: format!("{pct_text} \u{00b7} {reset_text}"),
+            primary: format!("{pct_text} \u{00b7} {time_text}"),
             secondary: None,
             detail: None,
             is_warning: false,
@@ -1009,17 +1050,20 @@ fn weekly_pace_guidance_lines(
     }
 
     let status = weekly_pace_status(elapsed_secs, WEEKLY_WINDOW_SECS, used_percent);
-    let status_text = weekly_pace_status_text(status, strings);
-    let primary = format!("{pct_text} {status_text}");
+    let primary = if status == WeeklyPaceStatus::Judging {
+        pct_text
+    } else {
+        format!("{pct_text} {}", weekly_pace_status_text(status, strings))
+    };
 
     let future_pace_text = future_pace_guidance(used_percent, remaining_secs)
         .and_then(|guidance| format_future_pace_guidance(&guidance, strings));
     let secondary = Some(match future_pace_text {
         Some(future_text) => format!(
-            "{reset_text}\u{ff5c}{} {future_text}",
+            "{time_text}\u{ff5c}{} {future_text}",
             strings.future_pace_label
         ),
-        None => reset_text,
+        None => time_text,
     });
 
     if density == DisplayDensity::Standard {
@@ -1037,8 +1081,20 @@ fn weekly_pace_guidance_lines(
     let pace_diff = weekly_pace_diff_pt(elapsed_secs, WEEKLY_WINDOW_SECS, used_percent);
     let diff_text =
         format_pace_diff_pt(pace_diff).map(|d| format!("{} {d}", strings.pace_diff_label));
-    let exhaustion_text = weekly_exhaustion_lead_secs(elapsed_secs, remaining_secs, used_percent)
-        .map(|lead_secs| format_exhaustion_text(lead_secs, strings));
+    // Keep calculating the projection for every status, but surface it only
+    // once the existing weekly pace status is itself in a warning band. This
+    // avoids presenting "On Track" or "Under Pace" alongside a projected
+    // pre-reset exhaustion without changing either calculation.
+    let exhaustion_lead_secs =
+        weekly_exhaustion_lead_secs(elapsed_secs, remaining_secs, used_percent);
+    let exhaustion_text = if matches!(
+        status,
+        WeeklyPaceStatus::SlightlyOverpacing | WeeklyPaceStatus::Overpacing
+    ) {
+        exhaustion_lead_secs.map(|lead_secs| format_exhaustion_text(lead_secs, strings))
+    } else {
+        None
+    };
 
     let detail = match (diff_text, exhaustion_text) {
         (Some(d), Some(e)) => Some(format!("{d}\u{ff5c}{e}")),
@@ -1102,12 +1158,15 @@ fn short_window_pace_guidance_lines(
         String::new()
     };
 
-    let primary = match remaining_secs {
-        Some(remaining) => format!(
-            "{pct_text}{status_suffix} \u{00b7} {} {}",
-            strings.reset_in,
-            format_remaining_duration(remaining, strings)
-        ),
+    let time_text = format_window_time(
+        basis,
+        remaining_secs,
+        elapsed_secs,
+        DurationGranularity::ShortWindow,
+        strings,
+    );
+    let primary = match time_text {
+        Some(time_text) => format!("{pct_text}{status_suffix} \u{00b7} {time_text}"),
         None => format!("{pct_text}{status_suffix}"),
     };
 
@@ -1121,7 +1180,7 @@ fn short_window_pace_guidance_lines(
 
 /// Compact provider-header row's weekly-remaining text (AUM-WINDOW-UI-01C-1):
 /// "<remaining prefix> <Xd Yh>", reusing the same `remaining_secs_at`/
-/// `format_remaining_duration` primitives `weekly_pace_guidance_lines`
+/// `format_duration` primitives `weekly_pace_guidance_lines`
 /// already uses for its own countdown text, and the existing
 /// `pace_remaining_prefix` string rather than a new localization key — it
 /// already reads naturally in front of a duration in every shipped
@@ -1139,7 +1198,7 @@ fn compact_weekly_remaining_text(
     Some(format!(
         "{} {}",
         strings.pace_remaining_prefix,
-        format_remaining_duration(remaining_secs, strings)
+        format_duration(remaining_secs, DurationGranularity::LongWindow, strings)
     ))
 }
 
@@ -7476,6 +7535,15 @@ mod tests {
         assert_eq!(limited_display.bar_percent, Some(25.0));
         assert_eq!(limited_display.text, "375 / 1500 ai-credits");
 
+        let limited_remaining_display = render_generic_quota_item(
+            CellState::Ok,
+            Some(&limited),
+            DisplayBasis::RemainingAllowance,
+            strings,
+        );
+        assert_eq!(limited_remaining_display.bar_percent, Some(75.0));
+        assert_eq!(limited_remaining_display.text, "1125");
+
         let usage_only = generic_item(
             Some(QuotaMetric::Used {
                 used: 17.5,
@@ -7518,11 +7586,21 @@ mod tests {
         let reset_display = render_generic_quota_item(
             CellState::Ok,
             Some(&reset_only),
-            DisplayBasis::UsedPercentage,
+            DisplayBasis::RemainingAllowance,
             strings,
         );
         assert_eq!(reset_display.bar_percent, None);
         assert!(reset_display.text.contains(strings.reset_in));
+
+        let used_display = render_generic_quota_item(
+            CellState::Ok,
+            Some(&reset_only),
+            DisplayBasis::UsedPercentage,
+            strings,
+        );
+        assert_eq!(used_display.text, strings.not_available);
+        assert!(!used_display.text.contains(strings.reset_in));
+        assert!(!used_display.text.contains(strings.elapsed));
 
         let unavailable = QuotaItem::unavailable("missing", "Missing");
         let unavailable_display = render_generic_quota_item(
@@ -7543,6 +7621,29 @@ mod tests {
         );
         assert_eq!(zero_display.bar_percent, Some(0.0));
         assert_eq!(zero_display.text, "0%");
+    }
+
+    #[test]
+    fn copilot_remaining_text_prioritizes_exact_amount_and_reset_in_fixed_width_row() {
+        let strings = LanguageId::Japanese.strings();
+        let item = generic_item(
+            Some(QuotaMetric::Used {
+                used: 1.19,
+                limit: Some(1_500.0),
+            }),
+            Some(SystemTime::now() + Duration::from_secs(20 * 86400)),
+        );
+
+        let display = render_generic_quota_item(
+            CellState::Ok,
+            Some(&item),
+            DisplayBasis::RemainingAllowance,
+            strings,
+        );
+
+        assert!(display.text.starts_with("1498.81 · あと"));
+        assert!(!display.text.contains("1500"));
+        assert!(!display.text.contains("ai-credits"));
     }
 
     #[test]
@@ -9096,11 +9197,12 @@ mod tests {
             assert!(!strings.per_hour_suffix.is_empty());
             assert!(!strings.pace_used_prefix.is_empty());
             assert!(!strings.pace_remaining_prefix.is_empty());
+            assert!(!strings.elapsed.is_empty());
         }
     }
 
     #[test]
-    fn weekly_pace_guidance_compact_shows_only_value_and_reset() {
+    fn weekly_pace_guidance_compact_used_basis_shows_only_value_and_elapsed() {
         let now = SystemTime::now();
         let elapsed = WEEKLY_WINDOW_SECS / 2;
         let remaining = WEEKLY_WINDOW_SECS - elapsed;
@@ -9118,7 +9220,8 @@ mod tests {
         .expect("known value with valid reset data should produce lines");
 
         assert!(lines.primary.contains("69%"));
-        assert!(lines.primary.contains(strings.reset_in));
+        assert!(lines.primary.contains(strings.elapsed));
+        assert!(!lines.primary.contains(strings.reset_in));
         assert_eq!(lines.secondary, None);
         assert_eq!(lines.detail, None);
         assert!(!lines.is_warning);
@@ -9203,6 +9306,52 @@ mod tests {
     }
 
     #[test]
+    fn weekly_pace_guidance_detailed_hides_exhaustion_while_on_track_or_under_pace() {
+        let now = SystemTime::now();
+        let elapsed = WEEKLY_WINDOW_SECS / 5;
+        let remaining = WEEKLY_WINDOW_SECS - elapsed;
+        let resets_at = Some(now + Duration::from_secs(remaining));
+        let strings = LanguageId::English.strings();
+
+        // At 20% elapsed, 25% used is +5pt: OnTrack. The unchanged linear
+        // projection still reaches 100% before reset, but must not be shown.
+        assert_eq!(
+            weekly_pace_status(elapsed, WEEKLY_WINDOW_SECS, 25.0),
+            WeeklyPaceStatus::OnTrack
+        );
+        assert!(weekly_exhaustion_lead_secs(elapsed, remaining, 25.0).is_some());
+        let on_track = weekly_pace_guidance_lines(
+            Some(25.0),
+            resets_at,
+            now,
+            DisplayBasis::UsedPercentage,
+            DisplayDensity::Detailed,
+            strings,
+        )
+        .unwrap();
+        assert!(on_track.primary.contains(strings.weekly_pace_on_track));
+        let detail = on_track.detail.expect("pace diff should remain visible");
+        assert!(detail.contains("+5pt"));
+        assert!(!detail.contains(strings.exhaustion_label));
+
+        // Under Pace also never pairs its status word with exhaustion text.
+        let under_pace = weekly_pace_guidance_lines(
+            Some(5.0),
+            resets_at,
+            now,
+            DisplayBasis::UsedPercentage,
+            DisplayDensity::Detailed,
+            strings,
+        )
+        .unwrap();
+        assert!(under_pace.primary.contains(strings.weekly_pace_under_pace));
+        assert!(!under_pace
+            .detail
+            .unwrap()
+            .contains(strings.exhaustion_label));
+    }
+
+    #[test]
     fn weekly_pace_guidance_detailed_shows_exhaustion_lead_time_before_reset() {
         let now = SystemTime::now();
         let elapsed = WEEKLY_WINDOW_SECS / 2;
@@ -9210,26 +9359,31 @@ mod tests {
         let resets_at = Some(now + Duration::from_secs(remaining));
         let strings = LanguageId::English.strings();
 
-        // used=69% at 50% elapsed projects exhaustion well before this
-        // window's reset.
-        let lines = weekly_pace_guidance_lines(
-            Some(69.0),
-            resets_at,
-            now,
-            DisplayBasis::UsedPercentage,
-            DisplayDensity::Detailed,
-            strings,
-        )
-        .expect("known value with valid reset data should produce lines");
+        // Both warning statuses may still show a valid pre-reset projection.
+        for (used_percent, status_text) in [
+            (69.0, strings.weekly_pace_slightly_overpacing),
+            (80.0, strings.weekly_pace_overpacing),
+        ] {
+            let lines = weekly_pace_guidance_lines(
+                Some(used_percent),
+                resets_at,
+                now,
+                DisplayBasis::UsedPercentage,
+                DisplayDensity::Detailed,
+                strings,
+            )
+            .expect("known value with valid reset data should produce lines");
 
-        let detail = lines.detail.expect("exhaustion text should be present");
-        assert!(detail.contains(strings.exhaustion_label));
+            assert!(lines.primary.contains(status_text));
+            let detail = lines.detail.expect("exhaustion text should be present");
+            assert!(detail.contains(strings.exhaustion_label));
+        }
     }
 
     #[test]
-    fn weekly_pace_guidance_never_shows_both_basis_values_at_once() {
+    fn weekly_pace_guidance_time_axis_follows_basis_and_keeps_future_pace() {
         let now = SystemTime::now();
-        let elapsed = WEEKLY_WINDOW_SECS / 2;
+        let elapsed = 14 * 3600 + 26 * 60;
         let remaining = WEEKLY_WINDOW_SECS - elapsed;
         let resets_at = Some(now + Duration::from_secs(remaining));
         let strings = LanguageId::English.strings();
@@ -9239,7 +9393,7 @@ mod tests {
             resets_at,
             now,
             DisplayBasis::UsedPercentage,
-            DisplayDensity::Compact,
+            DisplayDensity::Standard,
             strings,
         )
         .unwrap();
@@ -9248,7 +9402,7 @@ mod tests {
             resets_at,
             now,
             DisplayBasis::RemainingAllowance,
-            DisplayDensity::Compact,
+            DisplayDensity::Standard,
             strings,
         )
         .unwrap();
@@ -9257,6 +9411,20 @@ mod tests {
         assert!(!used_lines.primary.contains("31%"));
         assert!(remaining_lines.primary.contains("31%"));
         assert!(!remaining_lines.primary.contains("69%"));
+
+        let used_secondary = used_lines.secondary.unwrap();
+        assert!(used_secondary.contains(strings.elapsed));
+        assert!(used_secondary.contains("14h"));
+        assert!(!used_secondary.contains("26m"));
+        assert!(!used_secondary.contains(strings.reset_in));
+        assert!(used_secondary.contains(strings.future_pace_label));
+
+        let remaining_secondary = remaining_lines.secondary.unwrap();
+        assert!(remaining_secondary.contains(strings.reset_in));
+        assert!(remaining_secondary.contains("6d9h"));
+        assert!(!remaining_secondary.contains("34m"));
+        assert!(!remaining_secondary.contains(strings.elapsed));
+        assert!(remaining_secondary.contains(strings.future_pace_label));
     }
 
     #[test]
@@ -9296,7 +9464,7 @@ mod tests {
     }
 
     #[test]
-    fn weekly_pace_guidance_standard_shows_judging_before_min_elapsed() {
+    fn weekly_pace_guidance_standard_omits_judging_word_before_min_elapsed() {
         let now = SystemTime::now();
         // Elapsed well under `PACE_JUDGING_MIN_ELAPSED_SECS` (6h): pace is
         // too noisy to judge yet, regardless of `used_percent`.
@@ -9315,7 +9483,36 @@ mod tests {
         )
         .expect("known value with valid reset data should produce lines");
 
-        assert!(lines.primary.contains(strings.weekly_pace_judging));
+        assert!(lines.primary.contains("5%"));
+        assert!(!lines.primary.contains(strings.weekly_pace_judging));
+        assert!(lines.secondary.is_some());
+    }
+
+    #[test]
+    fn japanese_reset_time_is_compact_for_long_and_short_windows() {
+        let strings = LanguageId::Japanese.strings();
+        assert_eq!(
+            format_window_time(
+                DisplayBasis::RemainingAllowance,
+                Some(6 * 86400 + 8 * 3600),
+                None,
+                DurationGranularity::LongWindow,
+                strings,
+            )
+            .as_deref(),
+            Some("あと6日8時間")
+        );
+        assert_eq!(
+            format_window_time(
+                DisplayBasis::RemainingAllowance,
+                Some(3 * 3600 + 16 * 60),
+                None,
+                DurationGranularity::ShortWindow,
+                strings,
+            )
+            .as_deref(),
+            Some("あと3時間16分")
+        );
     }
 
     #[test]
@@ -9360,11 +9557,13 @@ mod tests {
     }
 
     #[test]
-    fn short_window_pace_guidance_always_shows_normal_window() {
+    fn short_window_pace_guidance_time_axis_follows_display_basis() {
         let now = SystemTime::now();
-        let resets_at = Some(now + Duration::from_secs(SESSION_WINDOW_SECS / 2));
+        let elapsed = 1 * 3600 + 16 * 60 + 42;
+        let remaining = SESSION_WINDOW_SECS - elapsed;
+        let resets_at = Some(now + Duration::from_secs(remaining));
         let strings = LanguageId::English.strings();
-        let lines = short_window_pace_guidance_lines(
+        let used_lines = short_window_pace_guidance_lines(
             Some(24.0),
             resets_at,
             now,
@@ -9372,8 +9571,27 @@ mod tests {
             ShortWindowVisibility::Always,
             ShortWindowAlertSensitivity::Standard,
             strings,
-        );
-        assert!(lines.is_some());
+        )
+        .unwrap();
+        assert!(used_lines.primary.contains(strings.elapsed));
+        assert!(used_lines.primary.contains("1h16m"));
+        assert!(!used_lines.primary.contains("42s"));
+        assert!(!used_lines.primary.contains(strings.reset_in));
+
+        let remaining_lines = short_window_pace_guidance_lines(
+            Some(24.0),
+            resets_at,
+            now,
+            DisplayBasis::RemainingAllowance,
+            ShortWindowVisibility::Always,
+            ShortWindowAlertSensitivity::Standard,
+            strings,
+        )
+        .unwrap();
+        assert!(remaining_lines.primary.contains(strings.reset_in));
+        assert!(remaining_lines.primary.contains("3h43m"));
+        assert!(!remaining_lines.primary.contains("18s"));
+        assert!(!remaining_lines.primary.contains(strings.elapsed));
     }
 
     #[test]
@@ -9692,21 +9910,21 @@ mod tests {
     }
 
     #[test]
-    fn compact_weekly_remaining_text_formats_hours_and_minutes_under_one_day() {
+    fn compact_weekly_remaining_text_formats_hours_only_under_one_day() {
         let now = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
         let strings = LanguageId::Japanese.strings();
         let remaining = Duration::from_secs(10 * 3600 + 30 * 60);
         let text = compact_weekly_remaining_text(Some(now + remaining), now, strings);
-        assert_eq!(text.as_deref(), Some("残り 10時間30分"));
+        assert_eq!(text.as_deref(), Some("残り 10時間"));
     }
 
     #[test]
-    fn compact_weekly_remaining_text_formats_minutes_and_seconds_under_one_hour() {
+    fn compact_weekly_remaining_text_formats_zero_hours_under_one_hour() {
         let now = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
         let strings = LanguageId::Japanese.strings();
         let remaining = Duration::from_secs(5 * 60 + 30);
         let text = compact_weekly_remaining_text(Some(now + remaining), now, strings);
-        assert_eq!(text.as_deref(), Some("残り 5分30秒"));
+        assert_eq!(text.as_deref(), Some("残り 0時間"));
     }
 
     #[test]

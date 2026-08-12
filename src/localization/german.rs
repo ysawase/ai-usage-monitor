@@ -62,6 +62,8 @@ pub(super) const STRINGS: Strings = Strings {
     used_percentage: "Genutzt (%)",
     remaining_allowance: "Verbleibendes Kontingent",
     reset_in: "Reset in",
+    reset_in_separator: " ",
+    elapsed: "Vergangen",
     loading: "Wird geladen",
     authentication_expired: "Authentifizierung abgelaufen",
     authentication_problem: "Authentifizierung prüfen",

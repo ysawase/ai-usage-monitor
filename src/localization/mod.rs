@@ -204,6 +204,8 @@ pub struct Strings {
     pub used_percentage: &'static str,
     pub remaining_allowance: &'static str,
     pub reset_in: &'static str,
+    pub reset_in_separator: &'static str,
+    pub elapsed: &'static str,
     pub loading: &'static str,
     pub authentication_expired: &'static str,
     pub authentication_problem: &'static str,
