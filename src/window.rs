@@ -1802,167 +1802,20 @@ fn save_state_settings() {
     }
 }
 
+fn app_tray_icon_data(strings: Strings) -> Vec<tray_icon::TrayIconData> {
+    vec![tray_icon::TrayIconData {
+        kind: tray_icon::TrayIconKind::App,
+        percent: None,
+        tooltip: strings.window_title.to_string(),
+    }]
+}
+
 fn tray_icon_data_from_state() -> Vec<tray_icon::TrayIconData> {
     let state = lock_state();
-    match state.as_ref() {
-        Some(s) if s.last_poll_ok => {
-            // The tray icon's fill color/text-color thresholds in
-            // `tray_icon::create_icon` assume `percent` is used-percentage
-            // (they redden/invert as it rises toward 100 — see the
-            // completion report). `s.*_percent`/`s.*_text` are basis-
-            // converted for the popup and would both invert that meaning
-            // and disagree with the icon's own color under "remaining"
-            // (e.g. icon shows a low, safe-looking number while the
-            // tooltip says "30% remaining" — actually 70% used). So every
-            // tray field (icon percent AND tooltip text) is recomputed here
-            // independently, always as used-percentage, regardless of
-            // `s.display_basis`; the popup keeps the user's chosen basis.
-            let strings = s.language.strings();
-
-            let claude_session =
-                quota_item_section(s.data.as_ref(), QuotaFamilyId::Claude, "session");
-            let claude_weekly =
-                quota_item_section(s.data.as_ref(), QuotaFamilyId::Claude, "weekly");
-            let claude_session_used = render_cell(
-                s.session_state,
-                claude_session.as_ref(),
-                DisplayBasis::UsedPercentage,
-                strings,
-            );
-            let claude_weekly_used = render_cell(
-                s.weekly_state,
-                claude_weekly.as_ref(),
-                DisplayBasis::UsedPercentage,
-                strings,
-            );
-
-            let codex_session =
-                quota_item_section(s.data.as_ref(), QuotaFamilyId::Codex, "session");
-            let codex_weekly = quota_item_section(s.data.as_ref(), QuotaFamilyId::Codex, "weekly");
-            let codex_session_used = render_cell(
-                s.codex_session_state,
-                codex_session.as_ref(),
-                DisplayBasis::UsedPercentage,
-                strings,
-            );
-            let codex_weekly_used = render_cell(
-                s.codex_weekly_state,
-                codex_weekly.as_ref(),
-                DisplayBasis::UsedPercentage,
-                strings,
-            );
-
-            let antigravity_session =
-                quota_item_section(s.data.as_ref(), QuotaFamilyId::Antigravity, "session");
-            let antigravity_weekly =
-                quota_item_section(s.data.as_ref(), QuotaFamilyId::Antigravity, "weekly");
-            let antigravity_session_used = render_cell(
-                s.antigravity_session_state,
-                antigravity_session.as_ref(),
-                DisplayBasis::UsedPercentage,
-                strings,
-            );
-            let antigravity_weekly_used = render_cell(
-                s.antigravity_weekly_state,
-                antigravity_weekly.as_ref(),
-                DisplayBasis::UsedPercentage,
-                strings,
-            );
-            let github_copilot_item = s
-                .data
-                .as_ref()
-                .and_then(|data| data.family(QuotaFamilyId::GithubCopilot))
-                .and_then(|family| family.item(GITHUB_COPILOT_MONTHLY_ITEM_ID));
-            let github_copilot_used = render_generic_quota_item(
-                s.github_copilot_state,
-                github_copilot_item,
-                DisplayBasis::UsedPercentage,
-                strings,
-            );
-
-            let mut icons = Vec::new();
-            if s.show_claude_code {
-                icons.push(tray_icon::TrayIconData {
-                    kind: tray_icon::TrayIconKind::Claude,
-                    percent: claude_session_used.bar_percent,
-                    tooltip: format!(
-                        "{} | {} | 5h: {} | 7d: {}",
-                        strings.claude_code_model,
-                        strings.used_percentage,
-                        claude_session_used.text,
-                        claude_weekly_used.text,
-                    ),
-                });
-            }
-            if s.show_codex {
-                icons.push(tray_icon::TrayIconData {
-                    kind: tray_icon::TrayIconKind::Codex,
-                    percent: codex_session_used.bar_percent,
-                    tooltip: format!(
-                        "{} | {} | 5h: {} | 7d: {}",
-                        strings.codex_model,
-                        strings.used_percentage,
-                        codex_session_used.text,
-                        codex_weekly_used.text,
-                    ),
-                });
-            }
-            if s.show_antigravity {
-                icons.push(tray_icon::TrayIconData {
-                    kind: tray_icon::TrayIconKind::Antigravity,
-                    percent: antigravity_session_used.bar_percent,
-                    tooltip: format!(
-                        "{} | {} | 5h: {} | 7d: {}",
-                        strings.antigravity_model,
-                        strings.used_percentage,
-                        antigravity_session_used.text,
-                        antigravity_weekly_used.text,
-                    ),
-                });
-            }
-            if s.show_github_copilot {
-                icons.push(tray_icon::TrayIconData {
-                    kind: tray_icon::TrayIconKind::GithubCopilot,
-                    percent: github_copilot_used.bar_percent,
-                    tooltip: format!("GitHub Copilot | {}", github_copilot_used.text),
-                });
-            }
-            icons
-        }
-        Some(s) => {
-            let mut icons = Vec::new();
-            if s.show_claude_code {
-                icons.push(tray_icon::TrayIconData {
-                    kind: tray_icon::TrayIconKind::Claude,
-                    percent: None,
-                    tooltip: s.language.strings().window_title.to_string(),
-                });
-            }
-            if s.show_codex {
-                icons.push(tray_icon::TrayIconData {
-                    kind: tray_icon::TrayIconKind::Codex,
-                    percent: None,
-                    tooltip: s.language.strings().codex_window_title.to_string(),
-                });
-            }
-            if s.show_antigravity {
-                icons.push(tray_icon::TrayIconData {
-                    kind: tray_icon::TrayIconKind::Antigravity,
-                    percent: None,
-                    tooltip: s.language.strings().antigravity_window_title.to_string(),
-                });
-            }
-            if s.show_github_copilot {
-                icons.push(tray_icon::TrayIconData {
-                    kind: tray_icon::TrayIconKind::GithubCopilot,
-                    percent: None,
-                    tooltip: "GitHub Copilot Usage Monitor".to_string(),
-                });
-            }
-            icons
-        }
-        None => Vec::new(),
-    }
+    state
+        .as_ref()
+        .map(|s| app_tray_icon_data(s.language.strings()))
+        .unwrap_or_default()
 }
 
 fn sync_tray_icons(hwnd: HWND) {
@@ -1992,6 +1845,20 @@ fn apply_always_on_top(hwnd: HWND, always_on_top: bool) {
     }
 }
 
+fn show_widget_without_activation(hwnd: HWND) {
+    unsafe {
+        let _ = SetWindowPos(
+            hwnd,
+            HWND::default(),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+        );
+    }
+}
+
 fn toggle_widget_visibility(hwnd: HWND) {
     let (new_visible, always_on_top) = {
         let mut state = lock_state();
@@ -2006,9 +1873,16 @@ fn toggle_widget_visibility(hwnd: HWND) {
     unsafe {
         if new_visible {
             position_at_taskbar();
-            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
-            apply_always_on_top(hwnd, always_on_top);
+            // `SetWindowPos(SWP_SHOWWINDOW)` is not subject to the special
+            // first-call behavior of `ShowWindow`. This matters when the app
+            // starts with the widget hidden and the tray click is its first
+            // request to show the window.
+            show_widget_without_activation(hwnd);
             render_layered();
+            // Showing and redrawing a hidden layered window completes before
+            // restoring its saved z-order so the menu state and the actual
+            // topmost state cannot diverge after a tray/menu restore.
+            apply_always_on_top(hwnd, always_on_top);
         } else {
             let _ = ShowWindow(hwnd, SW_HIDE);
         }
@@ -3565,11 +3439,7 @@ pub fn run() {
         select_taskbar_anchor(settings.taskbar_index);
 
         let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA);
-        // Explicitly apply NOTOPMOST (not just skip TOPMOST) when the saved
-        // preference is off, so no stale topmost z-order can linger.
-        apply_always_on_top(hwnd, settings.always_on_top);
-
-        // Register system tray icon(s)
+        // Register the application-wide system tray icon.
         sync_tray_icons(hwnd);
 
         // Position and show (only if widget_visible preference is true)
@@ -3581,6 +3451,10 @@ pub fn run() {
 
         // Initial render via UpdateLayeredWindow (for embedded) or InvalidateRect (fallback)
         render_layered();
+        // Apply the saved z-order after the initial show and layered render.
+        // Explicitly applying NOTOPMOST when disabled also prevents a stale
+        // topmost state from lingering.
+        apply_always_on_top(hwnd, settings.always_on_top);
 
         // Poll timer: 15 minutes
         let initial_poll_ms = {
@@ -4608,30 +4482,24 @@ fn do_poll(send_hwnd: SendHwnd) {
                     state.as_ref().map(|s| {
                         if s.show_claude_code {
                             (
-                                s.language.strings(),
-                                tray_icon::TrayIconKind::Claude,
                                 s.language.strings().token_expired_title,
                                 s.language.strings().token_expired_body,
                             )
                         } else if s.show_codex {
                             (
-                                s.language.strings(),
-                                tray_icon::TrayIconKind::Codex,
                                 s.language.strings().codex_token_expired_title,
                                 s.language.strings().codex_token_expired_body,
                             )
                         } else {
                             (
-                                s.language.strings(),
-                                tray_icon::TrayIconKind::Antigravity,
                                 s.language.strings().antigravity_token_expired_title,
                                 s.language.strings().antigravity_token_expired_body,
                             )
                         }
                     })
                 };
-                if let Some((_strings, kind, title, body)) = balloon {
-                    tray_icon::notify_balloon(hwnd, kind, title, body);
+                if let Some((title, body)) = balloon {
+                    tray_icon::notify_balloon(hwnd, title, body);
                 }
             }
 
@@ -7263,6 +7131,19 @@ mod tests {
             attempted_at: SystemTime::UNIX_EPOCH,
             acquired_at: SystemTime::UNIX_EPOCH,
             usage: UsageData::from_quota_items(items),
+        }
+    }
+
+    #[test]
+    fn app_tray_icon_data_contains_one_provider_independent_icon() {
+        for language in LanguageId::ALL {
+            let strings = language.strings();
+            let icons = app_tray_icon_data(strings);
+
+            assert_eq!(icons.len(), 1);
+            assert_eq!(icons[0].kind, tray_icon::TrayIconKind::App);
+            assert!(icons[0].percent.is_none());
+            assert_eq!(icons[0].tooltip, strings.window_title);
         }
     }
 

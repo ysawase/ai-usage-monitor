@@ -14,6 +14,7 @@ const CLAUDE_TRAY_ICON_ID: u32 = 1;
 const CODEX_TRAY_ICON_ID: u32 = 2;
 const ANTIGRAVITY_TRAY_ICON_ID: u32 = 3;
 const GITHUB_COPILOT_TRAY_ICON_ID: u32 = 4;
+const APP_TRAY_ICON_ID: u32 = CLAUDE_TRAY_ICON_ID;
 
 /// Menu item ID for toggling widget visibility (used by window.rs context menu).
 pub const IDM_TOGGLE_WIDGET: u16 = 70;
@@ -25,8 +26,9 @@ pub enum TrayAction {
     ShowContextMenu,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TrayIconKind {
+    App,
     Claude,
     Codex,
     Antigravity,
@@ -42,6 +44,7 @@ pub struct TrayIconData {
 impl TrayIconKind {
     fn id(self) -> u32 {
         match self {
+            Self::App => APP_TRAY_ICON_ID,
             Self::Claude => CLAUDE_TRAY_ICON_ID,
             Self::Codex => CODEX_TRAY_ICON_ID,
             Self::Antigravity => ANTIGRAVITY_TRAY_ICON_ID,
@@ -116,7 +119,9 @@ fn github_copilot_fill(percent: f64) -> Color {
 /// For Claude, `percent` = None uses the embedded app icon as the loading state.
 /// For Codex and Antigravity, `percent` = None uses a provider placeholder badge.
 pub fn create_icon(kind: TrayIconKind, percent: Option<f64>) -> HICON {
-    if matches!(kind, TrayIconKind::Claude) && percent.is_none() {
+    if matches!(kind, TrayIconKind::App)
+        || (matches!(kind, TrayIconKind::Claude) && percent.is_none())
+    {
         let app_icon = load_embedded_app_icon();
         if !app_icon.is_invalid() {
             return app_icon;
@@ -136,12 +141,14 @@ pub fn create_icon(kind: TrayIconKind, percent: Option<f64>) -> HICON {
     };
 
     let fill = match kind {
+        TrayIconKind::App => Color::from_hex("#D97757"),
         TrayIconKind::Claude => interpolated_fill(percent.unwrap_or(0.0)),
         TrayIconKind::Codex => codex_fill(percent.unwrap_or(0.0)),
         TrayIconKind::Antigravity => antigravity_fill(percent.unwrap_or(0.0)),
         TrayIconKind::GithubCopilot => github_copilot_fill(percent.unwrap_or(0.0)),
     };
     let text_col = match kind {
+        TrayIconKind::App => Color::from_hex("#FFFFFF"),
         TrayIconKind::Claude => Color::from_hex("#FFFFFF"),
         TrayIconKind::Codex if percent.unwrap_or(0.0) >= 90.0 => Color::from_hex("#111111"),
         TrayIconKind::Codex => Color::from_hex("#FFFFFF"),
@@ -151,6 +158,7 @@ pub fn create_icon(kind: TrayIconKind, percent: Option<f64>) -> HICON {
         TrayIconKind::GithubCopilot => Color::from_hex("#FFFFFF"),
     };
     let outline_col = match kind {
+        TrayIconKind::App => fill,
         TrayIconKind::Claude => fill,
         TrayIconKind::Codex if percent.unwrap_or(0.0) >= 90.0 => Color::from_hex("#111111"),
         TrayIconKind::Codex => Color::from_hex("#FFFFFF"),
@@ -163,6 +171,7 @@ pub fn create_icon(kind: TrayIconKind, percent: Option<f64>) -> HICON {
     let display_text = match percent {
         Some(p) => format!("{}", p.round().clamp(0.0, 999.0) as u32),
         None => match kind {
+            TrayIconKind::App => String::new(),
             TrayIconKind::Claude => String::new(),
             TrayIconKind::Codex => "C".to_string(),
             TrayIconKind::Antigravity => "A".to_string(),
@@ -352,12 +361,12 @@ fn load_embedded_app_icon() -> HICON {
 
 /// Show a Windows balloon notification from the tray icon.
 /// Used to alert the user when re-authentication is required.
-pub fn notify_balloon(hwnd: HWND, kind: TrayIconKind, title: &str, message: &str) {
+pub fn notify_balloon(hwnd: HWND, title: &str, message: &str) {
     unsafe {
         let mut nid: NOTIFYICONDATAW = std::mem::zeroed();
         nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
         nid.hWnd = hwnd;
-        nid.uID = kind.id();
+        nid.uID = APP_TRAY_ICON_ID;
         nid.uFlags = NIF_INFO;
         nid.dwInfoFlags = NIIF_WARNING;
         copy_wide(title, &mut nid.szInfoTitle);
@@ -428,50 +437,28 @@ pub fn remove(hwnd: HWND, kind: TrayIconKind) {
 }
 
 pub fn sync(hwnd: HWND, icons: &[TrayIconData]) {
-    let show_claude = icons
+    let app_icon = icons
         .iter()
-        .find(|icon| matches!(icon.kind, TrayIconKind::Claude));
-    let show_codex = icons
-        .iter()
-        .find(|icon| matches!(icon.kind, TrayIconKind::Codex));
-    let show_antigravity = icons
-        .iter()
-        .find(|icon| matches!(icon.kind, TrayIconKind::Antigravity));
-    let show_github_copilot = icons
-        .iter()
-        .find(|icon| matches!(icon.kind, TrayIconKind::GithubCopilot));
+        .find(|icon| matches!(icon.kind, TrayIconKind::App));
 
-    if let Some(icon) = show_claude {
+    if let Some(icon) = app_icon {
         add(hwnd, icon.kind, icon.percent, &icon.tooltip);
         update(hwnd, icon.kind, icon.percent, &icon.tooltip);
     } else {
+        // The app icon deliberately reuses the original Claude icon ID.
         remove(hwnd, TrayIconKind::Claude);
     }
 
-    if let Some(icon) = show_codex {
-        add(hwnd, icon.kind, icon.percent, &icon.tooltip);
-        update(hwnd, icon.kind, icon.percent, &icon.tooltip);
-    } else {
-        remove(hwnd, TrayIconKind::Codex);
-    }
-
-    if let Some(icon) = show_antigravity {
-        add(hwnd, icon.kind, icon.percent, &icon.tooltip);
-        update(hwnd, icon.kind, icon.percent, &icon.tooltip);
-    } else {
-        remove(hwnd, TrayIconKind::Antigravity);
-    }
-
-    if let Some(icon) = show_github_copilot {
-        add(hwnd, icon.kind, icon.percent, &icon.tooltip);
-        update(hwnd, icon.kind, icon.percent, &icon.tooltip);
-    } else {
-        remove(hwnd, TrayIconKind::GithubCopilot);
-    }
+    // Clean up provider-specific icon IDs left by earlier builds. The app ID
+    // deliberately reuses the original primary ID, so only the other legacy
+    // IDs need explicit removal here.
+    remove(hwnd, TrayIconKind::Codex);
+    remove(hwnd, TrayIconKind::Antigravity);
+    remove(hwnd, TrayIconKind::GithubCopilot);
 }
 
 pub fn remove_all(hwnd: HWND) {
-    remove(hwnd, TrayIconKind::Claude);
+    remove(hwnd, TrayIconKind::App);
     remove(hwnd, TrayIconKind::Codex);
     remove(hwnd, TrayIconKind::Antigravity);
     remove(hwnd, TrayIconKind::GithubCopilot);
