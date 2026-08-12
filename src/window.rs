@@ -5840,7 +5840,7 @@ fn show_context_menu(hwnd: HWND) {
             IDM_FREQ_1MIN as u32,
             IDM_FREQ_1HOUR as u32,
             selected_frequency_id as u32,
-            MF_BYCOMMAND,
+            MF_BYCOMMAND.0,
         );
 
         let freq_label = native_interop::wide_str(strings.update_frequency);
@@ -5963,7 +5963,7 @@ fn show_context_menu(hwnd: HWND) {
             IDM_GITHUB_COPILOT_PLAN_UNKNOWN as u32,
             IDM_GITHUB_COPILOT_PLAN_MAX as u32,
             selected_copilot_plan_id as u32,
-            MF_BYCOMMAND,
+            MF_BYCOMMAND.0,
         );
 
         let language_menu = CreatePopupMenu().unwrap();
@@ -6026,7 +6026,7 @@ fn show_context_menu(hwnd: HWND) {
             IDM_LANG_SYSTEM as u32,
             IDM_LANG_SIMPLIFIED_CHINESE as u32,
             selected_language_id as u32,
-            MF_BYCOMMAND,
+            MF_BYCOMMAND.0,
         );
 
         let display_settings_menu = CreatePopupMenu().unwrap();
@@ -6068,7 +6068,7 @@ fn show_context_menu(hwnd: HWND) {
             IDM_DISPLAY_BASIS_USED as u32,
             IDM_DISPLAY_BASIS_REMAINING as u32,
             selected_display_basis_id as u32,
-            MF_BYCOMMAND,
+            MF_BYCOMMAND.0,
         );
 
         // Display density submenu: mutually exclusive, radio-style, same
@@ -6116,7 +6116,7 @@ fn show_context_menu(hwnd: HWND) {
             IDM_DISPLAY_DENSITY_COMPACT as u32,
             IDM_DISPLAY_DENSITY_DETAILED as u32,
             selected_display_density_id as u32,
-            MF_BYCOMMAND,
+            MF_BYCOMMAND.0,
         );
         // Popup layout submenu: mutually exclusive, radio-style, same
         // pattern as the display-density submenu above. A separate setting
@@ -6159,7 +6159,7 @@ fn show_context_menu(hwnd: HWND) {
             IDM_POPUP_LAYOUT_COMPACT as u32,
             IDM_POPUP_LAYOUT_STANDARD as u32,
             selected_popup_layout_id as u32,
-            MF_BYCOMMAND,
+            MF_BYCOMMAND.0,
         );
         // App theme submenu: mutually exclusive, radio-style, same pattern
         // as the popup-layout submenu above. Only affects popup colors
@@ -6206,7 +6206,7 @@ fn show_context_menu(hwnd: HWND) {
             IDM_APP_THEME_RECOMMENDED_DARK as u32,
             IDM_APP_THEME_HIGH_VISIBILITY as u32,
             selected_app_theme_id as u32,
-            MF_BYCOMMAND,
+            MF_BYCOMMAND.0,
         );
         // Short-window (5h) visibility submenu.
         let short_window_visibility_menu = CreatePopupMenu().unwrap();
@@ -6251,7 +6251,7 @@ fn show_context_menu(hwnd: HWND) {
             IDM_SHORT_WINDOW_VISIBILITY_ALWAYS as u32,
             IDM_SHORT_WINDOW_VISIBILITY_HIDDEN as u32,
             selected_short_window_visibility_id as u32,
-            MF_BYCOMMAND,
+            MF_BYCOMMAND.0,
         );
         // Short-window (5h) alert sensitivity submenu.
         let short_window_alert_sensitivity_menu = CreatePopupMenu().unwrap();
@@ -6287,9 +6287,7 @@ fn show_context_menu(hwnd: HWND) {
             );
         }
         let selected_short_window_alert_sensitivity_id = match short_window_alert_sensitivity {
-            ShortWindowAlertSensitivity::Sensitive => {
-                IDM_SHORT_WINDOW_ALERT_SENSITIVITY_SENSITIVE
-            }
+            ShortWindowAlertSensitivity::Sensitive => IDM_SHORT_WINDOW_ALERT_SENSITIVITY_SENSITIVE,
             ShortWindowAlertSensitivity::Standard => IDM_SHORT_WINDOW_ALERT_SENSITIVITY_STANDARD,
             ShortWindowAlertSensitivity::Relaxed => IDM_SHORT_WINDOW_ALERT_SENSITIVITY_RELAXED,
         };
@@ -6298,7 +6296,7 @@ fn show_context_menu(hwnd: HWND) {
             IDM_SHORT_WINDOW_ALERT_SENSITIVITY_SENSITIVE as u32,
             IDM_SHORT_WINDOW_ALERT_SENSITIVITY_RELAXED as u32,
             selected_short_window_alert_sensitivity_id as u32,
-            MF_BYCOMMAND,
+            MF_BYCOMMAND.0,
         );
         // Assemble Display Settings in semantic groups: content/judgment,
         // then visual density/layout/theme.

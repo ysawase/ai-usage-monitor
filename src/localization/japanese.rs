@@ -16,7 +16,7 @@ pub(super) const STRINGS: Strings = Strings {
     full_reset: "フルリセット",
     antigravity_model: "Antigravity",
     display_settings: "表示設定",
-    start_with_windows: "Windows と同時に開始",
+    start_with_windows: "Windowsと同時に開始",
     always_on_top: "常に手前に表示",
     reset_position: "位置をリセット",
     language: "言語",
