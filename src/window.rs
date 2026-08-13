@@ -1409,6 +1409,7 @@ fn apply_github_copilot_plan_selection(
 const WM_DPICHANGED_MSG: u32 = 0x02E0;
 #[cfg(feature = "self-update")]
 const WM_APP_UPDATE_CHECK_COMPLETE: u32 = WM_APP + 2;
+const WM_APP_DEFERRED_TRAY_TOGGLE: u32 = WM_APP + 4;
 const TRAY_ICON_UPDATE_REPOSITION_SUPPRESS_MS: u64 = 750;
 
 /// How often the watchdog thread polls for an explorer.exe restart (which
@@ -1832,6 +1833,10 @@ fn apply_always_on_top(hwnd: HWND, always_on_top: bool) {
     } else {
         HWND_NOTOPMOST
     };
+    set_z_order_without_activation(hwnd, insert_after);
+}
+
+fn set_z_order_without_activation(hwnd: HWND, insert_after: HWND) {
     unsafe {
         let _ = SetWindowPos(
             hwnd,
@@ -1845,16 +1850,32 @@ fn apply_always_on_top(hwnd: HWND, always_on_top: bool) {
     }
 }
 
-fn show_widget_without_activation(hwnd: HWND) {
+fn finalize_widget_show_z_order(hwnd: HWND, always_on_top: bool) {
+    if always_on_top {
+        set_z_order_without_activation(hwnd, HWND_TOPMOST);
+    } else {
+        // A newly shown window needs to enter the topmost band once to become
+        // visible, then immediately returns to the normal z-order band.
+        set_z_order_without_activation(hwnd, HWND_TOPMOST);
+        set_z_order_without_activation(hwnd, HWND_NOTOPMOST);
+    }
+}
+
+fn show_widget_without_activation(hwnd: HWND, always_on_top: bool) {
+    let insert_after = if always_on_top {
+        HWND_TOPMOST
+    } else {
+        HWND_TOP
+    };
     unsafe {
         let _ = SetWindowPos(
             hwnd,
-            HWND::default(),
+            insert_after,
             0,
             0,
             0,
             0,
-            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
         );
     }
 }
@@ -1877,12 +1898,9 @@ fn toggle_widget_visibility(hwnd: HWND) {
             // first-call behavior of `ShowWindow`. This matters when the app
             // starts with the widget hidden and the tray click is its first
             // request to show the window.
-            show_widget_without_activation(hwnd);
+            show_widget_without_activation(hwnd, always_on_top);
             render_layered();
-            // Showing and redrawing a hidden layered window completes before
-            // restoring its saved z-order so the menu state and the actual
-            // topmost state cannot diverge after a tray/menu restore.
-            apply_always_on_top(hwnd, always_on_top);
+            finalize_widget_show_z_order(hwnd, always_on_top);
         } else {
             let _ = ShowWindow(hwnd, SW_HIDE);
         }
@@ -5574,10 +5592,14 @@ unsafe extern "system" fn wnd_proc(
             }
             LRESULT(0)
         }
+        WM_APP_DEFERRED_TRAY_TOGGLE => {
+            toggle_widget_visibility(hwnd);
+            LRESULT(0)
+        }
         _ if msg == WM_APP_TRAY => {
             match tray_icon::handle_message(lparam) {
                 tray_icon::TrayAction::ToggleWidget => {
-                    toggle_widget_visibility(hwnd);
+                    let _ = PostMessageW(hwnd, WM_APP_DEFERRED_TRAY_TOGGLE, WPARAM(0), LPARAM(0));
                 }
                 tray_icon::TrayAction::ShowContextMenu => {
                     show_context_menu(hwnd);
