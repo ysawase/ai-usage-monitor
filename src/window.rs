@@ -565,6 +565,17 @@ fn banked_reset_count_for_poll(outcome: &poller::ProviderPollOutcome) -> BankedR
     }
 }
 
+fn merge_successful_provider(
+    data: &mut Option<AppUsageData>,
+    provider: QuotaFamilyId,
+    outcome: &poller::ProviderPollOutcome,
+) {
+    if let poller::ProviderPollOutcome::Success { usage, .. } = outcome {
+        data.get_or_insert_with(AppUsageData::default)
+            .upsert(usage.clone().into_quota_family(provider));
+    }
+}
+
 /// Overwrite each provider's cached `UsageData` with this poll's result only
 /// when that provider actually succeeded this round; a provider that didn't
 /// succeed (error or disabled) keeps whatever was cached before. That old
@@ -575,23 +586,44 @@ fn banked_reset_count_for_poll(outcome: &poller::ProviderPollOutcome) -> BankedR
 /// displayed value is from an old poll" can never occur together, regardless
 /// of ordering.
 fn merge_successful_providers(data: &mut Option<AppUsageData>, report: &poller::PollReport) {
-    let data = data.get_or_insert_with(AppUsageData::default);
-    if let poller::ProviderPollOutcome::Success { usage, .. } = &report.claude_code {
-        data.upsert(usage.clone().into_quota_family(QuotaFamilyId::Claude));
+    // Preserve the existing final-report behavior where an all-error report
+    // still initializes an empty cache before its error states are rendered.
+    data.get_or_insert_with(AppUsageData::default);
+    merge_successful_provider(data, QuotaFamilyId::Claude, &report.claude_code);
+    merge_successful_provider(data, QuotaFamilyId::Codex, &report.codex);
+    merge_successful_provider(data, QuotaFamilyId::Antigravity, &report.antigravity);
+    merge_successful_provider(data, QuotaFamilyId::GithubCopilot, &report.github_copilot);
+}
+
+fn apply_provider_poll_update(
+    state: &mut AppState,
+    provider: QuotaFamilyId,
+    outcome: &poller::ProviderPollOutcome,
+) {
+    match provider {
+        QuotaFamilyId::Claude => {
+            let (session_state, weekly_state) = poll_cell_states(provider, outcome);
+            state.session_state = session_state;
+            state.weekly_state = weekly_state;
+        }
+        QuotaFamilyId::Codex => {
+            let (session_state, weekly_state) = poll_cell_states(provider, outcome);
+            state.codex_session_state = session_state;
+            state.codex_weekly_state = weekly_state;
+            state.codex_banked_reset_count = banked_reset_count_for_poll(outcome);
+        }
+        QuotaFamilyId::Antigravity => {
+            let (session_state, weekly_state) = poll_cell_states(provider, outcome);
+            state.antigravity_session_state = session_state;
+            state.antigravity_weekly_state = weekly_state;
+        }
+        QuotaFamilyId::GithubCopilot => {
+            state.github_copilot_state =
+                poll_quota_item_state(provider, outcome, GITHUB_COPILOT_MONTHLY_ITEM_ID);
+        }
     }
-    if let poller::ProviderPollOutcome::Success { usage, .. } = &report.codex {
-        data.upsert(usage.clone().into_quota_family(QuotaFamilyId::Codex));
-    }
-    if let poller::ProviderPollOutcome::Success { usage, .. } = &report.antigravity {
-        data.upsert(usage.clone().into_quota_family(QuotaFamilyId::Antigravity));
-    }
-    if let poller::ProviderPollOutcome::Success { usage, .. } = &report.github_copilot {
-        data.upsert(
-            usage
-                .clone()
-                .into_quota_family(QuotaFamilyId::GithubCopilot),
-        );
-    }
+    merge_successful_provider(&mut state.data, provider, outcome);
+    refresh_usage_texts(state);
 }
 
 // ── Weekly pace guidance (AUM-PACE-GUIDANCE-01) ───────────────────────────
@@ -4320,12 +4352,23 @@ fn do_poll(send_hwnd: SendHwnd) {
             ))
     };
 
-    let report = poller::poll_report_with_github_copilot(
+    let report = poller::poll_report_with_github_copilot_updates(
         show_claude_code,
         show_codex,
         show_antigravity,
         show_github_copilot,
         github_copilot_plan,
+        |provider, outcome| {
+            {
+                let mut state = lock_state();
+                if let Some(state) = state.as_mut() {
+                    apply_provider_poll_update(state, provider, outcome);
+                }
+            }
+            unsafe {
+                let _ = PostMessageW(hwnd, WM_APP_USAGE_UPDATED, WPARAM(0), LPARAM(0));
+            }
+        },
     );
 
     match report.clone().into_app_usage_data() {
@@ -5238,6 +5281,7 @@ unsafe extern "system" fn wnd_proc(
                             s.codex_weekly_state = CellState::Loading;
                             s.antigravity_session_state = CellState::Loading;
                             s.antigravity_weekly_state = CellState::Loading;
+                            s.github_copilot_state = CellState::Loading;
                             refresh_usage_texts(s);
                             s.force_notify_auth_error = true;
                         }
@@ -11236,6 +11280,48 @@ mod tests {
     }
 
     // ── remaining_secs_at ──────────────────────────────────────────────
+
+    #[test]
+    fn partial_provider_merge_leaves_other_provider_cache_untouched() {
+        let mut cached = Some({
+            let mut data = AppUsageData::default();
+            data.upsert(
+                usage_data_with_session_percent(10.0).into_quota_family(QuotaFamilyId::Claude),
+            );
+            data.upsert(
+                usage_data_with_session_percent(20.0).into_quota_family(QuotaFamilyId::Codex),
+            );
+            data
+        });
+        let claude_update = poller::ProviderPollOutcome::Success {
+            source: poller::ProviderPollSource::AnthropicOauthUsage,
+            attempted_at: SystemTime::now(),
+            acquired_at: SystemTime::now(),
+            usage: usage_data_with_session_percent(70.0),
+        };
+
+        merge_successful_provider(&mut cached, QuotaFamilyId::Claude, &claude_update);
+
+        let cached = cached.expect("partial success should keep the cache");
+        assert_eq!(
+            cached
+                .family(QuotaFamilyId::Claude)
+                .unwrap()
+                .item("session")
+                .unwrap()
+                .used_percentage(),
+            Some(70.0)
+        );
+        assert_eq!(
+            cached
+                .family(QuotaFamilyId::Codex)
+                .unwrap()
+                .item("session")
+                .unwrap()
+                .used_percentage(),
+            Some(20.0)
+        );
+    }
 
     #[test]
     fn remaining_secs_at_is_none_without_resets_at() {

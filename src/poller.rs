@@ -400,20 +400,46 @@ pub(crate) fn poll_report(
     }
 }
 
-pub(crate) fn poll_report_with_github_copilot(
+pub(crate) fn poll_report_with_github_copilot_updates(
     show_claude_code: bool,
     show_codex: bool,
     show_antigravity: bool,
     show_github_copilot: bool,
     github_copilot_plan: GithubCopilotPlan,
+    mut on_provider_complete: impl FnMut(QuotaFamilyId, &ProviderPollOutcome),
 ) -> PollReport {
-    let mut report = poll_report(show_claude_code, show_codex, show_antigravity);
+    #[cfg(feature = "antigravity")]
+    let mut report = poll_report_with_updates(
+        show_claude_code,
+        show_codex,
+        show_antigravity,
+        poll_claude_code,
+        poll_codex,
+        poll_antigravity,
+        &mut on_provider_complete,
+    );
+
+    #[cfg(not(feature = "antigravity"))]
+    let mut report = {
+        let _ = show_antigravity;
+        poll_report_with_updates(
+            show_claude_code,
+            show_codex,
+            false,
+            poll_claude_code,
+            poll_codex,
+            || unreachable!("Antigravity is unavailable in this build"),
+            &mut on_provider_complete,
+        )
+    };
+
     report.github_copilot = poll_provider(
         show_github_copilot,
         ProviderPollSource::GithubBillingApi,
         &mut || poll_github_copilot(github_copilot_plan),
         &mut SystemTime::now,
     );
+    on_provider_complete(QuotaFamilyId::GithubCopilot, &report.github_copilot);
     report
 }
 
@@ -444,7 +470,28 @@ fn poll_report_with(
     poll_codex: impl FnMut() -> Result<UsageData, PollError>,
     poll_antigravity: impl FnMut() -> Result<UsageData, PollError>,
 ) -> PollReport {
-    poll_report_with_clock(
+    let mut ignore_update = |_: QuotaFamilyId, _: &ProviderPollOutcome| {};
+    poll_report_with_updates(
+        show_claude_code,
+        show_codex,
+        show_antigravity,
+        poll_claude_code,
+        poll_codex,
+        poll_antigravity,
+        &mut ignore_update,
+    )
+}
+
+fn poll_report_with_updates(
+    show_claude_code: bool,
+    show_codex: bool,
+    show_antigravity: bool,
+    poll_claude_code: impl FnMut() -> Result<UsageData, PollError>,
+    poll_codex: impl FnMut() -> Result<UsageData, PollError>,
+    poll_antigravity: impl FnMut() -> Result<UsageData, PollError>,
+    on_provider_complete: &mut impl FnMut(QuotaFamilyId, &ProviderPollOutcome),
+) -> PollReport {
+    poll_report_with_clock_and_updates(
         show_claude_code,
         show_codex,
         show_antigravity,
@@ -452,6 +499,7 @@ fn poll_report_with(
         poll_codex,
         poll_antigravity,
         SystemTime::now,
+        on_provider_complete,
     )
 }
 
@@ -464,6 +512,29 @@ fn poll_report_with_clock(
     mut poll_antigravity: impl FnMut() -> Result<UsageData, PollError>,
     mut now: impl FnMut() -> SystemTime,
 ) -> PollReport {
+    let mut ignore_update = |_: QuotaFamilyId, _: &ProviderPollOutcome| {};
+    poll_report_with_clock_and_updates(
+        show_claude_code,
+        show_codex,
+        show_antigravity,
+        poll_claude_code,
+        poll_codex,
+        poll_antigravity,
+        &mut now,
+        &mut ignore_update,
+    )
+}
+
+fn poll_report_with_clock_and_updates(
+    show_claude_code: bool,
+    show_codex: bool,
+    show_antigravity: bool,
+    mut poll_claude_code: impl FnMut() -> Result<UsageData, PollError>,
+    mut poll_codex: impl FnMut() -> Result<UsageData, PollError>,
+    mut poll_antigravity: impl FnMut() -> Result<UsageData, PollError>,
+    mut now: impl FnMut() -> SystemTime,
+    on_provider_complete: &mut impl FnMut(QuotaFamilyId, &ProviderPollOutcome),
+) -> PollReport {
     let active_provider_count = show_claude_code as u8 + show_codex as u8 + show_antigravity as u8;
 
     let claude_code = poll_provider(
@@ -473,6 +544,7 @@ fn poll_report_with_clock(
         &mut now,
     );
     log_partial_failure("Claude Code", &claude_code, active_provider_count);
+    on_provider_complete(QuotaFamilyId::Claude, &claude_code);
 
     let codex = poll_provider(
         show_codex,
@@ -481,6 +553,7 @@ fn poll_report_with_clock(
         &mut now,
     );
     log_partial_failure("Codex", &codex, active_provider_count);
+    on_provider_complete(QuotaFamilyId::Codex, &codex);
 
     let antigravity_source = ProviderPollSource::AntigravityQuotaUsage;
 
@@ -491,6 +564,7 @@ fn poll_report_with_clock(
         &mut now,
     );
     log_partial_failure("Antigravity", &antigravity, active_provider_count);
+    on_provider_complete(QuotaFamilyId::Antigravity, &antigravity);
 
     PollReport {
         claude_code,
@@ -2879,6 +2953,62 @@ mod tests {
         assert!(matches!(report.claude_code, ProviderPollOutcome::Disabled));
         assert!(matches!(report.codex, ProviderPollOutcome::Disabled));
         assert!(matches!(report.antigravity, ProviderPollOutcome::Disabled));
+    }
+
+    #[test]
+    fn provider_updates_are_emitted_in_serial_poll_order() {
+        use std::cell::RefCell;
+
+        let events = RefCell::new(Vec::new());
+        let mut on_provider_complete = |provider: QuotaFamilyId, _: &ProviderPollOutcome| {
+            events.borrow_mut().push(match provider {
+                QuotaFamilyId::Claude => "claude_update",
+                QuotaFamilyId::Codex => "codex_update",
+                QuotaFamilyId::Antigravity => "antigravity_update",
+                QuotaFamilyId::GithubCopilot => "github_copilot_update",
+            });
+        };
+
+        let report = poll_report_with_clock_and_updates(
+            true,
+            true,
+            true,
+            || {
+                events.borrow_mut().push("claude_poll");
+                Ok(usage_with_session_percent(10.0))
+            },
+            || {
+                events.borrow_mut().push("codex_poll");
+                Err(PollError::RequestFailed)
+            },
+            || {
+                events.borrow_mut().push("antigravity_poll");
+                Ok(usage_with_session_percent(30.0))
+            },
+            SystemTime::now,
+            &mut on_provider_complete,
+        );
+
+        assert!(matches!(
+            report.claude_code,
+            ProviderPollOutcome::Success { .. }
+        ));
+        assert!(matches!(report.codex, ProviderPollOutcome::Error { .. }));
+        assert!(matches!(
+            report.antigravity,
+            ProviderPollOutcome::Success { .. }
+        ));
+        assert_eq!(
+            events.into_inner(),
+            [
+                "claude_poll",
+                "claude_update",
+                "codex_poll",
+                "codex_update",
+                "antigravity_poll",
+                "antigravity_update",
+            ]
+        );
     }
 
     #[test]
