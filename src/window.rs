@@ -10,6 +10,7 @@ use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::{GetModuleFileNameW, GetModuleHandleW};
 use windows::Win32::System::Registry::*;
 use windows::Win32::System::Threading::{CreateMutexW, WaitForSingleObject};
+use windows::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime};
 use windows::Win32::UI::Accessibility::HWINEVENTHOOK;
 use windows::Win32::UI::HiDpi::*;
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetCapture, ReleaseCapture, SetCapture};
@@ -84,6 +85,7 @@ struct AppState {
     install_channel: InstallChannel,
 
     display_basis: DisplayBasis,
+    reset_display_mode: ResetDisplayMode,
     display_density: DisplayDensity,
     short_window_visibility: ShortWindowVisibility,
     short_window_alert_sensitivity: ShortWindowAlertSensitivity,
@@ -183,6 +185,22 @@ enum DisplayBasis {
 impl Default for DisplayBasis {
     fn default() -> Self {
         DisplayBasis::UsedPercentage
+    }
+}
+
+/// Whether quota-window time is rendered relative to now or as the absolute
+/// local reset date/time. The serialized names are retained for settings
+/// compatibility even though the menu calls this "Time Display".
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ResetDisplayMode {
+    Relative,
+    AbsoluteDateTime,
+}
+
+impl Default for ResetDisplayMode {
+    fn default() -> Self {
+        Self::Relative
     }
 }
 
@@ -335,21 +353,140 @@ fn format_reset_time(duration: &str, strings: Strings) -> String {
     )
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LocalDateTimeParts {
+    year: u16,
+    month: u16,
+    day: u16,
+    weekday: u16,
+    hour: u16,
+    minute: u16,
+}
+
+fn system_time_to_local_parts(time: SystemTime) -> Option<LocalDateTimeParts> {
+    const WINDOWS_TO_UNIX_EPOCH_SECS: u64 = 11_644_473_600;
+    const TICKS_PER_SEC: u64 = 10_000_000;
+
+    let since_unix = time.duration_since(UNIX_EPOCH).ok()?;
+    let ticks = since_unix
+        .as_secs()
+        .checked_add(WINDOWS_TO_UNIX_EPOCH_SECS)?
+        .checked_mul(TICKS_PER_SEC)?
+        .checked_add(u64::from(since_unix.subsec_nanos()) / 100)?;
+    let file_time = FILETIME {
+        dwLowDateTime: ticks as u32,
+        dwHighDateTime: (ticks >> 32) as u32,
+    };
+    let mut utc = SYSTEMTIME::default();
+    let mut local = SYSTEMTIME::default();
+    unsafe {
+        FileTimeToSystemTime(&file_time, &mut utc).ok()?;
+        SystemTimeToTzSpecificLocalTime(None, &utc, &mut local).ok()?;
+    }
+    Some(LocalDateTimeParts {
+        year: local.wYear,
+        month: local.wMonth,
+        day: local.wDay,
+        weekday: local.wDayOfWeek,
+        hour: local.wHour,
+        minute: local.wMinute,
+    })
+}
+
+fn fill_reset_datetime_template(
+    template: &str,
+    value: LocalDateTimeParts,
+    time_text: &str,
+    strings: Strings,
+) -> String {
+    let weekday = strings
+        .weekday_short
+        .get(value.weekday as usize)
+        .copied()
+        .unwrap_or("");
+    template
+        .replace("{year}", &value.year.to_string())
+        .replace("{month}", &value.month.to_string())
+        .replace("{day}", &value.day.to_string())
+        .replace("{weekday}", weekday)
+        .replace("{time}", time_text)
+}
+
+fn format_absolute_reset_parts(
+    reset: LocalDateTimeParts,
+    _now: LocalDateTimeParts,
+    strings: Strings,
+) -> String {
+    let time_template = if reset.minute == 0 {
+        strings.reset_time_hour
+    } else {
+        strings.reset_time_hour_minute
+    };
+    let time_text = time_template
+        .replace("{hour}", &reset.hour.to_string())
+        .replace("{minute}", &format!("{:02}", reset.minute));
+    fill_reset_datetime_template(strings.reset_datetime_day, reset, &time_text, strings)
+}
+
+fn format_absolute_reset_time(
+    resets_at: Option<SystemTime>,
+    now: SystemTime,
+    strings: Strings,
+) -> Option<String> {
+    let resets_at = resets_at?;
+    if resets_at.duration_since(now).is_err() {
+        return Some(strings.now.to_string());
+    }
+    let reset = system_time_to_local_parts(resets_at)?;
+    let now = system_time_to_local_parts(now)?;
+    Some(format_absolute_reset_parts(reset, now, strings))
+}
+
+fn format_reset_display(
+    resets_at: Option<SystemTime>,
+    now: SystemTime,
+    mode: ResetDisplayMode,
+    granularity: DurationGranularity,
+    strings: Strings,
+) -> Option<String> {
+    match mode {
+        ResetDisplayMode::Relative => {
+            let remaining_secs = remaining_secs_at(resets_at, now)?;
+            let duration = format_duration(remaining_secs, granularity, strings);
+            Some(format_reset_time(&duration, strings))
+        }
+        ResetDisplayMode::AbsoluteDateTime => format_absolute_reset_time(resets_at, now, strings),
+    }
+}
+
 /// The display-basis prefix ("Used"/"Remaining") is chosen once via the
 /// settings menu (see `IDM_DISPLAY_BASIS_USED`/`IDM_DISPLAY_BASIS_REMAINING`)
 /// and isn't echoed anywhere in the popup body (AUM-WINDOW-UI-01C-1 removed
 /// the popup's own basis-label row), so this is just "<percent>%" optionally
 /// followed by " · <reset-in word> <countdown>".
-fn format_cell_text(basis: DisplayBasis, section: &UsageSection, strings: Strings) -> String {
+fn format_cell_text_with_reset_mode(
+    basis: DisplayBasis,
+    section: &UsageSection,
+    reset_display_mode: ResetDisplayMode,
+    strings: Strings,
+) -> String {
     let pct = display_value(basis, section.percentage);
     let pct_text = format!("{pct:.0}%");
-    match countdown_text(section.resets_at, strings) {
-        Some(countdown) => format!(
-            "{pct_text} \u{00b7} {}",
-            format_reset_time(&countdown, strings)
-        ),
+    let reset_text = match reset_display_mode {
+        ResetDisplayMode::Relative => countdown_text(section.resets_at, strings)
+            .map(|countdown| format_reset_time(&countdown, strings)),
+        ResetDisplayMode::AbsoluteDateTime => {
+            format_absolute_reset_time(section.resets_at, SystemTime::now(), strings)
+        }
+    };
+    match reset_text {
+        Some(reset_text) => format!("{pct_text} \u{00b7} {reset_text}"),
         None => pct_text,
     }
+}
+
+fn format_cell_text(basis: DisplayBasis, section: &UsageSection, strings: Strings) -> String {
+    format_cell_text_with_reset_mode(basis, section, ResetDisplayMode::Relative, strings)
 }
 
 /// Localized status word for a non-`Ok` cell. `CellState::Ok` has no status
@@ -385,22 +522,32 @@ fn format_banked_reset_text(count: BankedResetCount, strings: Strings) -> String
     }
 }
 
-fn render_cell(
+fn render_cell_with_reset_mode(
     state: CellState,
     section: Option<&UsageSection>,
     basis: DisplayBasis,
+    reset_display_mode: ResetDisplayMode,
     strings: Strings,
 ) -> CellDisplay {
     match (state, section) {
         (CellState::Ok, Some(section)) => CellDisplay {
             bar_percent: Some(display_value(basis, section.percentage)),
-            text: format_cell_text(basis, section, strings),
+            text: format_cell_text_with_reset_mode(basis, section, reset_display_mode, strings),
         },
         _ => CellDisplay {
             bar_percent: None,
             text: status_text(state, strings).to_string(),
         },
     }
+}
+
+fn render_cell(
+    state: CellState,
+    section: Option<&UsageSection>,
+    basis: DisplayBasis,
+    strings: Strings,
+) -> CellDisplay {
+    render_cell_with_reset_mode(state, section, basis, ResetDisplayMode::Relative, strings)
 }
 
 fn quota_item_section(
@@ -423,10 +570,11 @@ fn format_quota_number(value: f64) -> String {
     }
 }
 
-fn render_generic_quota_item(
+fn render_generic_quota_item_with_reset_mode(
     state: CellState,
     item: Option<&crate::models::QuotaItem>,
     basis: DisplayBasis,
+    reset_display_mode: ResetDisplayMode,
     strings: Strings,
 ) -> CellDisplay {
     if state != CellState::Ok {
@@ -486,16 +634,24 @@ fn render_generic_quota_item(
         },
         None => String::new(),
     };
-    let time_text = match basis {
-        DisplayBasis::RemainingAllowance => remaining_secs_at(item.resets_at, SystemTime::now())
-            .map(|remaining_secs| {
-                let duration =
-                    format_duration(remaining_secs, DurationGranularity::LongWindow, strings);
-                format_reset_time(&duration, strings)
-            }),
+    let time_text = match (reset_display_mode, basis) {
+        (ResetDisplayMode::AbsoluteDateTime, _) => format_reset_display(
+            item.resets_at,
+            SystemTime::now(),
+            reset_display_mode,
+            DurationGranularity::LongWindow,
+            strings,
+        ),
         // Generic quota items do not carry a safely-derived window start.
-        // Do not present their reset time as elapsed time.
-        DisplayBasis::UsedPercentage => None,
+        // Relative used-rate mode therefore has no safe time text.
+        (ResetDisplayMode::Relative, DisplayBasis::UsedPercentage) => None,
+        (ResetDisplayMode::Relative, DisplayBasis::RemainingAllowance) => format_reset_display(
+            item.resets_at,
+            SystemTime::now(),
+            reset_display_mode,
+            DurationGranularity::LongWindow,
+            strings,
+        ),
     };
     let text = match (metric_text.is_empty(), time_text) {
         (false, Some(time_text)) => format!("{metric_text} · {time_text}"),
@@ -504,6 +660,21 @@ fn render_generic_quota_item(
         (true, None) => strings.not_available.to_string(),
     };
     CellDisplay { bar_percent, text }
+}
+
+fn render_generic_quota_item(
+    state: CellState,
+    item: Option<&crate::models::QuotaItem>,
+    basis: DisplayBasis,
+    strings: Strings,
+) -> CellDisplay {
+    render_generic_quota_item_with_reset_mode(
+        state,
+        item,
+        basis,
+        ResetDisplayMode::Relative,
+        strings,
+    )
 }
 
 /// Classify a just-completed provider poll into session/weekly cell states.
@@ -925,10 +1096,37 @@ fn format_duration(total_secs: u64, granularity: DurationGranularity, strings: S
     }
 }
 
-/// Time-axis text for a fixed quota window. Used-percentage mode points
-/// backward from now to the safely-derived window start; remaining-allowance
-/// mode keeps pointing forward to reset. If the selected direction cannot be
-/// derived from the available reset data, no time text is shown.
+/// Time-axis text for a fixed quota window. Relative mode follows the selected
+/// quota basis (elapsed for used percentage, remaining until reset for
+/// remaining allowance). Absolute mode replaces either relative form with the
+/// local reset date/time. If the selected value cannot be derived, no time
+/// text is shown.
+fn format_window_time_with_reset_mode(
+    basis: DisplayBasis,
+    resets_at: Option<SystemTime>,
+    now: SystemTime,
+    remaining_secs: Option<u64>,
+    elapsed_secs: Option<u64>,
+    granularity: DurationGranularity,
+    reset_display_mode: ResetDisplayMode,
+    strings: Strings,
+) -> Option<String> {
+    match reset_display_mode {
+        ResetDisplayMode::AbsoluteDateTime => format_absolute_reset_time(resets_at, now, strings),
+        ResetDisplayMode::Relative => match basis {
+            DisplayBasis::UsedPercentage => {
+                let elapsed_secs = elapsed_secs?;
+                let duration = format_duration(elapsed_secs, granularity, strings);
+                Some(format!("{} {duration}", strings.elapsed))
+            }
+            DisplayBasis::RemainingAllowance => {
+                let duration = format_duration(remaining_secs?, granularity, strings);
+                Some(format_reset_time(&duration, strings))
+            }
+        },
+    }
+}
+
 fn format_window_time(
     basis: DisplayBasis,
     remaining_secs: Option<u64>,
@@ -936,16 +1134,16 @@ fn format_window_time(
     granularity: DurationGranularity,
     strings: Strings,
 ) -> Option<String> {
-    match basis {
-        DisplayBasis::UsedPercentage => {
-            let duration = format_duration(elapsed_secs?, granularity, strings);
-            Some(format!("{} {duration}", strings.elapsed))
-        }
-        DisplayBasis::RemainingAllowance => {
-            let duration = format_duration(remaining_secs?, granularity, strings);
-            Some(format_reset_time(&duration, strings))
-        }
-    }
+    format_window_time_with_reset_mode(
+        basis,
+        None,
+        SystemTime::now(),
+        remaining_secs,
+        elapsed_secs,
+        granularity,
+        ResetDisplayMode::Relative,
+        strings,
+    )
 }
 
 /// 10+ as an integer, [1, 10) to one decimal, (0, 1) to two decimals —
@@ -1051,12 +1249,13 @@ fn pace_basis_prefix(basis: DisplayBasis, strings: Strings) -> &'static str {
 /// `used_percent` itself is unknown or non-finite (nothing to show at all —
 /// distinct from a known value with unusable reset data, which still shows
 /// the current value alone). `now` is a parameter, never read internally.
-fn weekly_pace_guidance_lines(
+fn weekly_pace_guidance_lines_with_reset_mode(
     used_percent: Option<f64>,
     resets_at: Option<SystemTime>,
     now: SystemTime,
     basis: DisplayBasis,
     density: DisplayDensity,
+    reset_display_mode: ResetDisplayMode,
     strings: Strings,
 ) -> Option<PaceGuidanceLines> {
     let used_percent = used_percent?;
@@ -1082,11 +1281,14 @@ fn weekly_pace_guidance_lines(
         });
     };
 
-    let time_text = format_window_time(
+    let time_text = format_window_time_with_reset_mode(
         basis,
+        resets_at,
+        now,
         Some(remaining_secs),
         Some(elapsed_secs),
         DurationGranularity::LongWindow,
+        reset_display_mode,
         strings,
     )?;
 
@@ -1161,6 +1363,25 @@ fn weekly_pace_guidance_lines(
     })
 }
 
+fn weekly_pace_guidance_lines(
+    used_percent: Option<f64>,
+    resets_at: Option<SystemTime>,
+    now: SystemTime,
+    basis: DisplayBasis,
+    density: DisplayDensity,
+    strings: Strings,
+) -> Option<PaceGuidanceLines> {
+    weekly_pace_guidance_lines_with_reset_mode(
+        used_percent,
+        resets_at,
+        now,
+        basis,
+        density,
+        ResetDisplayMode::Relative,
+        strings,
+    )
+}
+
 /// Builds the short (5h) window's pace-guidance display, or `None` when it
 /// should not be shown at all this poll — either `used_percent` is unknown,
 /// `visibility` is `Hidden`, or `visibility` is `WarningOnly` and the window
@@ -1168,13 +1389,14 @@ fn weekly_pace_guidance_lines(
 /// `SlightlyOverpacing` wording, matching the "5時間枠には...を表示しない"
 /// requirement — only a plain value, or (when warranted) the same
 /// "使いすぎ"/Overpacing word the weekly line uses.
-fn short_window_pace_guidance_lines(
+fn short_window_pace_guidance_lines_with_reset_mode(
     used_percent: Option<f64>,
     resets_at: Option<SystemTime>,
     now: SystemTime,
     basis: DisplayBasis,
     visibility: ShortWindowVisibility,
     sensitivity: ShortWindowAlertSensitivity,
+    reset_display_mode: ResetDisplayMode,
     strings: Strings,
 ) -> Option<PaceGuidanceLines> {
     if visibility == ShortWindowVisibility::Hidden {
@@ -1208,11 +1430,14 @@ fn short_window_pace_guidance_lines(
         String::new()
     };
 
-    let time_text = format_window_time(
+    let time_text = format_window_time_with_reset_mode(
         basis,
+        resets_at,
+        now,
         remaining_secs,
         elapsed_secs,
         DurationGranularity::ShortWindow,
+        reset_display_mode,
         strings,
     );
     let primary = match time_text {
@@ -1228,6 +1453,27 @@ fn short_window_pace_guidance_lines(
     })
 }
 
+fn short_window_pace_guidance_lines(
+    used_percent: Option<f64>,
+    resets_at: Option<SystemTime>,
+    now: SystemTime,
+    basis: DisplayBasis,
+    visibility: ShortWindowVisibility,
+    sensitivity: ShortWindowAlertSensitivity,
+    strings: Strings,
+) -> Option<PaceGuidanceLines> {
+    short_window_pace_guidance_lines_with_reset_mode(
+        used_percent,
+        resets_at,
+        now,
+        basis,
+        visibility,
+        sensitivity,
+        ResetDisplayMode::Relative,
+        strings,
+    )
+}
+
 /// Compact provider-header row's weekly-remaining text (AUM-WINDOW-UI-01C-1):
 /// "<remaining prefix> <Xd Yh>", reusing the same `remaining_secs_at`/
 /// `format_duration` primitives `weekly_pace_guidance_lines`
@@ -1239,17 +1485,36 @@ fn short_window_pace_guidance_lines(
 /// returning `None`). Takes `now` as a parameter rather than reading the
 /// clock itself, same as `weekly_pace_guidance_lines`, so callers (and
 /// tests) control "now" explicitly.
+fn compact_weekly_remaining_text_with_reset_mode(
+    resets_at: Option<SystemTime>,
+    now: SystemTime,
+    reset_display_mode: ResetDisplayMode,
+    strings: Strings,
+) -> Option<String> {
+    match reset_display_mode {
+        ResetDisplayMode::Relative => {
+            let remaining_secs = remaining_secs_at(resets_at, now)?;
+            Some(format!(
+                "{} {}",
+                strings.pace_remaining_prefix,
+                format_duration(remaining_secs, DurationGranularity::LongWindow, strings)
+            ))
+        }
+        ResetDisplayMode::AbsoluteDateTime => format_absolute_reset_time(resets_at, now, strings),
+    }
+}
+
 fn compact_weekly_remaining_text(
     resets_at: Option<SystemTime>,
     now: SystemTime,
     strings: Strings,
 ) -> Option<String> {
-    let remaining_secs = remaining_secs_at(resets_at, now)?;
-    Some(format!(
-        "{} {}",
-        strings.pace_remaining_prefix,
-        format_duration(remaining_secs, DurationGranularity::LongWindow, strings)
-    ))
+    compact_weekly_remaining_text_with_reset_mode(
+        resets_at,
+        now,
+        ResetDisplayMode::Relative,
+        strings,
+    )
 }
 
 /// One provider cell's Compact weekly-remaining text, gated the same way
@@ -1258,18 +1523,37 @@ fn compact_weekly_remaining_text(
 /// surviving under a non-`Ok` state (loading/error/unconfigured/
 /// not-available — see `merge_successful_providers`) must never reach the
 /// popup, same as it never reaches the bar or the pace text.
+fn compact_weekly_remaining_for_cell_with_reset_mode(
+    state: CellState,
+    section: Option<&UsageSection>,
+    now: SystemTime,
+    reset_display_mode: ResetDisplayMode,
+    strings: Strings,
+) -> Option<String> {
+    match (state, section) {
+        (CellState::Ok, Some(section)) => compact_weekly_remaining_text_with_reset_mode(
+            section.resets_at,
+            now,
+            reset_display_mode,
+            strings,
+        ),
+        _ => None,
+    }
+}
+
 fn compact_weekly_remaining_for_cell(
     state: CellState,
     section: Option<&UsageSection>,
     now: SystemTime,
     strings: Strings,
 ) -> Option<String> {
-    match (state, section) {
-        (CellState::Ok, Some(section)) => {
-            compact_weekly_remaining_text(section.resets_at, now, strings)
-        }
-        _ => None,
-    }
+    compact_weekly_remaining_for_cell_with_reset_mode(
+        state,
+        section,
+        now,
+        ResetDisplayMode::Relative,
+        strings,
+    )
 }
 
 /// Weekly pace guidance for one provider's cell, gated the same way
@@ -1278,6 +1562,29 @@ fn compact_weekly_remaining_for_cell(
 /// (loading/error/unconfigured/not-available — see
 /// `merge_successful_providers`) must never reach the guidance text, same as
 /// it never reaches the bar.
+fn weekly_pace_for_cell_with_reset_mode(
+    state: CellState,
+    section: Option<&UsageSection>,
+    now: SystemTime,
+    basis: DisplayBasis,
+    density: DisplayDensity,
+    reset_display_mode: ResetDisplayMode,
+    strings: Strings,
+) -> Option<PaceGuidanceLines> {
+    match (state, section) {
+        (CellState::Ok, Some(section)) => weekly_pace_guidance_lines_with_reset_mode(
+            Some(section.percentage),
+            section.resets_at,
+            now,
+            basis,
+            density,
+            reset_display_mode,
+            strings,
+        ),
+        _ => None,
+    }
+}
+
 fn weekly_pace_for_cell(
     state: CellState,
     section: Option<&UsageSection>,
@@ -1286,21 +1593,44 @@ fn weekly_pace_for_cell(
     density: DisplayDensity,
     strings: Strings,
 ) -> Option<PaceGuidanceLines> {
+    weekly_pace_for_cell_with_reset_mode(
+        state,
+        section,
+        now,
+        basis,
+        density,
+        ResetDisplayMode::Relative,
+        strings,
+    )
+}
+
+/// Short (5h) window pace guidance for one provider's cell — same
+/// `CellState::Ok`-gating as `weekly_pace_for_cell`.
+fn session_pace_for_cell_with_reset_mode(
+    state: CellState,
+    section: Option<&UsageSection>,
+    now: SystemTime,
+    basis: DisplayBasis,
+    visibility: ShortWindowVisibility,
+    sensitivity: ShortWindowAlertSensitivity,
+    reset_display_mode: ResetDisplayMode,
+    strings: Strings,
+) -> Option<PaceGuidanceLines> {
     match (state, section) {
-        (CellState::Ok, Some(section)) => weekly_pace_guidance_lines(
+        (CellState::Ok, Some(section)) => short_window_pace_guidance_lines_with_reset_mode(
             Some(section.percentage),
             section.resets_at,
             now,
             basis,
-            density,
+            visibility,
+            sensitivity,
+            reset_display_mode,
             strings,
         ),
         _ => None,
     }
 }
 
-/// Short (5h) window pace guidance for one provider's cell — same
-/// `CellState::Ok`-gating as `weekly_pace_for_cell`.
 fn session_pace_for_cell(
     state: CellState,
     section: Option<&UsageSection>,
@@ -1310,18 +1640,16 @@ fn session_pace_for_cell(
     sensitivity: ShortWindowAlertSensitivity,
     strings: Strings,
 ) -> Option<PaceGuidanceLines> {
-    match (state, section) {
-        (CellState::Ok, Some(section)) => short_window_pace_guidance_lines(
-            Some(section.percentage),
-            section.resets_at,
-            now,
-            basis,
-            visibility,
-            sensitivity,
-            strings,
-        ),
-        _ => None,
-    }
+    session_pace_for_cell_with_reset_mode(
+        state,
+        section,
+        now,
+        basis,
+        visibility,
+        sensitivity,
+        ResetDisplayMode::Relative,
+        strings,
+    )
 }
 
 const RETRY_BASE_MS: u32 = 30_000; // 30 seconds
@@ -1384,6 +1712,8 @@ const IDM_GITHUB_COPILOT_PLAN_UNKNOWN: u16 = 94;
 const IDM_GITHUB_COPILOT_PLAN_PRO: u16 = 95;
 const IDM_GITHUB_COPILOT_PLAN_PRO_PLUS: u16 = 96;
 const IDM_GITHUB_COPILOT_PLAN_MAX: u16 = 97;
+const IDM_RESET_DISPLAY_RELATIVE: u16 = 98;
+const IDM_RESET_DISPLAY_ABSOLUTE: u16 = 99;
 
 /// Pure `menu ID -> enum value` lookups, shared by `show_context_menu`
 /// (which sets which item starts checked) and the `WM_COMMAND` handler
@@ -1394,6 +1724,14 @@ fn display_density_for_menu_id(id: u16) -> Option<DisplayDensity> {
         IDM_DISPLAY_DENSITY_COMPACT => Some(DisplayDensity::Compact),
         IDM_DISPLAY_DENSITY_STANDARD => Some(DisplayDensity::Standard),
         IDM_DISPLAY_DENSITY_DETAILED => Some(DisplayDensity::Detailed),
+        _ => None,
+    }
+}
+
+fn reset_display_mode_for_menu_id(id: u16) -> Option<ResetDisplayMode> {
+    match id {
+        IDM_RESET_DISPLAY_RELATIVE => Some(ResetDisplayMode::Relative),
+        IDM_RESET_DISPLAY_ABSOLUTE => Some(ResetDisplayMode::AbsoluteDateTime),
         _ => None,
     }
 }
@@ -1659,6 +1997,8 @@ struct SettingsFile {
     github_copilot_plan: poller::GithubCopilotPlan,
     #[serde(default, deserialize_with = "deserialize_display_basis")]
     display_basis: DisplayBasis,
+    #[serde(default, deserialize_with = "deserialize_reset_display_mode")]
+    reset_display_mode: ResetDisplayMode,
     #[serde(default, deserialize_with = "deserialize_display_density")]
     display_density: DisplayDensity,
     #[serde(default, deserialize_with = "deserialize_short_window_visibility")]
@@ -1693,6 +2033,7 @@ impl Default for SettingsFile {
             show_github_copilot: false,
             github_copilot_plan: poller::GithubCopilotPlan::Unknown,
             display_basis: DisplayBasis::default(),
+            reset_display_mode: ResetDisplayMode::default(),
             display_density: DisplayDensity::default(),
             short_window_visibility: ShortWindowVisibility::default(),
             short_window_alert_sensitivity: ShortWindowAlertSensitivity::default(),
@@ -1713,6 +2054,16 @@ where
     Ok(serde_json::Value::deserialize(deserializer)
         .ok()
         .and_then(|value| serde_json::from_value::<DisplayBasis>(value).ok())
+        .unwrap_or_default())
+}
+
+fn deserialize_reset_display_mode<'de, D>(deserializer: D) -> Result<ResetDisplayMode, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(serde_json::Value::deserialize(deserializer)
+        .ok()
+        .and_then(|value| serde_json::from_value::<ResetDisplayMode>(value).ok())
         .unwrap_or_default())
 }
 
@@ -1861,6 +2212,7 @@ fn save_state_settings() {
             show_github_copilot: s.show_github_copilot,
             github_copilot_plan: s.github_copilot_plan,
             display_basis: s.display_basis,
+            reset_display_mode: s.reset_display_mode,
             display_density: s.display_density,
             short_window_visibility: s.short_window_visibility,
             short_window_alert_sensitivity: s.short_window_alert_sensitivity,
@@ -2090,6 +2442,7 @@ fn schedule_auto_update_check(hwnd: HWND) {
 fn refresh_usage_texts(state: &mut AppState) {
     let strings = state.language.strings();
     let basis = state.display_basis;
+    let reset_display_mode = state.reset_display_mode;
     let density = state.display_density;
     let visibility = state.short_window_visibility;
     let sensitivity = state.short_window_alert_sensitivity;
@@ -2103,71 +2456,95 @@ fn refresh_usage_texts(state: &mut AppState) {
 
     let claude_session = quota_item_section(data, QuotaFamilyId::Claude, "session");
     let claude_weekly = quota_item_section(data, QuotaFamilyId::Claude, "weekly");
-    let session = render_cell(state.session_state, claude_session.as_ref(), basis, strings);
+    let session = render_cell_with_reset_mode(
+        state.session_state,
+        claude_session.as_ref(),
+        basis,
+        reset_display_mode,
+        strings,
+    );
     state.session_percent = session.bar_percent;
     state.session_text = session.text;
-    state.session_pace = session_pace_for_cell(
+    state.session_pace = session_pace_for_cell_with_reset_mode(
         state.session_state,
         claude_session.as_ref(),
         now,
         basis,
         visibility,
         sensitivity,
+        reset_display_mode,
         strings,
     );
-    let weekly = render_cell(state.weekly_state, claude_weekly.as_ref(), basis, strings);
+    let weekly = render_cell_with_reset_mode(
+        state.weekly_state,
+        claude_weekly.as_ref(),
+        basis,
+        reset_display_mode,
+        strings,
+    );
     state.weekly_percent = weekly.bar_percent;
     state.weekly_text = weekly.text;
-    state.weekly_pace = weekly_pace_for_cell(
+    state.weekly_pace = weekly_pace_for_cell_with_reset_mode(
         state.weekly_state,
         claude_weekly.as_ref(),
         now,
         basis,
         density,
+        reset_display_mode,
         strings,
     );
-    state.weekly_remaining_text =
-        compact_weekly_remaining_for_cell(state.weekly_state, claude_weekly.as_ref(), now, strings);
+    state.weekly_remaining_text = compact_weekly_remaining_for_cell_with_reset_mode(
+        state.weekly_state,
+        claude_weekly.as_ref(),
+        now,
+        reset_display_mode,
+        strings,
+    );
 
     let codex_session_section = quota_item_section(data, QuotaFamilyId::Codex, "session");
     let codex_weekly_section = quota_item_section(data, QuotaFamilyId::Codex, "weekly");
-    let codex_session = render_cell(
+    let codex_session = render_cell_with_reset_mode(
         state.codex_session_state,
         codex_session_section.as_ref(),
         basis,
+        reset_display_mode,
         strings,
     );
     state.codex_session_percent = codex_session.bar_percent;
     state.codex_session_text = codex_session.text;
-    state.codex_session_pace = session_pace_for_cell(
+    state.codex_session_pace = session_pace_for_cell_with_reset_mode(
         state.codex_session_state,
         codex_session_section.as_ref(),
         now,
         basis,
         visibility,
         sensitivity,
+        reset_display_mode,
         strings,
     );
-    let codex_weekly = render_cell(
+    let codex_weekly = render_cell_with_reset_mode(
         state.codex_weekly_state,
         codex_weekly_section.as_ref(),
         basis,
+        reset_display_mode,
         strings,
     );
     state.codex_weekly_percent = codex_weekly.bar_percent;
     state.codex_weekly_text = codex_weekly.text;
-    state.codex_weekly_pace = weekly_pace_for_cell(
+    state.codex_weekly_pace = weekly_pace_for_cell_with_reset_mode(
         state.codex_weekly_state,
         codex_weekly_section.as_ref(),
         now,
         basis,
         density,
+        reset_display_mode,
         strings,
     );
-    state.codex_weekly_remaining_text = compact_weekly_remaining_for_cell(
+    state.codex_weekly_remaining_text = compact_weekly_remaining_for_cell_with_reset_mode(
         state.codex_weekly_state,
         codex_weekly_section.as_ref(),
         now,
+        reset_display_mode,
         strings,
     );
     state.codex_banked_reset_text =
@@ -2176,53 +2553,59 @@ fn refresh_usage_texts(state: &mut AppState) {
     let antigravity_session_section =
         quota_item_section(data, QuotaFamilyId::Antigravity, "session");
     let antigravity_weekly_section = quota_item_section(data, QuotaFamilyId::Antigravity, "weekly");
-    let antigravity_session = render_cell(
+    let antigravity_session = render_cell_with_reset_mode(
         state.antigravity_session_state,
         antigravity_session_section.as_ref(),
         basis,
+        reset_display_mode,
         strings,
     );
     state.antigravity_session_percent = antigravity_session.bar_percent;
     state.antigravity_session_text = antigravity_session.text;
-    state.antigravity_session_pace = session_pace_for_cell(
+    state.antigravity_session_pace = session_pace_for_cell_with_reset_mode(
         state.antigravity_session_state,
         antigravity_session_section.as_ref(),
         now,
         basis,
         visibility,
         sensitivity,
+        reset_display_mode,
         strings,
     );
-    let antigravity_weekly = render_cell(
+    let antigravity_weekly = render_cell_with_reset_mode(
         state.antigravity_weekly_state,
         antigravity_weekly_section.as_ref(),
         basis,
+        reset_display_mode,
         strings,
     );
     state.antigravity_weekly_percent = antigravity_weekly.bar_percent;
     state.antigravity_weekly_text = antigravity_weekly.text;
-    state.antigravity_weekly_pace = weekly_pace_for_cell(
+    state.antigravity_weekly_pace = weekly_pace_for_cell_with_reset_mode(
         state.antigravity_weekly_state,
         antigravity_weekly_section.as_ref(),
         now,
         basis,
         density,
+        reset_display_mode,
         strings,
     );
-    state.antigravity_weekly_remaining_text = compact_weekly_remaining_for_cell(
+    state.antigravity_weekly_remaining_text = compact_weekly_remaining_for_cell_with_reset_mode(
         state.antigravity_weekly_state,
         antigravity_weekly_section.as_ref(),
         now,
+        reset_display_mode,
         strings,
     );
 
     let github_copilot_item = data
         .and_then(|data| data.family(QuotaFamilyId::GithubCopilot))
         .and_then(|family| family.item(GITHUB_COPILOT_MONTHLY_ITEM_ID));
-    let github_copilot = render_generic_quota_item(
+    let github_copilot = render_generic_quota_item_with_reset_mode(
         state.github_copilot_state,
         github_copilot_item,
         basis,
+        reset_display_mode,
         strings,
     );
     state.github_copilot_percent = github_copilot.bar_percent;
@@ -2792,27 +3175,16 @@ fn session_cell_decision<'a>(
     (true, percent, text, false)
 }
 
-/// AUM-WINDOW-UI-SHORT-WINDOW-WARNING-ROW-01: whether this provider's state
-/// alone, under `WarningOnly`, should keep the 5h row visible — distinct
-/// from `session_cell_decision`'s `shows` (which also covers "draw this
-/// cell's own text once the row exists for some other reason", and must
-/// keep returning `true` for `NotAvailable` so that cell still renders its
-/// status word when the row *is* shown for some other provider). A
-/// pace-driven warning (including HF1's "100%-used is always overpacing"
-/// case — see `short_window_is_overpacing`) always justifies the row. So
-/// does any other non-`Ok` status (`Loading` or a provider error) — a
-/// suppressed pace line must never hide a real error
-/// or loading state, matching `session_cell_decision`'s own existing intent
-/// (see `session_row_visible_true_for_warning_only_when_one_provider_is_in_error`).
-/// Only `NotAvailable` — a provider that structurally has no such window
-/// this poll (e.g. Codex with no 5-hour window — see HF2,
-/// `cb85cd52fcf8cb1a366e355c1bcba4c79f236ef6`) — is excluded: that fact
-/// alone must never be the sole reason the row appears.
+/// Whether this provider alone should keep the 5h row visible under
+/// `WarningOnly`. Only a real pace-driven warning justifies the row;
+/// loading/error/not-available status text may still be drawn when another
+/// provider's warning keeps the row alive, but status text alone must not
+/// leave a status-only row behind.
 fn session_cell_justifies_warning_only_row(
-    state: CellState,
+    _state: CellState,
     pace: Option<&PaceGuidanceLines>,
 ) -> bool {
-    pace.is_some() || !matches!(state, CellState::Ok | CellState::NotAvailable)
+    pace.is_some()
 }
 
 /// One provider's contribution to the 5h row's existence — shared by both
@@ -2820,8 +3192,8 @@ fn session_cell_justifies_warning_only_row(
 /// must never disagree about which providers keep the row alive (see
 /// `session_row_visible`'s own doc). Identical to `session_cell_decision`'s
 /// `shows` for `Always`/`Hidden`; for `WarningOnly`, defers to
-/// `session_cell_justifies_warning_only_row` instead, so a lone
-/// `NotAvailable` provider can't keep the row alive on its own.
+/// `session_cell_justifies_warning_only_row` instead, so status-only cells
+/// cannot keep the row alive on their own.
 fn session_row_cell_shows(
     state: CellState,
     percent: Option<f64>,
@@ -2854,6 +3226,36 @@ fn session_row_visible(
     (show_claude_code && claude_shows)
         || (show_codex && codex_shows)
         || (show_antigravity && antigravity_shows)
+}
+
+/// A quota row exists only when at least one currently shown provider has
+/// that row enabled for display. A provider that is merely hidden by a user
+/// setting contributes `false`; a displayed provider whose applicable quota
+/// is currently unavailable still contributes `true` and renders its normal
+/// localized unavailable/error state.
+fn quota_row_visible(provider_cells: &[(bool, bool)]) -> bool {
+    provider_cells
+        .iter()
+        .any(|(provider_is_shown, cell_is_enabled)| *provider_is_shown && *cell_is_enabled)
+}
+
+fn needs_weekly_row(state: &AppState) -> bool {
+    quota_row_visible(&[
+        (state.show_claude_code, true),
+        (state.show_codex, true),
+        (state.show_antigravity, true),
+        // GitHub Copilot has a monthly quota row, not a weekly one.
+        (state.show_github_copilot, false),
+    ])
+}
+
+fn needs_monthly_row(state: &AppState) -> bool {
+    quota_row_visible(&[
+        (state.show_claude_code, false),
+        (state.show_codex, false),
+        (state.show_antigravity, false),
+        (state.show_github_copilot, true),
+    ])
 }
 
 fn needs_session_row(state: &AppState) -> bool {
@@ -2893,21 +3295,17 @@ fn needs_session_row(state: &AppState) -> bool {
 /// the single row-selection judgment shared verbatim by `paint_content`
 /// (what to draw) and `popup_height_logical`/`pace_row_layout` (how tall to
 /// make the popup), so drawing and sizing can never disagree about which
-/// rows exist. `PopupLayout::Compact` forces every optional row off
-/// regardless of what the underlying content (`weekly_extra_lines`,
-/// `needs_session_row`) would otherwise warrant — only the provider-header
-/// and weekly rows remain, and neither is ever gated here since both are
-/// unconditional in every layout. `PopupLayout::Standard` passes the
-/// underlying content through unchanged, reproducing the popup's existing
-/// (pre-`PopupLayout`) behavior exactly. The basis-label row itself
-/// (previously a `PopupLayout::Standard`-only third option here) was removed
-/// from the popup body entirely by AUM-WINDOW-UI-01C-1 — see
-/// `popup_height_logical`'s unconditional `BASIS_LABEL_ROW_H` subtraction —
-/// so there is no longer a field for it to gate.
+/// rows exist. `PopupLayout::Compact` suppresses pace detail and the 5h row,
+/// while retaining whichever primary quota rows (weekly/monthly) actually
+/// have an enabled provider cell. `PopupLayout::Standard` passes all row
+/// decisions through. A provider-specific row with no enabled cell is
+/// removed by the same decision used by painting and height calculation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct VisibleRows {
+    weekly_row: bool,
     weekly_extra_lines: i32,
     session_row: bool,
+    monthly_row: bool,
 }
 
 fn visible_rows(
@@ -2915,38 +3313,45 @@ fn visible_rows(
     weekly_extra_lines: i32,
     needs_session_row: bool,
 ) -> VisibleRows {
+    visible_rows_for_quota(layout, true, weekly_extra_lines, needs_session_row, false)
+}
+
+fn visible_rows_for_quota(
+    layout: PopupLayout,
+    weekly_row: bool,
+    weekly_extra_lines: i32,
+    session_row: bool,
+    monthly_row: bool,
+) -> VisibleRows {
     match layout {
         PopupLayout::Compact => VisibleRows {
+            weekly_row,
             weekly_extra_lines: 0,
             session_row: false,
+            monthly_row,
         },
         PopupLayout::Standard => VisibleRows {
-            weekly_extra_lines,
-            session_row: needs_session_row,
+            weekly_row,
+            weekly_extra_lines: if weekly_row { weekly_extra_lines } else { 0 },
+            session_row,
+            monthly_row,
         },
     }
 }
 
-/// Popup height (logical, pre-DPI-scale px) for the current pace-guidance
-/// block and `PopupLayout`. `WIDGET_HEIGHT` already covers both main bar
-/// rows (weekly and 5h), the `ROW_GAP_H` between them, and the basis-label
-/// row (`BASIS_LABEL_ROW_H`) — see its own breakdown comment. The
-/// basis-label row is never drawn any more (AUM-WINDOW-UI-01C-1 removed it
-/// from the popup body for every `PopupLayout`), so its budget is always
-/// subtracted here rather than conditionally — this matches
-/// `PopupLayout::Compact`'s height exactly as before (it already always
-/// subtracted this budget) and shrinks `PopupLayout::Standard`'s height by
-/// the same amount, letting the rows below move up to fill the space.
-/// Whichever of the 5h row `rows` says isn't shown has its own budget
-/// removed entirely (the remaining rows simply move to fill the space)
-/// rather than left as blank space. Composed entirely in logical units —
-/// callers apply `sc(...)` once, at the end.
+/// Popup height (logical, pre-DPI-scale px) for the exact visible row set.
+/// The header and outer margins are fixed; each visible quota row contributes
+/// one segment height, gaps exist only between visible rows, and weekly pace
+/// detail contributes its actual line count. Callers apply `sc(...)` once.
 fn popup_height_logical(rows: VisibleRows) -> i32 {
-    let mut base = WIDGET_HEIGHT - BASIS_LABEL_ROW_H;
-    if !rows.session_row {
-        base -= ROW_GAP_H + SEGMENT_H;
-    }
-    base + rows.weekly_extra_lines * PACE_LINE_H
+    const HEADER_ONLY_HEIGHT: i32 = 3 + HEADER_ROW_H + 4 + 5;
+    let row_count =
+        i32::from(rows.weekly_row) + i32::from(rows.session_row) + i32::from(rows.monthly_row);
+    let gaps = (row_count - 1).max(0);
+    HEADER_ONLY_HEIGHT
+        + row_count * SEGMENT_H
+        + gaps * ROW_GAP_H
+        + rows.weekly_extra_lines * PACE_LINE_H
 }
 
 /// Popup height for the current state: the base widget height plus
@@ -2955,17 +3360,18 @@ fn popup_height_logical(rows: VisibleRows) -> i32 {
 /// of a `&AppState`-taking variant (used where a lock is already held)
 /// alongside a self-locking `widget_height()` convenience wrapper below.
 fn widget_height_for_state(state: &AppState) -> i32 {
-    let rows = visible_rows(
+    let rows = visible_rows_for_quota(
         state.popup_layout,
+        needs_weekly_row(state),
         weekly_pace_extra_lines(state),
         needs_session_row(state),
+        needs_monthly_row(state),
     );
-    widget_height_for_rows(rows, state.show_github_copilot)
+    widget_height_for_rows(rows)
 }
 
-fn widget_height_for_rows(rows: VisibleRows, show_github_copilot: bool) -> i32 {
-    let extra_rows = i32::from(show_github_copilot);
-    sc(popup_height_logical(rows) + extra_rows * (ROW_GAP_H + SEGMENT_H))
+fn widget_height_for_rows(rows: VisibleRows) -> i32 {
+    sc(popup_height_logical(rows))
 }
 
 fn widget_height() -> i32 {
@@ -2982,61 +3388,68 @@ fn widget_height() -> i32 {
 /// (`VisibleRows`) input `popup_height_logical` used to size that `height`
 /// in the first place — the two must always agree, which is why this is the
 /// one place either `paint_content` or a test computes these positions.
-/// Order top to bottom: provider header (the basis-label row above it was
-/// removed from the popup body entirely by AUM-WINDOW-UI-01C-1 — see
-/// `popup_height_logical`), weekly bar, weekly secondary/detail (if any — a
-/// single anchor `weekly_secondary_y`; `draw_weekly_pace_extra_lines` steps
-/// detail down by one more `PACE_LINE_H` internally when present), then the
-/// 5h bar (only when `rows.session_row`) at the very bottom with a
-/// `ROW_GAP_H` gap above it — the same gap that used to sit between the two
-/// main bar rows.
+/// Order top to bottom: provider header, optional weekly bar and its pace
+/// detail, optional 5h bar, optional monthly bar. Gaps exist only between
+/// rows that are actually present, so a hidden row leaves neither its label
+/// nor vertical whitespace behind.
 struct PaceRowLayout {
     provider_header_y: i32,
-    weekly_row_y: i32,
+    weekly_row_y: Option<i32>,
     weekly_secondary_y: Option<i32>,
     session_row_y: Option<i32>,
+    monthly_row_y: Option<i32>,
 }
 
 fn pace_row_layout(height: i32, rows: VisibleRows) -> PaceRowLayout {
-    let weekly_extra_h = rows.weekly_extra_lines * sc(PACE_LINE_H);
-    let (session_row_y, weekly_block_bottom) = if rows.session_row {
-        let session_y = height - sc(5) - sc(SEGMENT_H);
-        (Some(session_y), session_y - sc(ROW_GAP_H))
+    let provider_header_y = sc(3);
+    let mut y = provider_header_y + sc(HEADER_ROW_H) + sc(4);
+    let mut rows_left =
+        i32::from(rows.weekly_row) + i32::from(rows.session_row) + i32::from(rows.monthly_row);
+
+    let weekly_row_y = rows.weekly_row.then_some(y);
+    let weekly_secondary_y = if rows.weekly_row && rows.weekly_extra_lines >= 1 {
+        Some(y + sc(SEGMENT_H))
     } else {
-        (None, height - sc(5))
+        None
     };
-    let weekly_row_y = weekly_block_bottom - weekly_extra_h - sc(SEGMENT_H);
-    let weekly_secondary_y = (rows.weekly_extra_lines >= 1).then_some(weekly_row_y + sc(SEGMENT_H));
-    let provider_header_y = weekly_row_y - sc(4) - sc(HEADER_ROW_H);
+    if rows.weekly_row {
+        y += sc(SEGMENT_H + rows.weekly_extra_lines * PACE_LINE_H);
+        rows_left -= 1;
+        if rows_left > 0 {
+            y += sc(ROW_GAP_H);
+        }
+    }
+
+    let session_row_y = rows.session_row.then_some(y);
+    if rows.session_row {
+        y += sc(SEGMENT_H);
+        rows_left -= 1;
+        if rows_left > 0 {
+            y += sc(ROW_GAP_H);
+        }
+    }
+
+    let monthly_row_y = rows.monthly_row.then_some(y);
+    if rows.monthly_row {
+        y += sc(SEGMENT_H);
+    }
+    debug_assert_eq!(y + sc(5), height);
     PaceRowLayout {
         provider_header_y,
         weekly_row_y,
         weekly_secondary_y,
         session_row_y,
+        monthly_row_y,
     }
 }
 
-/// AUM-WINDOW-UI-01C-2-STEP2 (drag UX): the popup's y-boundary between the
-/// draggable header band (the provider-name row — and, in Compact, each
-/// provider's weekly-remaining text) and the non-draggable 7d/5h bar rows
-/// below it. This is literally `pace_row_layout`'s own `weekly_row_y` — the
-/// same value `paint_content` uses to position the weekly row — so the drag
-/// region can never disagree with what's actually drawn as the header. (In
-/// practice this boundary is identical across every `PopupLayout`/content
-/// combination: `popup_height_logical` always grows/shrinks the popup's
-/// total height by exactly the extra content's own size, so the top-anchored
-/// header never moves — see the STEP2 drag-UX design report — but it's
-/// still computed fresh here rather than assumed, since it's cheap and this
-/// is the single source of truth already used for drawing.)
+/// AUM-WINDOW-UI-01C-2-STEP2 (drag UX): the fixed y-boundary immediately
+/// below the provider header. Optional quota rows begin at this boundary;
+/// hiding any of them changes only the content below, never the established
+/// header drag target.
 fn header_band_bottom(state: &AppState) -> i32 {
-    let rows = visible_rows(
-        state.popup_layout,
-        weekly_pace_extra_lines(state),
-        needs_session_row(state),
-    );
-    let height = widget_height_for_state(state);
-    let legacy_height = height - i32::from(state.show_github_copilot) * sc(ROW_GAP_H + SEGMENT_H);
-    pace_row_layout(legacy_height, rows).weekly_row_y
+    let _ = state;
+    sc(3 + HEADER_ROW_H + 4)
 }
 
 /// Whether `(client_x, client_y)` falls within the popup's draggable header
@@ -3693,6 +4106,7 @@ pub fn run() {
                 language,
                 install_channel,
                 display_basis: settings.display_basis,
+                reset_display_mode: settings.reset_display_mode,
                 display_density: settings.display_density,
                 short_window_visibility: settings.short_window_visibility,
                 short_window_alert_sensitivity: settings.short_window_alert_sensitivity,
@@ -4253,9 +4667,26 @@ fn paint_content(
                 short_window_visibility,
             ),
         );
-        let rows = visible_rows(popup_layout, weekly_lines, needs_session_row);
-        let legacy_height = height - i32::from(show_github_copilot) * sc(ROW_GAP_H + SEGMENT_H);
-        let layout = pace_row_layout(legacy_height, rows);
+        let needs_weekly_row = quota_row_visible(&[
+            (show_claude_code, true),
+            (show_codex, true),
+            (show_antigravity, true),
+            (show_github_copilot, false),
+        ]);
+        let needs_monthly_row = quota_row_visible(&[
+            (show_claude_code, false),
+            (show_codex, false),
+            (show_antigravity, false),
+            (show_github_copilot, true),
+        ]);
+        let rows = visible_rows_for_quota(
+            popup_layout,
+            needs_weekly_row,
+            weekly_lines,
+            needs_session_row,
+            needs_monthly_row,
+        );
+        let layout = pace_row_layout(height, rows);
 
         let _ = SetBkMode(hdc, TRANSPARENT);
         let _ = SetTextColor(hdc, COLORREF(text_color.to_colorref()));
@@ -4345,28 +4776,30 @@ fn paint_content(
         if show_github_copilot {
             weekly_cells.push(RowCell {
                 percent: None,
-                text: "",
+                text: strings.not_available,
                 accent: &github_copilot_accent,
                 provider_text_color: github_copilot_accent,
                 is_warning: false,
             });
         }
 
-        draw_row(
-            hdc,
-            width,
-            content_x,
-            layout.weekly_row_y,
-            text_color,
-            strings.weekly_window,
-            &weekly_cells,
-            track,
-            warning,
-            // The weekly row never carries a warning flag of its own — see
-            // `weekly_pace_guidance_lines`, which always sets
-            // `PaceGuidanceLines::is_warning` to `false`.
-            track_outline,
-        );
+        if let Some(weekly_row_y) = layout.weekly_row_y {
+            draw_row(
+                hdc,
+                width,
+                content_x,
+                weekly_row_y,
+                text_color,
+                strings.weekly_window,
+                &weekly_cells,
+                track,
+                warning,
+                // The weekly row never carries a warning flag of its own — see
+                // `weekly_pace_guidance_lines`, which always sets
+                // `PaceGuidanceLines::is_warning` to `false`.
+                track_outline,
+            );
+        }
 
         // AUM-PACE-GUIDANCE-01: weekly secondary/detail lines, one column
         // per shown provider, aligned under that provider's own bar (same
@@ -4433,7 +4866,8 @@ fn paint_content(
         // that's not `CellState::Ok` keeps its existing status text
         // instead of going blank. The row itself is skipped entirely (see
         // `layout.session_row_y`/`needs_session_row`) when no shown
-        // provider's decision says to show anything.
+        // provider has an overuse warning; status-only cells do not keep
+        // the row alive under `WarningOnly`.
         if let Some(session_row_y) = layout.session_row_y {
             let mut session_cells = Vec::new();
             if show_claude_code {
@@ -4466,7 +4900,7 @@ fn paint_content(
             if show_github_copilot {
                 session_cells.push(RowCell {
                     percent: None,
-                    text: "",
+                    text: strings.not_available,
                     accent: &github_copilot_accent,
                     provider_text_color: github_copilot_accent,
                     is_warning: false,
@@ -4486,12 +4920,12 @@ fn paint_content(
             );
         }
 
-        if show_github_copilot {
+        if let Some(monthly_row_y) = layout.monthly_row_y {
             let mut monthly_cells = Vec::new();
             if show_claude_code {
                 monthly_cells.push(RowCell {
                     percent: None,
-                    text: "",
+                    text: strings.not_available,
                     accent,
                     provider_text_color: claude_usage_text_color(provider_tint_dark),
                     is_warning: false,
@@ -4500,7 +4934,7 @@ fn paint_content(
             if show_codex {
                 monthly_cells.push(RowCell {
                     percent: None,
-                    text: "",
+                    text: strings.not_available,
                     accent: codex_accent,
                     provider_text_color: codex_usage_text_color(provider_tint_dark),
                     is_warning: false,
@@ -4509,7 +4943,7 @@ fn paint_content(
             if show_antigravity {
                 monthly_cells.push(RowCell {
                     percent: None,
-                    text: "",
+                    text: strings.not_available,
                     accent: antigravity_accent,
                     provider_text_color: antigravity_usage_text_color(provider_tint_dark),
                     is_warning: false,
@@ -4526,9 +4960,9 @@ fn paint_content(
                 hdc,
                 width,
                 content_x,
-                height - sc(5) - sc(SEGMENT_H),
+                monthly_row_y,
                 text_color,
-                "Month",
+                strings.monthly_window,
                 &monthly_cells,
                 track,
                 warning,
@@ -5772,6 +6206,17 @@ unsafe extern "system" fn wnd_proc(
                     render_layered();
                     sync_tray_icons(hwnd);
                 }
+                IDM_RESET_DISPLAY_RELATIVE | IDM_RESET_DISPLAY_ABSOLUTE => {
+                    if let Some(new_mode) = reset_display_mode_for_menu_id(id) {
+                        let mut state = lock_state();
+                        if let Some(s) = state.as_mut() {
+                            s.reset_display_mode = new_mode;
+                            refresh_usage_texts(s);
+                        }
+                    }
+                    save_state_settings();
+                    render_layered();
+                }
                 IDM_DISPLAY_DENSITY_COMPACT
                 | IDM_DISPLAY_DENSITY_STANDARD
                 | IDM_DISPLAY_DENSITY_DETAILED => {
@@ -6072,6 +6517,7 @@ fn show_context_menu(hwnd: HWND) {
             show_github_copilot,
             github_copilot_plan,
             display_basis,
+            reset_display_mode,
             display_density,
             short_window_visibility,
             short_window_alert_sensitivity,
@@ -6095,6 +6541,7 @@ fn show_context_menu(hwnd: HWND) {
                     s.show_github_copilot,
                     s.github_copilot_plan,
                     s.display_basis,
+                    s.reset_display_mode,
                     s.display_density,
                     s.short_window_visibility,
                     s.short_window_alert_sensitivity,
@@ -6116,6 +6563,7 @@ fn show_context_menu(hwnd: HWND) {
                     false,
                     poller::GithubCopilotPlan::Unknown,
                     DisplayBasis::default(),
+                    ResetDisplayMode::default(),
                     DisplayDensity::default(),
                     ShortWindowVisibility::default(),
                     ShortWindowAlertSensitivity::default(),
@@ -6451,6 +6899,44 @@ fn show_context_menu(hwnd: HWND) {
             MF_BYCOMMAND.0,
         );
 
+        let reset_display_menu = CreatePopupMenu().unwrap();
+        for (id, value, label) in [
+            (
+                IDM_RESET_DISPLAY_RELATIVE,
+                ResetDisplayMode::Relative,
+                strings.reset_display_relative,
+            ),
+            (
+                IDM_RESET_DISPLAY_ABSOLUTE,
+                ResetDisplayMode::AbsoluteDateTime,
+                strings.reset_display_datetime,
+            ),
+        ] {
+            let label_str = native_interop::wide_str(label);
+            let flags = if value == reset_display_mode {
+                MF_CHECKED
+            } else {
+                MENU_ITEM_FLAGS(0)
+            };
+            let _ = AppendMenuW(
+                reset_display_menu,
+                flags,
+                id as usize,
+                PCWSTR::from_raw(label_str.as_ptr()),
+            );
+        }
+        let selected_reset_display_id = match reset_display_mode {
+            ResetDisplayMode::Relative => IDM_RESET_DISPLAY_RELATIVE,
+            ResetDisplayMode::AbsoluteDateTime => IDM_RESET_DISPLAY_ABSOLUTE,
+        };
+        let _ = CheckMenuRadioItem(
+            reset_display_menu,
+            IDM_RESET_DISPLAY_RELATIVE as u32,
+            IDM_RESET_DISPLAY_ABSOLUTE as u32,
+            selected_reset_display_id as u32,
+            MF_BYCOMMAND.0,
+        );
+
         // Display density submenu: mutually exclusive, radio-style, same
         // pattern as the display-basis submenu above. Not yet connected to
         // any drawing code — see AUM-PACE-GUIDANCE-01's later units.
@@ -6686,6 +7172,13 @@ fn show_context_menu(hwnd: HWND) {
             MF_POPUP,
             display_basis_menu.0 as usize,
             PCWSTR::from_raw(display_basis_label.as_ptr()),
+        );
+        let reset_display_label = native_interop::wide_str(strings.reset_display);
+        let _ = AppendMenuW(
+            display_settings_menu,
+            MF_POPUP,
+            reset_display_menu.0 as usize,
+            PCWSTR::from_raw(reset_display_label.as_ptr()),
         );
 
         let short_window_menu = CreatePopupMenu().unwrap();
@@ -8439,14 +8932,15 @@ mod tests {
 
     #[test]
     fn four_provider_poll_growth_has_current_height_visible_header_and_safe_bottom() {
-        let loading_rows = visible_rows(PopupLayout::Standard, 0, true);
-        let polled_rows = visible_rows(PopupLayout::Standard, 2, true);
-        let loading_height = widget_height_for_rows(loading_rows, true);
-        let polled_height = widget_height_for_rows(polled_rows, true);
+        let loading_rows = visible_rows_for_quota(PopupLayout::Standard, true, 0, true, true);
+        let polled_rows = visible_rows_for_quota(PopupLayout::Standard, true, 2, true, true);
+        let loading_height = widget_height_for_rows(loading_rows);
+        let polled_height = widget_height_for_rows(polled_rows);
 
         assert_eq!(active_family_count(true, true, true, true), 4);
         assert!(polled_height > loading_height);
-        assert!(polled_height > widget_height_for_rows(polled_rows, false));
+        let without_monthly = visible_rows_for_quota(PopupLayout::Standard, true, 2, true, false);
+        assert!(polled_height > widget_height_for_rows(without_monthly));
 
         let width = total_widget_width_for(4);
         let stale_loading_rect = RECT {
@@ -8470,8 +8964,7 @@ mod tests {
         let (_, y) = compute_auto_popup_position(work_area, 1900, width, polled_height, 0);
         assert!(y + polled_height <= work_area.bottom);
 
-        let copilot_row_height = sc(ROW_GAP_H + SEGMENT_H);
-        let layout = pace_row_layout(polled_height - copilot_row_height, polled_rows);
+        let layout = pace_row_layout(polled_height, polled_rows);
         assert!(layout.provider_header_y >= 0);
 
         let synchronized_rect = RECT {
@@ -8552,6 +9045,67 @@ mod tests {
     #[test]
     fn display_basis_default_is_used_percentage() {
         assert_eq!(DisplayBasis::default(), DisplayBasis::UsedPercentage);
+    }
+
+    #[test]
+    fn reset_display_mode_defaults_to_relative() {
+        assert_eq!(ResetDisplayMode::default(), ResetDisplayMode::Relative);
+    }
+
+    #[test]
+    fn legacy_settings_without_reset_display_mode_keep_relative_display() {
+        let settings: SettingsFile = serde_json::from_str("{}").unwrap();
+        assert_eq!(settings.reset_display_mode, ResetDisplayMode::Relative);
+    }
+
+    #[test]
+    fn reset_display_mode_round_trips_through_settings() {
+        let settings = SettingsFile {
+            reset_display_mode: ResetDisplayMode::AbsoluteDateTime,
+            ..SettingsFile::default()
+        };
+        let json = serde_json::to_string(&settings).unwrap();
+        assert!(json.contains("\"reset_display_mode\":\"absolute_date_time\""));
+        let decoded: SettingsFile = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            decoded.reset_display_mode,
+            ResetDisplayMode::AbsoluteDateTime
+        );
+    }
+
+    #[test]
+    fn unknown_reset_display_mode_falls_back_without_losing_other_settings() {
+        let settings: SettingsFile =
+            serde_json::from_str(r#"{"reset_display_mode":"future_mode","tray_offset":17}"#)
+                .unwrap();
+        assert_eq!(settings.reset_display_mode, ResetDisplayMode::Relative);
+        assert_eq!(settings.tray_offset, 17);
+    }
+
+    #[test]
+    fn reset_display_menu_ids_map_to_modes() {
+        assert_eq!(
+            reset_display_mode_for_menu_id(IDM_RESET_DISPLAY_RELATIVE),
+            Some(ResetDisplayMode::Relative)
+        );
+        assert_eq!(
+            reset_display_mode_for_menu_id(IDM_RESET_DISPLAY_ABSOLUTE),
+            Some(ResetDisplayMode::AbsoluteDateTime)
+        );
+        assert_eq!(reset_display_mode_for_menu_id(u16::MAX), None);
+    }
+
+    #[test]
+    fn time_display_menu_labels_use_relative_and_datetime_wording() {
+        let japanese = LanguageId::Japanese.strings();
+        assert_eq!(japanese.reset_display, "時間表示");
+        assert_eq!(japanese.reset_display_relative, "相対");
+        assert_eq!(japanese.reset_display_datetime, "日時");
+
+        let english = LanguageId::English.strings();
+        assert_eq!(english.reset_display, "Time Display");
+        assert_eq!(english.reset_display_relative, "Relative");
+        assert_eq!(english.reset_display_datetime, "Date and Time");
     }
 
     #[test]
@@ -9492,6 +10046,89 @@ mod tests {
     }
 
     #[test]
+    fn quota_row_with_every_provider_hidden_has_no_label_or_height() {
+        assert!(!quota_row_visible(&[
+            (true, false),
+            (false, true),
+            (false, false),
+        ]));
+        let rows = visible_rows_for_quota(PopupLayout::Standard, false, 2, false, false);
+        assert!(!rows.weekly_row);
+        assert_eq!(rows.weekly_extra_lines, 0);
+        assert_eq!(rows.session_row, false);
+        assert_eq!(rows.monthly_row, false);
+        assert_eq!(popup_height_logical(rows), 3 + HEADER_ROW_H + 4 + 5);
+        let layout = pace_row_layout(sc(popup_height_logical(rows)), rows);
+        assert_eq!(layout.weekly_row_y, None);
+        assert_eq!(layout.session_row_y, None);
+        assert_eq!(layout.monthly_row_y, None);
+    }
+
+    #[test]
+    fn quota_row_remains_when_any_shown_provider_has_content() {
+        assert!(quota_row_visible(&[
+            (true, false),
+            (true, true),
+            (false, true),
+        ]));
+    }
+
+    #[test]
+    fn hidden_by_setting_and_not_available_are_distinct() {
+        let strings = LanguageId::Japanese.strings();
+        let hidden = session_cell_decision(
+            CellState::NotAvailable,
+            None,
+            strings.not_available,
+            None,
+            ShortWindowVisibility::Hidden,
+        );
+        let shown_unavailable = session_cell_decision(
+            CellState::NotAvailable,
+            None,
+            strings.not_available,
+            None,
+            ShortWindowVisibility::Always,
+        );
+        assert!(!hidden.0);
+        assert_eq!(hidden.2, "");
+        assert!(shown_unavailable.0);
+        assert_eq!(shown_unavailable.2, "対象なし");
+    }
+
+    #[test]
+    fn five_hour_weekly_and_monthly_rows_share_visibility_and_height_rules() {
+        for visible_row in [
+            visible_rows_for_quota(PopupLayout::Standard, true, 0, false, false),
+            visible_rows_for_quota(PopupLayout::Standard, false, 0, true, false),
+            visible_rows_for_quota(PopupLayout::Standard, false, 0, false, true),
+        ] {
+            assert_eq!(
+                popup_height_logical(visible_row),
+                3 + HEADER_ROW_H + 4 + SEGMENT_H + 5
+            );
+            let layout = pace_row_layout(sc(popup_height_logical(visible_row)), visible_row);
+            assert_eq!(
+                i32::from(layout.weekly_row_y.is_some())
+                    + i32::from(layout.session_row_y.is_some())
+                    + i32::from(layout.monthly_row_y.is_some()),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn row_visibility_and_height_add_exactly_one_row_and_gap() {
+        let weekly_only = visible_rows_for_quota(PopupLayout::Standard, true, 0, false, false);
+        let weekly_and_monthly =
+            visible_rows_for_quota(PopupLayout::Standard, true, 0, false, true);
+        assert_eq!(
+            popup_height_logical(weekly_and_monthly) - popup_height_logical(weekly_only),
+            ROW_GAP_H + SEGMENT_H
+        );
+    }
+
+    #[test]
     fn popup_height_logical_for_compact_is_header_plus_weekly_row_only() {
         // No basis-label row and no session row, regardless of what the
         // underlying pace content would otherwise show.
@@ -9691,6 +10328,8 @@ mod tests {
             IDM_GITHUB_COPILOT_PLAN_PRO,
             IDM_GITHUB_COPILOT_PLAN_PRO_PLUS,
             IDM_GITHUB_COPILOT_PLAN_MAX,
+            IDM_RESET_DISPLAY_RELATIVE,
+            IDM_RESET_DISPLAY_ABSOLUTE,
             tray_icon::IDM_TOGGLE_WIDGET,
         ];
         #[cfg(feature = "self-update")]
@@ -9743,6 +10382,11 @@ mod tests {
             assert!(!strings.short_window_alert_sensitivity.is_empty());
             assert!(!strings.short_window_alert_sensitivity_sensitive.is_empty());
             assert!(!strings.short_window_alert_sensitivity_relaxed.is_empty());
+            assert!(!strings.reset_display.is_empty());
+            assert!(!strings.reset_display_relative.is_empty());
+            assert!(!strings.reset_display_datetime.is_empty());
+            assert!(!strings.monthly_window.is_empty());
+            assert!(strings.weekday_short.iter().all(|day| !day.is_empty()));
         }
     }
 
@@ -10108,6 +10752,302 @@ mod tests {
             .as_deref(),
             Some("あと3時間16分")
         );
+    }
+
+    #[test]
+    fn relative_remaining_mode_preserves_existing_output() {
+        let now = SystemTime::now();
+        let remaining = 2 * 86400 + 5 * 3600;
+        let strings = LanguageId::Japanese.strings();
+        let existing = format_window_time(
+            DisplayBasis::RemainingAllowance,
+            Some(remaining),
+            None,
+            DurationGranularity::LongWindow,
+            strings,
+        );
+        let selected = format_window_time_with_reset_mode(
+            DisplayBasis::RemainingAllowance,
+            Some(now + Duration::from_secs(remaining)),
+            now,
+            Some(remaining),
+            None,
+            DurationGranularity::LongWindow,
+            ResetDisplayMode::Relative,
+            strings,
+        );
+        assert_eq!(selected, existing);
+        assert_eq!(selected.as_deref(), Some("あと2日5時間"));
+    }
+
+    #[test]
+    fn relative_used_rate_shows_elapsed_only() {
+        let now = SystemTime::now();
+        let reset_at = now + Duration::from_secs(3 * 3600);
+        let strings = LanguageId::Japanese.strings();
+        let text = format_window_time_with_reset_mode(
+            DisplayBasis::UsedPercentage,
+            Some(reset_at),
+            now,
+            Some(3 * 3600),
+            Some(2 * 3600),
+            DurationGranularity::ShortWindow,
+            ResetDisplayMode::Relative,
+            strings,
+        )
+        .unwrap();
+        let reset_text = format_absolute_reset_time(Some(reset_at), now, strings).unwrap();
+        assert_eq!(text, "経過 2時間0分");
+        assert!(!text.contains(&reset_text));
+    }
+
+    #[test]
+    fn japanese_absolute_reset_uses_compact_day_weekday_and_colon_time() {
+        let strings = LanguageId::Japanese.strings();
+        let now = LocalDateTimeParts {
+            year: 2026,
+            month: 8,
+            day: 16,
+            weekday: 0,
+            hour: 10,
+            minute: 0,
+        };
+        let reset = LocalDateTimeParts {
+            year: 2026,
+            month: 8,
+            day: 19,
+            weekday: 3,
+            hour: 6,
+            minute: 59,
+        };
+        assert_eq!(
+            format_absolute_reset_parts(reset, now, strings),
+            "19(水) 6:59リセット"
+        );
+    }
+
+    #[test]
+    fn japanese_absolute_reset_omits_month_and_year_across_boundaries() {
+        let strings = LanguageId::Japanese.strings();
+        let now = LocalDateTimeParts {
+            year: 2026,
+            month: 8,
+            day: 31,
+            weekday: 1,
+            hour: 23,
+            minute: 0,
+        };
+        let next_month = LocalDateTimeParts {
+            year: 2026,
+            month: 9,
+            day: 1,
+            weekday: 2,
+            hour: 20,
+            minute: 0,
+        };
+        let next_year = LocalDateTimeParts {
+            year: 2027,
+            month: 1,
+            day: 1,
+            weekday: 5,
+            hour: 9,
+            minute: 30,
+        };
+        assert_eq!(
+            format_absolute_reset_parts(next_month, now, strings),
+            "1(火) 20:00リセット"
+        );
+        assert_eq!(
+            format_absolute_reset_parts(next_year, now, strings),
+            "1(金) 9:30リセット"
+        );
+    }
+
+    #[test]
+    fn absolute_reset_uses_the_windows_local_time_conversion() {
+        let now = SystemTime::now();
+        let reset_at = now + Duration::from_secs(26 * 3600);
+        let strings = LanguageId::English.strings();
+        let expected = format_absolute_reset_parts(
+            system_time_to_local_parts(reset_at).expect("reset local time"),
+            system_time_to_local_parts(now).expect("current local time"),
+            strings,
+        );
+        assert_eq!(
+            format_absolute_reset_time(Some(reset_at), now, strings),
+            Some(expected)
+        );
+    }
+
+    #[test]
+    fn absolute_used_rate_replaces_elapsed_with_reset_datetime() {
+        let now = SystemTime::now();
+        let reset_at = now + Duration::from_secs(3 * 3600);
+        let strings = LanguageId::English.strings();
+        let relative = format_window_time_with_reset_mode(
+            DisplayBasis::UsedPercentage,
+            Some(reset_at),
+            now,
+            Some(3 * 3600),
+            Some(2 * 3600),
+            DurationGranularity::ShortWindow,
+            ResetDisplayMode::Relative,
+            strings,
+        );
+        let absolute = format_window_time_with_reset_mode(
+            DisplayBasis::UsedPercentage,
+            Some(reset_at),
+            now,
+            Some(3 * 3600),
+            Some(2 * 3600),
+            DurationGranularity::ShortWindow,
+            ResetDisplayMode::AbsoluteDateTime,
+            strings,
+        );
+        let reset_text = format_absolute_reset_time(Some(reset_at), now, strings).unwrap();
+        let relative = relative.unwrap();
+        let absolute = absolute.unwrap();
+        assert!(relative.contains(strings.elapsed));
+        assert!(!relative.contains(&reset_text));
+        assert!(!absolute.contains(strings.elapsed));
+        assert_eq!(absolute, reset_text);
+    }
+
+    #[test]
+    fn absolute_remaining_replaces_countdown_with_reset_datetime() {
+        let now = SystemTime::now();
+        let reset_at = now + Duration::from_secs(2 * 86400 + 5 * 3600);
+        let strings = LanguageId::Japanese.strings();
+        let text = format_window_time_with_reset_mode(
+            DisplayBasis::RemainingAllowance,
+            Some(reset_at),
+            now,
+            Some(2 * 86400 + 5 * 3600),
+            None,
+            DurationGranularity::LongWindow,
+            ResetDisplayMode::AbsoluteDateTime,
+            strings,
+        )
+        .unwrap();
+        assert_eq!(
+            text,
+            format_absolute_reset_time(Some(reset_at), now, strings).unwrap()
+        );
+        assert!(!text.contains(strings.reset_in));
+    }
+
+    #[test]
+    fn absolute_mode_without_reset_timestamp_does_not_guess_datetime() {
+        let now = SystemTime::now();
+        let strings = LanguageId::English.strings();
+        for basis in [
+            DisplayBasis::UsedPercentage,
+            DisplayBasis::RemainingAllowance,
+        ] {
+            assert_eq!(
+                format_window_time_with_reset_mode(
+                    basis,
+                    None,
+                    now,
+                    Some(3 * 3600),
+                    Some(2 * 3600),
+                    DurationGranularity::ShortWindow,
+                    ResetDisplayMode::AbsoluteDateTime,
+                    strings,
+                ),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn absolute_mode_flows_through_weekly_and_generic_remaining_displays() {
+        let now = SystemTime::now();
+        let reset_at = now + Duration::from_secs(2 * 86400 + 5 * 3600);
+        let strings = LanguageId::Japanese.strings();
+        let weekly = weekly_pace_guidance_lines_with_reset_mode(
+            Some(40.0),
+            Some(reset_at),
+            now,
+            DisplayBasis::RemainingAllowance,
+            DisplayDensity::Standard,
+            ResetDisplayMode::AbsoluteDateTime,
+            strings,
+        )
+        .unwrap();
+        let weekly_time = weekly.secondary.unwrap();
+        assert!(!weekly_time.contains(strings.reset_in));
+        assert!(weekly_time.contains("リセット"));
+
+        let used_weekly = weekly_pace_guidance_lines_with_reset_mode(
+            Some(40.0),
+            Some(reset_at),
+            now,
+            DisplayBasis::UsedPercentage,
+            DisplayDensity::Standard,
+            ResetDisplayMode::AbsoluteDateTime,
+            strings,
+        )
+        .unwrap();
+        let used_weekly_time = used_weekly.secondary.unwrap();
+        assert!(!used_weekly_time.contains(strings.elapsed));
+        assert!(used_weekly_time.contains("リセット"));
+        assert!(used_weekly_time.contains(strings.future_pace_label));
+
+        let item = generic_item(
+            Some(QuotaMetric::Used {
+                used: 100.0,
+                limit: Some(1_500.0),
+            }),
+            Some(reset_at),
+        );
+        let generic = render_generic_quota_item_with_reset_mode(
+            CellState::Ok,
+            Some(&item),
+            DisplayBasis::RemainingAllowance,
+            ResetDisplayMode::AbsoluteDateTime,
+            strings,
+        );
+        assert!(!generic.text.contains(strings.reset_in));
+        assert!(generic.text.contains("リセット"));
+
+        let generic_used = render_generic_quota_item_with_reset_mode(
+            CellState::Ok,
+            Some(&item),
+            DisplayBasis::UsedPercentage,
+            ResetDisplayMode::AbsoluteDateTime,
+            strings,
+        );
+        assert!(generic_used.text.contains("リセット"));
+    }
+
+    #[test]
+    fn every_language_formats_absolute_reset_without_unresolved_placeholders() {
+        let now = LocalDateTimeParts {
+            year: 2026,
+            month: 12,
+            day: 31,
+            weekday: 4,
+            hour: 23,
+            minute: 0,
+        };
+        let reset = LocalDateTimeParts {
+            year: 2027,
+            month: 11,
+            day: 2,
+            weekday: 5,
+            hour: 9,
+            minute: 5,
+        };
+        for language in LanguageId::ALL {
+            let strings = language.strings();
+            let text = format_absolute_reset_parts(reset, now, strings);
+            assert!(!text.trim().is_empty(), "language={language:?}");
+            assert!(!text.contains('{'), "language={language:?}: {text}");
+            assert!(text.contains(strings.weekday_short[5]));
+            assert!(!text.contains("2027"), "language={language:?}: {text}");
+            assert!(!text.contains("11"), "language={language:?}: {text}");
+        }
     }
 
     #[test]
@@ -11166,8 +12106,8 @@ mod tests {
     }
 
     #[test]
-    fn session_row_visible_true_for_warning_only_when_one_provider_is_in_error() {
-        let (claude_shows, _, _, _) = session_cell_decision(
+    fn session_row_visible_false_for_warning_only_when_one_provider_is_in_error() {
+        let claude_shows = session_row_cell_shows(
             CellState::Ok,
             Some(24.0),
             "24%",
@@ -11175,14 +12115,14 @@ mod tests {
             ShortWindowVisibility::WarningOnly,
         );
         let strings = LanguageId::English.strings();
-        let (codex_shows, _, _, _) = session_cell_decision(
+        let codex_shows = session_row_cell_shows(
             CellState::FetchFailed,
             None,
             strings.fetch_failed,
             None,
             ShortWindowVisibility::WarningOnly,
         );
-        assert!(session_row_visible(
+        assert!(!session_row_visible(
             true,
             claude_shows,
             true,
@@ -11227,9 +12167,8 @@ mod tests {
 
     // ── AUM-WINDOW-UI-SHORT-WINDOW-WARNING-ROW-01 ──────────────────────────
     // `session_cell_justifies_warning_only_row` / `session_row_cell_shows`:
-    // under WarningOnly, a lone NotAvailable provider must not keep the 5h
-    // row alive, but every other non-Ok status (and any real pace-driven
-    // warning, including HF1's 100%-used case) still must.
+    // under WarningOnly, only a real pace-driven warning (including HF1's
+    // 100%-used case) may keep the 5h row alive. Status-only cells collapse.
 
     #[test]
     fn justifies_warning_only_row_is_false_for_not_available_alone() {
@@ -11264,11 +12203,7 @@ mod tests {
     }
 
     #[test]
-    fn justifies_warning_only_row_is_true_for_every_non_ok_non_not_available_state() {
-        // Existing status-word states other than NotAvailable — a
-        // suppressed pace line must never hide a real error/loading state
-        // (see `session_row_visible_true_for_warning_only_when_one_provider_is_in_error`,
-        // preserved unchanged by this predicate).
+    fn justifies_warning_only_row_is_false_for_every_status_without_pace() {
         for state in [
             CellState::Loading,
             CellState::AuthenticationExpired,
@@ -11277,8 +12212,8 @@ mod tests {
             CellState::FetchFailed,
         ] {
             assert!(
-                session_cell_justifies_warning_only_row(state, None),
-                "state {state:?} must still justify the row on its own"
+                !session_cell_justifies_warning_only_row(state, None),
+                "status-only state {state:?} must not justify the row"
             );
         }
     }
@@ -11505,10 +12440,9 @@ mod tests {
         ));
     }
 
-    /// Case 7: WarningOnly + FetchFailed only → row still shown (existing
-    /// behavior preserved unchanged).
+    /// Case 7: WarningOnly + FetchFailed only → status-only row collapses.
     #[test]
-    fn session_row_warning_only_shows_for_fetch_failed_alone() {
+    fn session_row_warning_only_hides_for_fetch_failed_alone() {
         let strings = LanguageId::English.strings();
         let claude_shows = session_row_cell_shows(
             CellState::FetchFailed,
@@ -11517,7 +12451,7 @@ mod tests {
             None,
             ShortWindowVisibility::WarningOnly,
         );
-        assert!(session_row_visible(
+        assert!(!session_row_visible(
             true,
             claude_shows,
             false,
@@ -11527,10 +12461,9 @@ mod tests {
         ));
     }
 
-    /// Case 8: WarningOnly + Loading / provider errors each still justify the
-    /// row on their own (existing intent preserved).
+    /// Case 8: WarningOnly + Loading / provider errors alone also collapse.
     #[test]
-    fn session_row_warning_only_shows_for_loading_and_provider_errors() {
+    fn session_row_warning_only_hides_for_loading_and_provider_errors() {
         let strings = LanguageId::English.strings();
         for (state, text) in [
             (CellState::Loading, strings.loading),
@@ -11551,8 +12484,8 @@ mod tests {
             let claude_shows =
                 session_row_cell_shows(state, None, text, None, ShortWindowVisibility::WarningOnly);
             assert!(
-                session_row_visible(true, claude_shows, false, false, false, false),
-                "state {state:?} must keep the row visible under WarningOnly"
+                !session_row_visible(true, claude_shows, false, false, false, false),
+                "status-only state {state:?} must not keep the row visible under WarningOnly"
             );
         }
     }
