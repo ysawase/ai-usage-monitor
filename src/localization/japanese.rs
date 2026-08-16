@@ -1,4 +1,4 @@
-use super::Strings;
+use super::{ProviderHelp, Strings};
 
 pub(super) const UPDATE_VIA_WINGET_LABEL: &str = "WinGet で更新";
 
@@ -27,9 +27,44 @@ pub(super) const STRINGS: Strings = Strings {
     github_copilot_plan_pro_plus: "Copilot Pro+",
     github_copilot_plan_max: "Copilot Max",
     help: "ヘルプ",
-    help_readme_placeholder: "（仮）README",
-    help_update_placeholder: "（仮）アプリの更新",
-    help_version_placeholder: "（仮）バージョン情報",
+    help_display_guide: "表示の見方",
+    help_ai_quotas: "AI利用枠について",
+    help_readme: "README",
+    help_version_information: "バージョン情報",
+    help_display_guide_body: concat!(
+        "残り利用枠 / 使用済み率\n",
+        "表示設定で選んだ表示基準に応じて割合を表示します。\n\n",
+        "5h / 7d / Mo\n",
+        "5時間・7日・月次の利用枠です。\n",
+        "内容がない行は省略します。\n\n",
+        "時間表示\n",
+        "相対：使用済み率では経過時間、残り利用枠ではリセットまでの残り時間を表示します。\n",
+        "日時：相対時間をローカルのリセット日時に置き換えます。\n\n",
+        "ペース情報\n",
+        "目安、予定との差、使いすぎ等の警告は、利用ペースを判断するための参考です。\n\n",
+        "状態の見分け方\n",
+        "使用量0は取得失敗ではありません。\n",
+        "対象なしはその提供元に利用枠がない状態で、設定による非表示とは別です。"
+    ),
+    help_ai_quotas_intro: "AIごとに利用枠の仕組みは異なります。名前が似ていても、同じ利用枠とは限りません。",
+    help_provider_notes: &[
+        ProviderHelp {
+            name: "Claude",
+            description: "Claude / Claude Codeアカウントで共有される5h・7dの利用枠を表示します。",
+        },
+        ProviderHelp {
+            name: "Codex",
+            description: "Codex CLIで確認できる5h・7dの利用枠です。ChatGPT本体の利用枠とは別です。",
+        },
+        ProviderHelp {
+            name: "Antigravity",
+            description: "Antigravityの利用枠です。Gemini本体の利用枠とは別です。",
+        },
+        ProviderHelp {
+            name: "GitHub Copilot",
+            description: "GitHub Copilotの月次AI Creditsです。選択したプランに応じて利用枠を表示し、プランが不明な場合は総使用量のみ表示します。Microsoft Copilotとは別のサービスです。",
+        },
+    ],
     check_for_updates: "更新を確認",
     checking_for_updates: "更新を確認しています...",
     updates: "更新",

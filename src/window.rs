@@ -14,7 +14,7 @@ use windows::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificL
 use windows::Win32::UI::Accessibility::HWINEVENTHOOK;
 use windows::Win32::UI::HiDpi::*;
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetCapture, ReleaseCapture, SetCapture};
-use windows::Win32::UI::Shell::ExtractIconExW;
+use windows::Win32::UI::Shell::{ExtractIconExW, ShellExecuteW};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::diagnose;
@@ -68,6 +68,7 @@ struct HorizontalResizeSession {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PointerInteractionTarget {
     HorizontalResize(HorizontalResizeEdge),
+    HelpButton,
     HeaderDrag,
     None,
 }
@@ -1669,6 +1670,10 @@ const IDM_ALWAYS_ON_TOP: u16 = 32;
 const IDM_RESET_POSITION: u16 = 30;
 #[cfg(feature = "self-update")]
 const IDM_VERSION_ACTION: u16 = 31;
+const IDM_HELP_DISPLAY_GUIDE: u16 = 100;
+const IDM_HELP_AI_QUOTAS: u16 = 101;
+const IDM_HELP_README: u16 = 102;
+const IDM_HELP_VERSION_INFORMATION: u16 = 103;
 const IDM_LANG_SYSTEM: u16 = 40;
 const IDM_LANG_ENGLISH: u16 = 41;
 const IDM_LANG_DUTCH: u16 = 42;
@@ -2619,7 +2624,6 @@ fn set_window_title(hwnd: HWND, strings: Strings) {
     }
 }
 
-#[cfg(feature = "self-update")]
 fn show_info_message(hwnd: HWND, title: &str, message: &str) {
     unsafe {
         let title_wide = native_interop::wide_str(title);
@@ -2630,6 +2634,74 @@ fn show_info_message(hwnd: HWND, title: &str, message: &str) {
             PCWSTR::from_raw(title_wide.as_ptr()),
             MB_OK | MB_ICONINFORMATION,
         );
+    }
+}
+
+const README_URL: &str = "https://github.com/ysawase/ai-usage-monitor#readme";
+
+fn current_strings() -> Strings {
+    let state = lock_state();
+    state
+        .as_ref()
+        .map(|s| s.language.strings())
+        .unwrap_or(LanguageId::English.strings())
+}
+
+fn build_provider_help_text(strings: Strings) -> String {
+    let mut message = String::from(strings.help_ai_quotas_intro);
+    for provider in strings.help_provider_notes {
+        message.push_str("\n\n");
+        message.push_str(provider.name);
+        message.push_str("\n");
+        message.push_str(provider.description);
+    }
+    message
+}
+
+fn show_display_guide(hwnd: HWND) {
+    let strings = current_strings();
+    show_info_message(
+        hwnd,
+        strings.help_display_guide,
+        strings.help_display_guide_body,
+    );
+}
+
+fn show_ai_quota_help(hwnd: HWND) {
+    let strings = current_strings();
+    show_info_message(
+        hwnd,
+        strings.help_ai_quotas,
+        &build_provider_help_text(strings),
+    );
+}
+
+fn version_information_text(strings: Strings) -> String {
+    format!("{}\n\nv{}", strings.window_title, env!("CARGO_PKG_VERSION"))
+}
+
+fn show_version_information(hwnd: HWND) {
+    let strings = current_strings();
+    show_info_message(
+        hwnd,
+        strings.help_version_information,
+        &version_information_text(strings),
+    );
+}
+
+fn open_readme(hwnd: HWND) -> bool {
+    unsafe {
+        let operation = native_interop::wide_str("open");
+        let url = native_interop::wide_str(README_URL);
+        let result = ShellExecuteW(
+            hwnd,
+            PCWSTR::from_raw(operation.as_ptr()),
+            PCWSTR::from_raw(url.as_ptr()),
+            PCWSTR::null(),
+            PCWSTR::null(),
+            SW_SHOWNORMAL,
+        );
+        result.0 as isize > 32
     }
 }
 
@@ -2689,35 +2761,6 @@ fn update_language_change() -> bool {
 
     apply_language_to_state(app_state, None);
     true
-}
-
-#[cfg(feature = "self-update")]
-fn version_action_label(
-    strings: Strings,
-    language: LanguageId,
-    install_channel: InstallChannel,
-    status: &UpdateStatus,
-) -> String {
-    let current = env!("CARGO_PKG_VERSION");
-    match status {
-        UpdateStatus::Idle => format!("v{current} - {}", strings.check_for_updates),
-        UpdateStatus::Checking => format!("v{current} - {}", strings.checking_for_updates),
-        UpdateStatus::Applying => format!("v{current} - {}", strings.applying_update),
-        UpdateStatus::UpToDate => format!("v{current} - {}", strings.up_to_date_short),
-        UpdateStatus::Available(release) => match install_channel {
-            InstallChannel::Portable => {
-                format!(
-                    "v{current} - {} v{}",
-                    strings.update_to, release.latest_version
-                )
-            }
-            InstallChannel::Winget => format!(
-                "v{current} - {} v{}",
-                localization::update_via_winget(language),
-                release.latest_version
-            ),
-        },
-    }
 }
 
 #[cfg(feature = "self-update")]
@@ -3020,6 +3063,10 @@ const TEXT_WIDTH: i32 = 160;
 const MIN_MULTI_PROVIDER_TEXT_WIDTH: i32 = 96;
 const MAX_WIDGET_WIDTH_LOGICAL: i32 = 1200;
 const RESIZE_EDGE_LOGICAL: i32 = 6;
+const HELP_BUTTON_SIZE_LOGICAL: i32 = 14;
+const HELP_BUTTON_TOP_LOGICAL: i32 = 3;
+const HELP_BUTTON_RIGHT_MARGIN_LOGICAL: i32 = 4;
+const HELP_BUTTON_CONTENT_GAP_LOGICAL: i32 = 4;
 const MODEL_RIGHT_MARGIN: i32 = 3;
 const RIGHT_MARGIN: i32 = 1;
 /// Height of each of the two header text rows (display-basis label, then
@@ -3466,6 +3513,42 @@ fn horizontal_resize_edge_width_for_dpi(dpi: u32) -> i32 {
     scaled_for_dpi(RESIZE_EDGE_LOGICAL, dpi).max(4)
 }
 
+fn help_button_rect_for_client_width(client_width: i32, dpi: u32) -> RECT {
+    let size = scaled_for_dpi(HELP_BUTTON_SIZE_LOGICAL, dpi);
+    let right = (client_width
+        - horizontal_resize_edge_width_for_dpi(dpi)
+        - scaled_for_dpi(HELP_BUTTON_RIGHT_MARGIN_LOGICAL, dpi))
+    .max(size);
+    let left = right - size;
+    let top = scaled_for_dpi(HELP_BUTTON_TOP_LOGICAL, dpi);
+    RECT {
+        left,
+        top,
+        right,
+        bottom: top + size,
+    }
+}
+
+fn header_column_width_avoiding_help(
+    column_x: i32,
+    column_width: i32,
+    client_width: i32,
+    dpi: u32,
+    is_last_provider: bool,
+) -> i32 {
+    if !is_last_provider {
+        return column_width;
+    }
+
+    let help_left = help_button_rect_for_client_width(client_width, dpi).left;
+    let available = help_left - scaled_for_dpi(HELP_BUTTON_CONTENT_GAP_LOGICAL, dpi) - column_x;
+    column_width.min(available.max(0))
+}
+
+fn point_is_in_rect(client_x: i32, client_y: i32, rect: RECT) -> bool {
+    client_x >= rect.left && client_x < rect.right && client_y >= rect.top && client_y < rect.bottom
+}
+
 fn horizontal_resize_edge_at(
     client_x: i32,
     client_width: i32,
@@ -3491,9 +3574,12 @@ fn pointer_interaction_target(
     client_width: i32,
     resize_edge_width: i32,
     header_bottom: i32,
+    help_button_rect: RECT,
 ) -> PointerInteractionTarget {
     if let Some(edge) = horizontal_resize_edge_at(client_x, client_width, resize_edge_width) {
         PointerInteractionTarget::HorizontalResize(edge)
+    } else if point_is_in_rect(client_x, client_y, help_button_rect) {
+        PointerInteractionTarget::HelpButton
     } else if is_drag_region_point(client_x, client_y, client_width, header_bottom) {
         PointerInteractionTarget::HeaderDrag
     } else {
@@ -3510,7 +3596,7 @@ fn window_dpi(hwnd: HWND) -> u32 {
     }
 }
 
-fn horizontal_resize_edge_under_cursor(hwnd: HWND) -> Option<HorizontalResizeEdge> {
+fn pointer_interaction_under_cursor(hwnd: HWND) -> PointerInteractionTarget {
     let mut point = POINT::default();
     let mut client_rect = RECT::default();
     unsafe {
@@ -3518,39 +3604,22 @@ fn horizontal_resize_edge_under_cursor(hwnd: HWND) -> Option<HorizontalResizeEdg
             || !ScreenToClient(hwnd, &mut point).as_bool()
             || GetClientRect(hwnd, &mut client_rect).is_err()
         {
-            return None;
-        }
-    }
-    horizontal_resize_edge_at(
-        point.x,
-        client_rect.right - client_rect.left,
-        horizontal_resize_edge_width_for_dpi(window_dpi(hwnd)),
-    )
-}
-
-fn cursor_is_on_drag_region(hwnd: HWND) -> bool {
-    let mut pt = POINT::default();
-    unsafe {
-        if GetCursorPos(&mut pt).is_err() || !ScreenToClient(hwnd, &mut pt).as_bool() {
-            return false;
-        }
-    }
-    let mut client_rect = RECT::default();
-    unsafe {
-        if GetClientRect(hwnd, &mut client_rect).is_err() {
-            return false;
+            return PointerInteractionTarget::None;
         }
     }
     let state = lock_state();
     let s = match state.as_ref() {
         Some(s) => s,
-        None => return false,
+        None => return PointerInteractionTarget::None,
     };
-    is_drag_region_point(
-        pt.x,
-        pt.y,
+    let dpi = window_dpi(hwnd);
+    pointer_interaction_target(
+        point.x,
+        point.y,
         client_rect.right - client_rect.left,
+        horizontal_resize_edge_width_for_dpi(dpi),
         header_band_bottom(s),
+        help_button_rect_for_client_width(client_rect.right - client_rect.left, dpi),
     )
 }
 
@@ -4710,6 +4779,22 @@ fn paint_content(
         );
         let old_font = SelectObject(hdc, font);
 
+        let help_rect =
+            help_button_rect_for_client_width(width, CURRENT_DPI.load(Ordering::Relaxed));
+        let help_border_brush = CreateSolidBrush(COLORREF(border.to_colorref()));
+        FrameRect(hdc, &help_rect, help_border_brush);
+        let _ = DeleteObject(help_border_brush);
+        let _ = SetTextColor(hdc, COLORREF(heading_text.to_colorref()));
+        let mut help_text_rect = help_rect;
+        let mut help_text = native_interop::wide_str("?");
+        let _ = DrawTextW(
+            hdc,
+            &mut help_text,
+            &mut help_text_rect,
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+        );
+        let _ = SetTextColor(hdc, COLORREF(text_color.to_colorref()));
+
         draw_provider_header_row(
             hdc,
             width,
@@ -5842,7 +5927,13 @@ unsafe extern "system" fn wnd_proc(
                     .map(|s| (s.resize_session.is_some(), s.dragging))
                     .unwrap_or((false, false))
             };
-            if is_resizing || horizontal_resize_edge_under_cursor(hwnd).is_some() {
+            let pointer_target = pointer_interaction_under_cursor(hwnd);
+            if is_resizing
+                || matches!(
+                    pointer_target,
+                    PointerInteractionTarget::HorizontalResize(_)
+                )
+            {
                 let cursor = LoadCursorW(HINSTANCE::default(), IDC_SIZEWE).unwrap_or_default();
                 SetCursor(cursor);
                 return LRESULT(1);
@@ -5852,10 +5943,18 @@ unsafe extern "system" fn wnd_proc(
                 SetCursor(cursor);
                 return LRESULT(1);
             }
-            if cursor_is_on_drag_region(hwnd) {
-                let cursor = LoadCursorW(HINSTANCE::default(), IDC_SIZEALL).unwrap_or_default();
-                SetCursor(cursor);
-                return LRESULT(1);
+            match pointer_target {
+                PointerInteractionTarget::HelpButton => {
+                    let cursor = LoadCursorW(HINSTANCE::default(), IDC_HAND).unwrap_or_default();
+                    SetCursor(cursor);
+                    return LRESULT(1);
+                }
+                PointerInteractionTarget::HeaderDrag => {
+                    let cursor = LoadCursorW(HINSTANCE::default(), IDC_SIZEALL).unwrap_or_default();
+                    SetCursor(cursor);
+                    return LRESULT(1);
+                }
+                _ => {}
             }
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
@@ -5875,10 +5974,16 @@ unsafe extern "system" fn wnd_proc(
                         client_width,
                         resize_edge_width,
                         header_band_bottom(s),
+                        help_button_rect_for_client_width(client_width, window_dpi(hwnd)),
                     ),
                     None => PointerInteractionTarget::None,
                 }
             };
+
+            if interaction == PointerInteractionTarget::HelpButton {
+                show_display_guide(hwnd);
+                return LRESULT(0);
+            }
 
             let mut pt = POINT::default();
             if GetCursorPos(&mut pt).is_err() {
@@ -6118,6 +6223,15 @@ unsafe extern "system" fn wnd_proc(
                         do_poll(sh);
                     });
                 }
+                IDM_HELP_DISPLAY_GUIDE => show_display_guide(hwnd),
+                IDM_HELP_AI_QUOTAS => show_ai_quota_help(hwnd),
+                IDM_HELP_README => {
+                    if !open_readme(hwnd) {
+                        let strings = current_strings();
+                        show_info_message(hwnd, strings.help_readme, README_URL);
+                    }
+                }
+                IDM_HELP_VERSION_INFORMATION => show_version_information(hwnd),
                 #[cfg(feature = "self-update")]
                 IDM_VERSION_ACTION => {
                     let (install_channel, release) = {
@@ -6505,10 +6619,7 @@ fn show_context_menu(hwnd: HWND) {
         let (
             current_interval,
             strings,
-            language,
             language_override,
-            install_channel,
-            update_status,
             widget_visible,
             always_on_top,
             show_claude_code,
@@ -6529,10 +6640,7 @@ fn show_context_menu(hwnd: HWND) {
                 Some(s) => (
                     s.poll_interval_ms,
                     s.language.strings(),
-                    s.language,
                     s.language_override,
-                    s.install_channel,
-                    s.update_status.clone(),
                     s.widget_visible,
                     s.always_on_top,
                     s.show_claude_code,
@@ -6551,10 +6659,7 @@ fn show_context_menu(hwnd: HWND) {
                 None => (
                     POLL_15_MIN,
                     LanguageId::English.strings(),
-                    LanguageId::English,
                     None,
-                    InstallChannel::Portable,
-                    UpdateStatus::Idle,
                     true,
                     false,
                     true,
@@ -7255,41 +7360,55 @@ fn show_context_menu(hwnd: HWND) {
         );
 
         let help_menu = CreatePopupMenu().unwrap();
-        for label in [
-            strings.help_readme_placeholder,
-            strings.help_update_placeholder,
-            strings.help_version_placeholder,
+        for (id, label) in [
+            (IDM_HELP_DISPLAY_GUIDE, strings.help_display_guide),
+            (IDM_HELP_AI_QUOTAS, strings.help_ai_quotas),
         ] {
             let label_str = native_interop::wide_str(label);
             let _ = AppendMenuW(
                 help_menu,
-                MF_GRAYED,
-                0,
+                MENU_ITEM_FLAGS(0),
+                id as usize,
                 PCWSTR::from_raw(label_str.as_ptr()),
             );
         }
+        let _ = AppendMenuW(help_menu, MF_SEPARATOR, 0, PCWSTR::null());
+
+        let readme_label = native_interop::wide_str(strings.help_readme);
+        let _ = AppendMenuW(
+            help_menu,
+            MENU_ITEM_FLAGS(0),
+            IDM_HELP_README as usize,
+            PCWSTR::from_raw(readme_label.as_ptr()),
+        );
+
+        let update_label = native_interop::wide_str(strings.check_for_updates);
         #[cfg(feature = "self-update")]
         {
-            let _ = AppendMenuW(help_menu, MF_SEPARATOR, 0, PCWSTR::null());
-
-            let version_label =
-                version_action_label(strings, language, install_channel, &update_status);
-            let version_str = native_interop::wide_str(&version_label);
-            let version_flags = if matches!(
-                update_status,
-                UpdateStatus::Checking | UpdateStatus::Applying
-            ) {
-                MF_GRAYED
-            } else {
-                MENU_ITEM_FLAGS(0)
-            };
             let _ = AppendMenuW(
                 help_menu,
-                version_flags,
+                MENU_ITEM_FLAGS(0),
                 IDM_VERSION_ACTION as usize,
-                PCWSTR::from_raw(version_str.as_ptr()),
+                PCWSTR::from_raw(update_label.as_ptr()),
             );
         }
+        #[cfg(not(feature = "self-update"))]
+        {
+            let _ = AppendMenuW(
+                help_menu,
+                MF_GRAYED,
+                0,
+                PCWSTR::from_raw(update_label.as_ptr()),
+            );
+        }
+
+        let version_label = native_interop::wide_str(strings.help_version_information);
+        let _ = AppendMenuW(
+            help_menu,
+            MENU_ITEM_FLAGS(0),
+            IDM_HELP_VERSION_INFORMATION as usize,
+            PCWSTR::from_raw(version_label.as_ptr()),
+        );
 
         let help_label = native_interop::wide_str(strings.help);
         let _ = AppendMenuW(
@@ -7517,18 +7636,26 @@ fn draw_provider_header_row(
         show_github_copilot,
     );
     let column_width = provider_column_width_for_client(client_width, active_models);
+    let dpi = CURRENT_DPI.load(Ordering::Relaxed);
 
     unsafe {
         let _ = SetTextColor(hdc, COLORREF(text_color.to_colorref()));
         let mut model_x = x + sc(LABEL_WIDTH) + sc(LABEL_RIGHT_MARGIN);
         if show_claude_code {
-            draw_header_label(hdc, model_x, y, column_width, strings.claude_code_model);
+            let header_width = header_column_width_avoiding_help(
+                model_x,
+                column_width,
+                client_width,
+                dpi,
+                !show_codex && !show_antigravity && !show_github_copilot,
+            );
+            draw_header_label(hdc, model_x, y, header_width, strings.claude_code_model);
             if show_weekly_remaining {
                 draw_header_remaining_if_fits(
                     hdc,
                     model_x,
                     y,
-                    column_width,
+                    header_width,
                     !show_codex && !show_antigravity,
                     strings.claude_code_model,
                     claude_weekly_remaining,
@@ -7538,13 +7665,20 @@ fn draw_provider_header_row(
         }
         if show_codex {
             let codex_header = format!("{} · {}", strings.codex_model, codex_banked_reset_text);
-            draw_header_label(hdc, model_x, y, column_width, &codex_header);
+            let header_width = header_column_width_avoiding_help(
+                model_x,
+                column_width,
+                client_width,
+                dpi,
+                !show_antigravity && !show_github_copilot,
+            );
+            draw_header_label(hdc, model_x, y, header_width, &codex_header);
             if show_weekly_remaining {
                 draw_header_remaining_if_fits(
                     hdc,
                     model_x,
                     y,
-                    column_width,
+                    header_width,
                     !show_antigravity,
                     &codex_header,
                     codex_weekly_remaining,
@@ -7553,13 +7687,20 @@ fn draw_provider_header_row(
             model_x += column_width + sc(MODEL_RIGHT_MARGIN);
         }
         if show_antigravity {
-            draw_header_label(hdc, model_x, y, column_width, strings.antigravity_model);
+            let header_width = header_column_width_avoiding_help(
+                model_x,
+                column_width,
+                client_width,
+                dpi,
+                !show_github_copilot,
+            );
+            draw_header_label(hdc, model_x, y, header_width, strings.antigravity_model);
             if show_weekly_remaining {
                 draw_header_remaining_if_fits(
                     hdc,
                     model_x,
                     y,
-                    column_width,
+                    header_width,
                     true,
                     strings.antigravity_model,
                     antigravity_weekly_remaining,
@@ -7568,7 +7709,9 @@ fn draw_provider_header_row(
             model_x += column_width + sc(MODEL_RIGHT_MARGIN);
         }
         if show_github_copilot {
-            draw_header_label(hdc, model_x, y, column_width, "GitHub Copilot");
+            let header_width =
+                header_column_width_avoiding_help(model_x, column_width, client_width, dpi, true);
+            draw_header_label(hdc, model_x, y, header_width, "GitHub Copilot");
         }
     }
 }
@@ -8657,21 +8800,97 @@ mod tests {
 
     #[test]
     fn resize_edge_takes_priority_over_header_drag() {
+        let help_rect = help_button_rect_for_client_width(600, 96);
         assert_eq!(
-            pointer_interaction_target(2, 10, 600, 6, 30),
+            pointer_interaction_target(2, 10, 600, 6, 30, help_rect),
             PointerInteractionTarget::HorizontalResize(HorizontalResizeEdge::Left)
         );
         assert_eq!(
-            pointer_interaction_target(598, 10, 600, 6, 30),
+            pointer_interaction_target(598, 10, 600, 6, 30, help_rect),
             PointerInteractionTarget::HorizontalResize(HorizontalResizeEdge::Right)
         );
         assert_eq!(
-            pointer_interaction_target(300, 10, 600, 6, 30),
+            pointer_interaction_target(300, 10, 600, 6, 30, help_rect),
             PointerInteractionTarget::HeaderDrag
         );
         assert_eq!(
-            pointer_interaction_target(300, 40, 600, 6, 30),
+            pointer_interaction_target(300, 40, 600, 6, 30, help_rect),
             PointerInteractionTarget::None
+        );
+    }
+
+    #[test]
+    fn help_button_scales_with_dpi_and_stays_inside_the_right_resize_edge() {
+        for dpi in [96, 144, 192] {
+            let client_width = scaled_for_dpi(600, dpi);
+            let rect = help_button_rect_for_client_width(client_width, dpi);
+            let resize_edge = horizontal_resize_edge_width_for_dpi(dpi);
+            let header_bottom = scaled_for_dpi(3 + HEADER_ROW_H + 4, dpi);
+
+            assert_eq!(
+                client_width - rect.right,
+                resize_edge + scaled_for_dpi(HELP_BUTTON_RIGHT_MARGIN_LOGICAL, dpi)
+            );
+            assert!(rect.top >= 0);
+            assert!(rect.bottom <= header_bottom);
+            assert_eq!(
+                rect.right - rect.left,
+                scaled_for_dpi(HELP_BUTTON_SIZE_LOGICAL, dpi)
+            );
+        }
+    }
+
+    #[test]
+    fn help_button_tracks_the_right_edge_when_the_widget_width_changes() {
+        for dpi in [96, 144, 192] {
+            let narrow_width = scaled_for_dpi(400, dpi);
+            let wide_width = scaled_for_dpi(700, dpi);
+            let narrow = help_button_rect_for_client_width(narrow_width, dpi);
+            let wide = help_button_rect_for_client_width(wide_width, dpi);
+
+            assert_eq!(wide.left - narrow.left, wide_width - narrow_width);
+            assert_eq!(wide.right - narrow.right, wide_width - narrow_width);
+        }
+    }
+
+    #[test]
+    fn final_provider_header_is_clipped_before_the_help_button() {
+        for dpi in [96, 144, 192] {
+            let client_width = scaled_for_dpi(600, dpi);
+            let help = help_button_rect_for_client_width(client_width, dpi);
+            let column_x = scaled_for_dpi(420, dpi);
+            let column_width = scaled_for_dpi(200, dpi);
+            let clipped =
+                header_column_width_avoiding_help(column_x, column_width, client_width, dpi, true);
+
+            assert_eq!(
+                column_x + clipped + scaled_for_dpi(HELP_BUTTON_CONTENT_GAP_LOGICAL, dpi),
+                help.left
+            );
+            assert_eq!(
+                header_column_width_avoiding_help(column_x, column_width, client_width, dpi, false,),
+                column_width
+            );
+        }
+    }
+
+    #[test]
+    fn help_button_takes_priority_over_header_drag_but_not_resize_edges() {
+        let help_rect = help_button_rect_for_client_width(600, 96);
+        let help_x = (help_rect.left + help_rect.right) / 2;
+        let help_y = (help_rect.top + help_rect.bottom) / 2;
+
+        assert_eq!(
+            pointer_interaction_target(help_x, help_y, 600, 6, 30, help_rect),
+            PointerInteractionTarget::HelpButton
+        );
+        assert_eq!(
+            pointer_interaction_target(2, help_y, 600, 30, 30, help_rect),
+            PointerInteractionTarget::HorizontalResize(HorizontalResizeEdge::Left)
+        );
+        assert_eq!(
+            pointer_interaction_target(300, help_y, 600, 6, 30, help_rect),
+            PointerInteractionTarget::HeaderDrag
         );
     }
 
@@ -10330,6 +10549,10 @@ mod tests {
             IDM_GITHUB_COPILOT_PLAN_MAX,
             IDM_RESET_DISPLAY_RELATIVE,
             IDM_RESET_DISPLAY_ABSOLUTE,
+            IDM_HELP_DISPLAY_GUIDE,
+            IDM_HELP_AI_QUOTAS,
+            IDM_HELP_README,
+            IDM_HELP_VERSION_INFORMATION,
             tray_icon::IDM_TOGGLE_WIDGET,
         ];
         #[cfg(feature = "self-update")]
@@ -10368,9 +10591,17 @@ mod tests {
             assert!(!strings.github_copilot_plan_pro_plus.is_empty());
             assert!(!strings.github_copilot_plan_max.is_empty());
             assert!(!strings.help.is_empty());
-            assert!(!strings.help_readme_placeholder.is_empty());
-            assert!(!strings.help_update_placeholder.is_empty());
-            assert!(!strings.help_version_placeholder.is_empty());
+            assert!(!strings.help_display_guide.is_empty());
+            assert!(!strings.help_ai_quotas.is_empty());
+            assert!(!strings.help_readme.is_empty());
+            assert!(!strings.help_version_information.is_empty());
+            assert!(!strings.help_display_guide_body.is_empty());
+            assert!(!strings.help_ai_quotas_intro.is_empty());
+            assert_eq!(strings.help_provider_notes.len(), 4);
+            assert!(strings
+                .help_provider_notes
+                .iter()
+                .all(|provider| !provider.name.is_empty() && !provider.description.is_empty()));
             assert!(!strings.display_density.is_empty());
             assert!(!strings.display_density_compact.is_empty());
             assert!(!strings.standard_level.is_empty());
@@ -10387,6 +10618,109 @@ mod tests {
             assert!(!strings.reset_display_datetime.is_empty());
             assert!(!strings.monthly_window.is_empty());
             assert!(strings.weekday_short.iter().all(|day| !day.is_empty()));
+        }
+    }
+
+    #[test]
+    fn provider_help_is_appendable_and_keeps_the_required_provider_order() {
+        for language in LanguageId::ALL {
+            let strings = language.strings();
+            let provider_names: Vec<_> = strings
+                .help_provider_notes
+                .iter()
+                .map(|provider| provider.name)
+                .collect();
+            assert_eq!(
+                provider_names,
+                ["Claude", "Codex", "Antigravity", "GitHub Copilot"]
+            );
+
+            let help = build_provider_help_text(strings);
+            assert!(help.starts_with(strings.help_ai_quotas_intro));
+            for provider in strings.help_provider_notes {
+                assert!(help.contains(provider.name));
+                assert!(help.contains(provider.description));
+            }
+        }
+    }
+
+    #[test]
+    fn japanese_help_covers_display_semantics_and_provider_distinctions() {
+        let strings = LanguageId::Japanese.strings();
+        for term in [
+            "残り利用枠",
+            "使用済み率",
+            "5h",
+            "7d",
+            "Mo",
+            "経過時間",
+            "残り時間",
+            "日時",
+            "目安",
+            "予定との差",
+            "使いすぎ",
+            "使用量0",
+            "取得失敗",
+            "対象なし",
+            "非表示",
+        ] {
+            assert!(
+                strings.help_display_guide_body.contains(term),
+                "Japanese display help is missing {term}"
+            );
+        }
+
+        let provider_help = build_provider_help_text(strings);
+        for distinction in ["ChatGPT本体", "Gemini本体", "Microsoft Copilot", "不明"] {
+            assert!(
+                provider_help.contains(distinction),
+                "Japanese provider help is missing {distinction}"
+            );
+        }
+        assert!(!provider_help.contains("フルリセット"));
+        assert!(provider_help.contains("ChatGPT本体の利用枠とは別です"));
+        assert!(provider_help.contains("Gemini本体の利用枠とは別です"));
+        assert!(provider_help.contains("プランが不明な場合は総使用量のみ表示します"));
+    }
+
+    #[test]
+    fn japanese_display_help_has_no_manually_forced_orphan_lines() {
+        let body = LanguageId::Japanese.strings().help_display_guide_body;
+        for line in body.lines().filter(|line| !line.is_empty()) {
+            assert!(
+                line.chars().count() > 2,
+                "Japanese display help has an orphan line: {line}"
+            );
+        }
+        assert!(!body.lines().any(|line| line == "す。"));
+    }
+
+    #[test]
+    fn help_readme_and_version_use_this_apps_public_metadata() {
+        assert_eq!(
+            README_URL,
+            "https://github.com/ysawase/ai-usage-monitor#readme"
+        );
+
+        let strings = LanguageId::Japanese.strings();
+        let version = version_information_text(strings);
+        assert!(version.contains(strings.window_title));
+        assert!(version.contains(&format!("v{}", env!("CARGO_PKG_VERSION"))));
+    }
+
+    #[test]
+    fn help_copy_does_not_expose_endpoints_or_credentials() {
+        for language in LanguageId::ALL {
+            let strings = language.strings();
+            let help = format!(
+                "{}\n{}",
+                strings.help_display_guide_body,
+                build_provider_help_text(strings)
+            )
+            .to_ascii_lowercase();
+            for forbidden in ["https://", "/v1/", "access token", "credential"] {
+                assert!(!help.contains(forbidden), "Help copy exposes {forbidden}");
+            }
         }
     }
 

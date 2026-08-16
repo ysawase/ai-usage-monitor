@@ -1,4 +1,4 @@
-use super::Strings;
+use super::{ProviderHelp, Strings};
 
 pub(super) const UPDATE_VIA_WINGET_LABEL: &str = "WinGet으로 업데이트";
 
@@ -27,9 +27,29 @@ pub(super) const STRINGS: Strings = Strings {
     github_copilot_plan_pro_plus: "Copilot Pro+",
     github_copilot_plan_max: "Copilot Max",
     help: "도움말",
-    help_readme_placeholder: "(임시) README",
-    help_update_placeholder: "(임시) 앱 업데이트",
-    help_version_placeholder: "(임시) 버전 정보",
+    help_display_guide: "표시 읽는 방법",
+    help_ai_quotas: "AI 사용 한도",
+    help_readme: "README",
+    help_version_information: "버전 정보",
+    help_display_guide_body: concat!(
+        "남은 한도 / 사용률\n",
+        "백분율은 표시 설정에서 선택한 기준을 따릅니다.\n\n",
+        "5h / 7d / Mo\n",
+        "5시간, 7일, 월간 사용 한도입니다. 표시할 내용이 없는 행은 생략됩니다.\n\n",
+        "시간 표시\n",
+        "상대는 사용률에서 경과 시간을, 남은 한도에서 재설정까지 남은 시간을 표시합니다. 날짜 및 시간은 대신 현지 재설정 시각을 표시합니다.\n\n",
+        "사용 속도 안내\n",
+        "기준 속도, 일정과의 차이, 과다 사용 등의 경고는 사용 속도를 판단하기 위한 참고 정보입니다.\n\n",
+        "상태 구분\n",
+        "사용량 0은 가져오기 실패가 아닙니다. 해당 없음은 제공자에게 그 한도가 없다는 뜻이며 설정에서 숨긴 것과 다릅니다."
+    ),
+    help_ai_quotas_intro: "제공자마다 사용 한도 체계가 다릅니다. 이름이 비슷해도 한도를 공유한다는 뜻은 아닙니다.",
+    help_provider_notes: &[
+        ProviderHelp { name: "Claude", description: "Claude / Claude Code 계정이 공유하는 5h 및 7d 사용 한도를 표시합니다." },
+        ProviderHelp { name: "Codex", description: "Codex CLI에서 확인할 수 있는 5h 및 7d 한도입니다. ChatGPT 앱의 사용 한도와는 별개입니다." },
+        ProviderHelp { name: "Antigravity", description: "Antigravity의 사용 한도입니다. 독립형 Gemini의 사용 한도와는 별개입니다." },
+        ProviderHelp { name: "GitHub Copilot", description: "GitHub Copilot의 월간 AI Credits입니다. 선택한 요금제에 따라 한도를 표시하며, 요금제를 알 수 없으면 총사용량만 표시합니다. Microsoft Copilot과는 다른 서비스입니다." },
+    ],
     check_for_updates: "업데이트 확인",
     checking_for_updates: "업데이트 확인 중...",
     updates: "업데이트",

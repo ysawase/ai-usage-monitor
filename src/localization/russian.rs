@@ -1,4 +1,4 @@
-use super::Strings;
+use super::{ProviderHelp, Strings};
 
 pub(super) const UPDATE_VIA_WINGET_LABEL: &str = "Обновить через WinGet";
 
@@ -27,9 +27,29 @@ pub(super) const STRINGS: Strings = Strings {
     github_copilot_plan_pro_plus: "Copilot Pro+",
     github_copilot_plan_max: "Copilot Max",
     help: "Справка",
-    help_readme_placeholder: "(Временно) README",
-    help_update_placeholder: "(Временно) Обновление приложения",
-    help_version_placeholder: "(Временно) Информация о версии",
+    help_display_guide: "Как читать данные",
+    help_ai_quotas: "Квоты ИИ",
+    help_readme: "README",
+    help_version_information: "Информация о версии",
+    help_display_guide_body: concat!(
+        "Остаток / Процент использования\n",
+        "Процент соответствует выбранной основе отображения.\n\n",
+        "5h / 7d / Mo\n",
+        "Это квоты на пять часов, семь дней и месяц. Строки без содержимого скрываются.\n\n",
+        "Отображение времени\n",
+        "Относительно показывает прошедшее время для Использовано или время до сброса для Остатка. Дата и время вместо этого показывает локальное время сброса.\n\n",
+        "Темп использования\n",
+        "Ориентир, отклонение от плана и предупреждения основаны на вашем темпе использования.\n\n",
+        "Состояния\n",
+        "Нулевое использование не является ошибкой получения. Неприменимо означает, что у поставщика нет такой квоты; это не то же самое, что скрытие в настройках."
+    ),
+    help_ai_quotas_intro: "У каждого поставщика своя система квот. Похожие названия не означают общие квоты.",
+    help_provider_notes: &[
+        ProviderHelp { name: "Claude", description: "Показывает общие квоты 5h и 7d учётной записи Claude / Claude Code." },
+        ProviderHelp { name: "Codex", description: "Показывает квоты 5h и 7d, доступные через Codex CLI. Они отличаются от квот приложения ChatGPT." },
+        ProviderHelp { name: "Antigravity", description: "Показывает квоты Antigravity. Они отличаются от самостоятельных квот Gemini." },
+        ProviderHelp { name: "GitHub Copilot", description: "Показывает месячные AI Credits GitHub Copilot. Выбранный план определяет квоту; Неизвестно показывает только общий расход. GitHub Copilot отличается от Microsoft Copilot." },
+    ],
     check_for_updates: "Проверить обновления",
     checking_for_updates: "Проверка обновлений...",
     updates: "Обновления",

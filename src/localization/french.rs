@@ -1,4 +1,4 @@
-use super::Strings;
+use super::{ProviderHelp, Strings};
 
 pub(super) const UPDATE_VIA_WINGET_LABEL: &str = "Mettre à jour avec WinGet";
 
@@ -27,9 +27,29 @@ pub(super) const STRINGS: Strings = Strings {
     github_copilot_plan_pro_plus: "Copilot Pro+",
     github_copilot_plan_max: "Copilot Max",
     help: "Aide",
-    help_readme_placeholder: "(Temporaire) README",
-    help_update_placeholder: "(Temporaire) Mise à jour de l’application",
-    help_version_placeholder: "(Temporaire) Informations sur la version",
+    help_display_guide: "Comprendre l’affichage",
+    help_ai_quotas: "Quotas d’IA",
+    help_readme: "README",
+    help_version_information: "Informations sur la version",
+    help_display_guide_body: concat!(
+        "Quota restant / Pourcentage utilisé\n",
+        "Le pourcentage suit la base choisie dans les paramètres d’affichage.\n\n",
+        "5h / 7d / Mo\n",
+        "Ce sont les quotas sur cinq heures, sept jours et un mois. Une ligne sans contenu est omise.\n\n",
+        "Affichage du temps\n",
+        "Relatif affiche le temps écoulé pour Utilisé, ou le temps avant réinitialisation pour Restant. Date et heure affiche plutôt la réinitialisation en heure locale.\n\n",
+        "Indications de rythme\n",
+        "Le rythme, l’écart au calendrier et les avertissements sont des repères fondés sur votre cadence d’utilisation.\n\n",
+        "États\n",
+        "Une utilisation nulle n’est pas un échec de récupération. Non applicable signifie que ce quota n’existe pas chez le fournisseur, ce qui diffère d’un quota masqué."
+    ),
+    help_ai_quotas_intro: "Chaque fournisseur possède son propre système de quotas. Des noms proches ne signifient pas que les quotas sont partagés.",
+    help_provider_notes: &[
+        ProviderHelp { name: "Claude", description: "Affiche les quotas 5h et 7j partagés du compte Claude / Claude Code." },
+        ProviderHelp { name: "Codex", description: "Affiche les quotas 5h et 7j accessibles via Codex CLI. Ils sont distincts des quotas de l’application ChatGPT." },
+        ProviderHelp { name: "Antigravity", description: "Affiche les quotas Antigravity. Ils sont distincts des quotas Gemini autonomes." },
+        ProviderHelp { name: "GitHub Copilot", description: "Affiche les AI Credits mensuels de GitHub Copilot. L’offre choisie détermine le quota ; Inconnu affiche seulement l’utilisation brute. GitHub Copilot est distinct de Microsoft Copilot." },
+    ],
     check_for_updates: "Vérifier les mises à jour",
     checking_for_updates: "Vérification des mises à jour...",
     updates: "Mises à jour",

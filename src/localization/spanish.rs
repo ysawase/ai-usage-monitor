@@ -1,4 +1,4 @@
-use super::Strings;
+use super::{ProviderHelp, Strings};
 
 pub(super) const UPDATE_VIA_WINGET_LABEL: &str = "Actualizar con WinGet";
 
@@ -27,9 +27,29 @@ pub(super) const STRINGS: Strings = Strings {
     github_copilot_plan_pro_plus: "Copilot Pro+",
     github_copilot_plan_max: "Copilot Max",
     help: "Ayuda",
-    help_readme_placeholder: "(Temporal) README",
-    help_update_placeholder: "(Temporal) Actualización de la aplicación",
-    help_version_placeholder: "(Temporal) Información de versión",
+    help_display_guide: "Cómo leer la pantalla",
+    help_ai_quotas: "Cuotas de IA",
+    help_readme: "README",
+    help_version_information: "Información de versión",
+    help_display_guide_body: concat!(
+        "Cuota restante / Porcentaje usado\n",
+        "El porcentaje sigue la base elegida en la configuración de visualización.\n\n",
+        "5h / 7d / Mo\n",
+        "Son cuotas de cinco horas, siete días y un mes. Se omiten las filas sin contenido.\n\n",
+        "Visualización del tiempo\n",
+        "Relativo muestra el tiempo transcurrido en Usado o el tiempo hasta el reinicio en Restante. Fecha y hora muestra en su lugar el reinicio en hora local.\n\n",
+        "Orientación de ritmo\n",
+        "El ritmo, la diferencia respecto al plan y las advertencias son referencias basadas en tu ritmo de uso.\n\n",
+        "Estados\n",
+        "Un uso de cero no es un fallo de obtención. No aplicable significa que esa cuota no existe para el proveedor; es distinto de ocultarla en la configuración."
+    ),
+    help_ai_quotas_intro: "Cada proveedor tiene su propio sistema de cuotas. Nombres similares no implican cuotas compartidas.",
+    help_provider_notes: &[
+        ProviderHelp { name: "Claude", description: "Muestra las cuotas compartidas de 5h y 7d de la cuenta Claude / Claude Code." },
+        ProviderHelp { name: "Codex", description: "Muestra las cuotas de 5h y 7d disponibles mediante Codex CLI. Son distintas de las cuotas de la aplicación ChatGPT." },
+        ProviderHelp { name: "Antigravity", description: "Muestra las cuotas de Antigravity. Son distintas de las cuotas autónomas de Gemini." },
+        ProviderHelp { name: "GitHub Copilot", description: "Muestra los AI Credits mensuales de GitHub Copilot. El plan elegido determina la cuota; Desconocido solo muestra el uso bruto. GitHub Copilot es distinto de Microsoft Copilot." },
+    ],
     check_for_updates: "Buscar actualizaciones",
     checking_for_updates: "Buscando actualizaciones...",
     updates: "Actualizaciones",

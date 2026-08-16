@@ -1,4 +1,4 @@
-use super::Strings;
+use super::{ProviderHelp, Strings};
 
 pub(super) const UPDATE_VIA_WINGET_LABEL: &str = "Mit WinGet aktualisieren";
 
@@ -27,9 +27,29 @@ pub(super) const STRINGS: Strings = Strings {
     github_copilot_plan_pro_plus: "Copilot Pro+",
     github_copilot_plan_max: "Copilot Max",
     help: "Hilfe",
-    help_readme_placeholder: "(Vorläufig) README",
-    help_update_placeholder: "(Vorläufig) App-Update",
-    help_version_placeholder: "(Vorläufig) Versionsinformationen",
+    help_display_guide: "Anzeige verstehen",
+    help_ai_quotas: "KI-Kontingente",
+    help_readme: "README",
+    help_version_information: "Versionsinformationen",
+    help_display_guide_body: concat!(
+        "Verbleibend / Verwendeter Anteil\n",
+        "Der Prozentwert folgt der gewählten Anzeigebasis.\n\n",
+        "5h / 7d / Mo\n",
+        "Dies sind Kontingente für fünf Stunden, sieben Tage und einen Monat. Leere Zeilen werden ausgelassen.\n\n",
+        "Zeitanzeige\n",
+        "Relativ zeigt bei Verwendet die verstrichene Zeit, bei Verbleibend die Zeit bis zum Reset. Datum und Uhrzeit zeigt stattdessen den lokalen Resetzeitpunkt.\n\n",
+        "Tempo-Hinweise\n",
+        "Richtwert, Planabweichung und Warnungen sind Orientierungshilfen auf Grundlage Ihres Nutzungstempos.\n\n",
+        "Status\n",
+        "Null Nutzung ist kein Abruffehler. Nicht verfügbar bedeutet, dass dieses Kontingent beim Anbieter nicht existiert; dies unterscheidet sich vom Ausblenden in den Einstellungen."
+    ),
+    help_ai_quotas_intro: "Jeder Anbieter hat ein eigenes Kontingentsystem. Ähnliche Namen bedeuten keine gemeinsamen Kontingente.",
+    help_provider_notes: &[
+        ProviderHelp { name: "Claude", description: "Zeigt die gemeinsamen 5h- und 7d-Kontingente des Claude-/Claude-Code-Kontos." },
+        ProviderHelp { name: "Codex", description: "Zeigt die über Codex CLI verfügbaren 5h- und 7d-Kontingente. Diese sind von den Kontingenten der ChatGPT-App getrennt." },
+        ProviderHelp { name: "Antigravity", description: "Zeigt die Antigravity-Kontingente. Diese sind von eigenständigen Gemini-Kontingenten getrennt." },
+        ProviderHelp { name: "GitHub Copilot", description: "Zeigt monatliche GitHub Copilot AI Credits. Der gewählte Tarif bestimmt das Kontingent; Unbekannt zeigt nur die Bruttonutzung. GitHub Copilot ist nicht Microsoft Copilot." },
+    ],
     check_for_updates: "Nach Updates suchen",
     checking_for_updates: "Suche nach Updates...",
     updates: "Updates",

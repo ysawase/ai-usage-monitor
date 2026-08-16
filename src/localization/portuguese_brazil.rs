@@ -1,4 +1,4 @@
-use super::Strings;
+use super::{ProviderHelp, Strings};
 
 pub(super) const UPDATE_VIA_WINGET_LABEL: &str = "Atualizar via WinGet";
 
@@ -27,9 +27,29 @@ pub(super) const STRINGS: Strings = Strings {
     github_copilot_plan_pro_plus: "Copilot Pro+",
     github_copilot_plan_max: "Copilot Max",
     help: "Ajuda",
-    help_readme_placeholder: "(Temporário) README",
-    help_update_placeholder: "(Temporário) Atualização do aplicativo",
-    help_version_placeholder: "(Temporário) Informações da versão",
+    help_display_guide: "Como ler a exibição",
+    help_ai_quotas: "Cotas de IA",
+    help_readme: "README",
+    help_version_information: "Informações da versão",
+    help_display_guide_body: concat!(
+        "Cota restante / Percentual usado\n",
+        "A porcentagem segue a base escolhida nas configurações de exibição.\n\n",
+        "5h / 7d / Mo\n",
+        "São cotas de cinco horas, sete dias e um mês. Linhas sem conteúdo são omitidas.\n\n",
+        "Exibição de tempo\n",
+        "Relativo mostra o tempo decorrido em Usado ou o tempo até a redefinição em Restante. Data e hora mostra, em vez disso, a redefinição no horário local.\n\n",
+        "Orientação de ritmo\n",
+        "Ritmo, diferença do esperado e avisos são referências baseadas no seu ritmo de uso.\n\n",
+        "Status\n",
+        "Uso zero não é falha de coleta. Não aplicável significa que a cota não existe para o provedor; é diferente de ocultá-la nas configurações."
+    ),
+    help_ai_quotas_intro: "Cada provedor tem seu próprio sistema de cotas. Nomes parecidos não significam cotas compartilhadas.",
+    help_provider_notes: &[
+        ProviderHelp { name: "Claude", description: "Mostra as cotas compartilhadas de 5h e 7d da conta Claude / Claude Code." },
+        ProviderHelp { name: "Codex", description: "Mostra as cotas de 5h e 7d disponíveis pelo Codex CLI. Elas são distintas das cotas do aplicativo ChatGPT." },
+        ProviderHelp { name: "Antigravity", description: "Mostra as cotas do Antigravity. Elas são distintas das cotas autônomas do Gemini." },
+        ProviderHelp { name: "GitHub Copilot", description: "Mostra os AI Credits mensais do GitHub Copilot. O plano escolhido determina a cota; Desconhecido mostra apenas o uso bruto. GitHub Copilot é diferente de Microsoft Copilot." },
+    ],
     check_for_updates: "Busca atualizações",
     checking_for_updates: "Buscando por atualizações...",
     updates: "Atualizações",

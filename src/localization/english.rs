@@ -1,4 +1,4 @@
-use super::Strings;
+use super::{ProviderHelp, Strings};
 
 pub(super) const UPDATE_VIA_WINGET_LABEL: &str = "Update via WinGet";
 
@@ -27,9 +27,41 @@ pub(super) const STRINGS: Strings = Strings {
     github_copilot_plan_pro_plus: "Copilot Pro+",
     github_copilot_plan_max: "Copilot Max",
     help: "Help",
-    help_readme_placeholder: "(Temporary) README",
-    help_update_placeholder: "(Temporary) App Updates",
-    help_version_placeholder: "(Temporary) Version Information",
+    help_display_guide: "How to Read the Display",
+    help_ai_quotas: "AI Quotas",
+    help_readme: "README",
+    help_version_information: "Version Information",
+    help_display_guide_body: concat!(
+        "Remaining allowance / Used percentage\n",
+        "The percentage follows the display basis selected in Display Settings.\n\n",
+        "5h / 7d / Mo\n",
+        "These are five-hour, seven-day, and monthly quota windows. A row is omitted when it has nothing to display.\n\n",
+        "Time display\n",
+        "Relative shows elapsed time for Used percentage, or time until reset for Remaining allowance. Date & time shows the local reset date and time instead.\n\n",
+        "Pace guidance\n",
+        "Pace, difference from schedule, and warnings such as Overusing are guidance based on your usage pace.\n\n",
+        "Statuses\n",
+        "Zero usage is not a fetch failure. Not applicable means that quota does not exist for the provider; it is different from hiding a quota in settings."
+    ),
+    help_ai_quotas_intro: "Each provider has its own quota system. Similar names do not mean that quotas are shared.",
+    help_provider_notes: &[
+        ProviderHelp {
+            name: "Claude",
+            description: "Shows the shared 5h and 7d quotas for the Claude / Claude Code account.",
+        },
+        ProviderHelp {
+            name: "Codex",
+            description: "Shows the 5h and 7d quotas available through Codex CLI. These are separate from ChatGPT app quotas.",
+        },
+        ProviderHelp {
+            name: "Antigravity",
+            description: "Shows Antigravity quotas. These are separate from standalone Gemini quotas.",
+        },
+        ProviderHelp {
+            name: "GitHub Copilot",
+            description: "Shows monthly GitHub Copilot AI Credits. The selected plan determines the allowance; Unknown shows gross usage only. GitHub Copilot is different from Microsoft Copilot.",
+        },
+    ],
     check_for_updates: "Check for Updates",
     checking_for_updates: "Checking for Updates...",
     updates: "Updates",

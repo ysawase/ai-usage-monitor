@@ -1,4 +1,4 @@
-use super::Strings;
+use super::{ProviderHelp, Strings};
 
 pub(super) const UPDATE_VIA_WINGET_LABEL: &str = "通过 WinGet 更新";
 
@@ -27,9 +27,29 @@ pub(super) const STRINGS: Strings = Strings {
     github_copilot_plan_pro_plus: "Copilot Pro+",
     github_copilot_plan_max: "Copilot Max",
     help: "帮助",
-    help_readme_placeholder: "（暂定）README",
-    help_update_placeholder: "（暂定）应用更新",
-    help_version_placeholder: "（暂定）版本信息",
+    help_display_guide: "如何阅读显示",
+    help_ai_quotas: "AI 配额",
+    help_readme: "README",
+    help_version_information: "版本信息",
+    help_display_guide_body: concat!(
+        "剩余配额 / 已用百分比\n",
+        "百分比遵循显示设置中选择的显示基准。\n\n",
+        "5h / 7d / Mo\n",
+        "分别是五小时、七天和每月配额。没有可显示内容的行会被省略。\n\n",
+        "时间显示\n",
+        "相对模式在已用百分比下显示经过时间，在剩余配额下显示距重置时间。日期时间模式改为显示本地重置日期和时间。\n\n",
+        "使用节奏提示\n",
+        "参考节奏、与计划的差异及使用过快等警告，是基于使用节奏的参考信息。\n\n",
+        "状态区别\n",
+        "使用量为零并非获取失败。不适用表示该服务没有此配额，与在设置中隐藏不同。"
+    ),
+    help_ai_quotas_intro: "每项服务都有自己的配额体系。名称相近并不表示配额共享。",
+    help_provider_notes: &[
+        ProviderHelp { name: "Claude", description: "显示 Claude / Claude Code 账户共享的 5h 和 7d 配额。" },
+        ProviderHelp { name: "Codex", description: "显示通过 Codex CLI 可查看的 5h 和 7d 配额。它们与 ChatGPT 应用的配额不同。" },
+        ProviderHelp { name: "Antigravity", description: "显示 Antigravity 的配额。它们与独立 Gemini 的配额不同。" },
+        ProviderHelp { name: "GitHub Copilot", description: "显示 GitHub Copilot 的每月 AI Credits。配额取决于所选套餐；套餐未知时仅显示总使用量。GitHub Copilot 与 Microsoft Copilot 不同。" },
+    ],
     check_for_updates: "检查更新",
     checking_for_updates: "正在检查更新...",
     updates: "更新",

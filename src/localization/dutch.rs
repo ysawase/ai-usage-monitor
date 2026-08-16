@@ -1,4 +1,4 @@
-use super::Strings;
+use super::{ProviderHelp, Strings};
 
 pub(super) const UPDATE_VIA_WINGET_LABEL: &str = "Bijwerken via WinGet";
 
@@ -27,9 +27,29 @@ pub(super) const STRINGS: Strings = Strings {
     github_copilot_plan_pro_plus: "Copilot Pro+",
     github_copilot_plan_max: "Copilot Max",
     help: "Help",
-    help_readme_placeholder: "(Tijdelijk) README",
-    help_update_placeholder: "(Tijdelijk) App-update",
-    help_version_placeholder: "(Tijdelijk) Versie-informatie",
+    help_display_guide: "De weergave lezen",
+    help_ai_quotas: "AI-limieten",
+    help_readme: "README",
+    help_version_information: "Versie-informatie",
+    help_display_guide_body: concat!(
+        "Resterend / Gebruikt percentage\n",
+        "Het percentage volgt de gekozen weergavebasis.\n\n",
+        "5h / 7d / Mo\n",
+        "Dit zijn limieten van vijf uur, zeven dagen en een maand. Een lege rij wordt weggelaten.\n\n",
+        "Tijdweergave\n",
+        "Relatief toont verstreken tijd bij Gebruikt, of tijd tot reset bij Resterend. Datum en tijd toont in plaats daarvan het lokale resetmoment.\n\n",
+        "Tempo-informatie\n",
+        "Richttempo, verschil met schema en waarschuwingen zijn hulpmiddelen op basis van je gebruikstempo.\n\n",
+        "Statussen\n",
+        "Nul gebruik is geen ophaalfout. Niet van toepassing betekent dat de provider die limiet niet heeft; dit verschilt van verbergen in de instellingen."
+    ),
+    help_ai_quotas_intro: "Elke provider heeft een eigen quotasysteem. Vergelijkbare namen betekenen niet dat quota worden gedeeld.",
+    help_provider_notes: &[
+        ProviderHelp { name: "Claude", description: "Toont de gedeelde 5h- en 7d-limieten van het Claude / Claude Code-account." },
+        ProviderHelp { name: "Codex", description: "Toont de 5h- en 7d-limieten via Codex CLI. Deze staan los van de quota van de ChatGPT-app." },
+        ProviderHelp { name: "Antigravity", description: "Toont de Antigravity-quota. Deze staan los van zelfstandige Gemini-quota." },
+        ProviderHelp { name: "GitHub Copilot", description: "Toont maandelijkse GitHub Copilot AI Credits. Het gekozen plan bepaalt de limiet; Onbekend toont alleen bruto gebruik. GitHub Copilot is niet Microsoft Copilot." },
+    ],
     check_for_updates: "Controleren op updates",
     checking_for_updates: "Controleren op updates...",
     updates: "Updates",

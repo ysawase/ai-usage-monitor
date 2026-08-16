@@ -143,6 +143,12 @@ impl LanguageId {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProviderHelp {
+    pub name: &'static str,
+    pub description: &'static str,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Strings {
     pub window_title: &'static str,
@@ -169,9 +175,13 @@ pub struct Strings {
     pub github_copilot_plan_pro_plus: &'static str,
     pub github_copilot_plan_max: &'static str,
     pub help: &'static str,
-    pub help_readme_placeholder: &'static str,
-    pub help_update_placeholder: &'static str,
-    pub help_version_placeholder: &'static str,
+    pub help_display_guide: &'static str,
+    pub help_ai_quotas: &'static str,
+    pub help_readme: &'static str,
+    pub help_version_information: &'static str,
+    pub help_display_guide_body: &'static str,
+    pub help_ai_quotas_intro: &'static str,
+    pub help_provider_notes: &'static [ProviderHelp],
     pub check_for_updates: &'static str,
     pub checking_for_updates: &'static str,
     pub updates: &'static str,
