@@ -1,7 +1,7 @@
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{BOOL, HWND, LPARAM, RECT};
+use windows::Win32::Foundation::{BOOL, HWND, LPARAM, POINT, RECT};
 use windows::Win32::Graphics::Gdi::{
-    GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    GetMonitorInfoW, MonitorFromPoint, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
 };
 use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
 use windows::Win32::UI::Shell::{SHAppBarMessage, ABM_GETTASKBARPOS, APPBARDATA};
@@ -110,6 +110,24 @@ pub fn get_taskbar_rect(taskbar_hwnd: HWND) -> Option<RECT> {
 pub fn get_monitor_work_area(hwnd: HWND) -> Option<RECT> {
     unsafe {
         let hmonitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        let mut info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if GetMonitorInfoW(hmonitor, &mut info).0 != 0 {
+            Some(info.rcWork)
+        } else {
+            None
+        }
+    }
+}
+
+/// Get the work area of the monitor nearest to a virtual-screen point.
+/// This recovers a saved free-placement coordinate after monitor topology
+/// changes without persisting a monitor identifier.
+pub fn get_monitor_work_area_for_point(point: POINT) -> Option<RECT> {
+    unsafe {
+        let hmonitor = MonitorFromPoint(point, MONITOR_DEFAULTTONEAREST);
         let mut info = MONITORINFO {
             cbSize: std::mem::size_of::<MONITORINFO>() as u32,
             ..Default::default()

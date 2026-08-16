@@ -12,7 +12,7 @@ use windows::Win32::System::Registry::*;
 use windows::Win32::System::Threading::{CreateMutexW, WaitForSingleObject};
 use windows::Win32::UI::Accessibility::HWINEVENTHOOK;
 use windows::Win32::UI::HiDpi::*;
-use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
+use windows::Win32::UI::Input::KeyboardAndMouse::{GetCapture, ReleaseCapture, SetCapture};
 use windows::Win32::UI::Shell::ExtractIconExW;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -49,6 +49,26 @@ impl SendHwnd {
     fn to_hwnd(self) -> HWND {
         HWND(self.0 as *mut _)
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HorizontalResizeEdge {
+    Left,
+    Right,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct HorizontalResizeSession {
+    edge: HorizontalResizeEdge,
+    start_cursor_screen_x: i32,
+    start_window_rect: RECT,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PointerInteractionTarget {
+    HorizontalResize(HorizontalResizeEdge),
+    HeaderDrag,
+    None,
 }
 
 /// Shared application state
@@ -125,18 +145,16 @@ struct AppState {
     dragging: bool,
     drag_start_mouse_x: i32,
     drag_start_mouse_y: i32,
-    drag_start_client_x: i32,
     drag_start_window_x: i32,
     drag_start_window_y: i32,
-    /// AUM-WINDOW-UI-01C-2-STEP2: runtime-only free placement. `None` means
-    /// the popup follows the taskbar-anchored auto position
-    /// (`compute_auto_popup_position`); `Some((x, y))` means the user
-    /// free-dragged it off the taskbar this session, so `position_at_taskbar`
-    /// keeps that position and only resizes in place. Never persisted to
-    /// `SettingsFile` — cleared back to `None` on `IDM_RESET_POSITION`, on a
-    /// taskbar-rect drop (see `WM_LBUTTONUP`), and implicitly on every
-    /// restart (this field simply isn't saved).
+    resize_session: Option<HorizontalResizeSession>,
+    /// Saved free placement. `None` uses the selected monitor's bottom-right
+    /// work-area corner; `Some((x, y))` is restored inside the nearest current
+    /// work area. Cleared by position reset and by a taskbar drop.
     manual_position: Option<(i32, i32)>,
+    /// User-selected width in 96-DPI logical pixels. `None` preserves the
+    /// provider-count-based default until the user resizes.
+    widget_width_logical: Option<i32>,
 
     widget_visible: bool,
     always_on_top: bool,
@@ -1623,6 +1641,12 @@ struct SettingsFile {
     widget_visible: bool,
     #[serde(default)]
     always_on_top: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    widget_width_logical: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    manual_x: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    manual_y: Option<i32>,
     #[serde(default = "default_show_claude_code")]
     show_claude_code: bool,
     #[serde(default = "default_show_codex")]
@@ -1660,6 +1684,9 @@ impl Default for SettingsFile {
             last_update_check_unix: None,
             widget_visible: true,
             always_on_top: false,
+            widget_width_logical: None,
+            manual_x: None,
+            manual_y: None,
             show_claude_code: true,
             show_codex: false,
             show_antigravity: false,
@@ -1776,6 +1803,7 @@ fn load_settings() -> SettingsFile {
         Err(_) => return SettingsFile::default(),
     };
     let mut settings: SettingsFile = serde_json::from_str(&content).unwrap_or_default();
+    settings.widget_width_logical = normalize_saved_widget_width(settings.widget_width_logical);
     normalize_github_copilot_settings(&mut settings);
     #[cfg(not(feature = "antigravity"))]
     {
@@ -1789,6 +1817,10 @@ fn load_settings() -> SettingsFile {
         settings.show_claude_code = true;
     }
     settings
+}
+
+fn normalize_saved_widget_width(width: Option<i32>) -> Option<i32> {
+    width.map(|width| width.clamp(1, MAX_WIDGET_WIDTH_LOGICAL))
 }
 
 fn normalize_github_copilot_settings(settings: &mut SettingsFile) {
@@ -1820,6 +1852,9 @@ fn save_state_settings() {
             last_update_check_unix: s.last_update_check_unix,
             widget_visible: s.widget_visible,
             always_on_top: s.always_on_top,
+            widget_width_logical: s.widget_width_logical,
+            manual_x: s.manual_position.map(|position| position.0),
+            manual_y: s.manual_position.map(|position| position.1),
             show_claude_code: s.show_claude_code,
             show_codex: s.show_codex,
             show_antigravity: s.show_antigravity,
@@ -1995,46 +2030,6 @@ fn select_taskbar_anchor(requested_index: usize) -> bool {
         s.taskbar_index = index;
     }
     true
-}
-
-fn taskbar_at_point(pt: POINT) -> Option<(usize, native_interop::TaskbarWindow)> {
-    native_interop::find_taskbars()
-        .into_iter()
-        .enumerate()
-        .find(|(_, taskbar)| {
-            pt.x >= taskbar.rect.left
-                && pt.x < taskbar.rect.right
-                && pt.y >= taskbar.rect.top
-                && pt.y < taskbar.rect.bottom
-        })
-}
-
-fn tray_left_for_taskbar(taskbar_hwnd: HWND, taskbar_rect: RECT) -> i32 {
-    let mut tray_left = taskbar_rect.right;
-    if let Some(tray_hwnd) = native_interop::find_child_window(taskbar_hwnd, "TrayNotifyWnd") {
-        if let Some(tray_rect) = native_interop::get_window_rect_safe(tray_hwnd) {
-            tray_left = tray_rect.left;
-        }
-    }
-    tray_left
-}
-
-fn clamp_offset_for_taskbar(taskbar_hwnd: HWND, taskbar_rect: RECT, offset: i32) -> i32 {
-    let tray_left = tray_left_for_taskbar(taskbar_hwnd, taskbar_rect);
-    let max_offset = (tray_left - taskbar_rect.left - total_widget_width()).max(0);
-    offset.clamp(0, max_offset)
-}
-
-fn offset_for_drop_point(
-    taskbar_hwnd: HWND,
-    taskbar_rect: RECT,
-    pt: POINT,
-    drag_start_client_x: i32,
-) -> i32 {
-    let tray_left = tray_left_for_taskbar(taskbar_hwnd, taskbar_rect);
-    let desired_left = pt.x - taskbar_rect.left - drag_start_client_x;
-    let offset = tray_left - taskbar_rect.left - total_widget_width() - desired_left;
-    clamp_offset_for_taskbar(taskbar_hwnd, taskbar_rect, offset)
 }
 
 fn now_unix_secs() -> u64 {
@@ -2635,6 +2630,13 @@ const BAR_RIGHT_MARGIN: i32 = 4;
 /// it has not been visually verified on this machine (no runtime access
 /// here) and needs a home-PC check across all 11 languages.
 const TEXT_WIDTH: i32 = 160;
+/// Minimum text budget per provider when two or more columns share the
+/// widget. Combined with the existing fixed bar widths, this yields the
+/// practical 353/477/623 logical-pixel minima for 2/3/4 providers while the
+/// single-provider minimum remains the legacy 315 pixels.
+const MIN_MULTI_PROVIDER_TEXT_WIDTH: i32 = 96;
+const MAX_WIDGET_WIDTH_LOGICAL: i32 = 1200;
+const RESIZE_EDGE_LOGICAL: i32 = 6;
 const MODEL_RIGHT_MARGIN: i32 = 3;
 const RIGHT_MARGIN: i32 = 1;
 /// Height of each of the two header text rows (display-basis label, then
@@ -3047,10 +3049,82 @@ fn is_drag_region_point(client_x: i32, client_y: i32, width: i32, header_band_bo
     client_x >= 0 && client_x < width && client_y >= 0 && client_y < header_band_bottom
 }
 
+fn horizontal_resize_edge_width_for_dpi(dpi: u32) -> i32 {
+    scaled_for_dpi(RESIZE_EDGE_LOGICAL, dpi).max(4)
+}
+
+fn horizontal_resize_edge_at(
+    client_x: i32,
+    client_width: i32,
+    edge_width: i32,
+) -> Option<HorizontalResizeEdge> {
+    if client_x < 0 || client_x >= client_width || client_width <= 0 {
+        return None;
+    }
+
+    let edge_width = edge_width.max(1).min(client_width);
+    if client_x < edge_width {
+        Some(HorizontalResizeEdge::Left)
+    } else if client_x >= client_width - edge_width {
+        Some(HorizontalResizeEdge::Right)
+    } else {
+        None
+    }
+}
+
+fn pointer_interaction_target(
+    client_x: i32,
+    client_y: i32,
+    client_width: i32,
+    resize_edge_width: i32,
+    header_bottom: i32,
+) -> PointerInteractionTarget {
+    if let Some(edge) = horizontal_resize_edge_at(client_x, client_width, resize_edge_width) {
+        PointerInteractionTarget::HorizontalResize(edge)
+    } else if is_drag_region_point(client_x, client_y, client_width, header_bottom) {
+        PointerInteractionTarget::HeaderDrag
+    } else {
+        PointerInteractionTarget::None
+    }
+}
+
+fn window_dpi(hwnd: HWND) -> u32 {
+    let dpi = unsafe { GetDpiForWindow(hwnd) };
+    if dpi == 0 {
+        CURRENT_DPI.load(Ordering::Relaxed).max(1)
+    } else {
+        dpi
+    }
+}
+
+fn horizontal_resize_edge_under_cursor(hwnd: HWND) -> Option<HorizontalResizeEdge> {
+    let mut point = POINT::default();
+    let mut client_rect = RECT::default();
+    unsafe {
+        if GetCursorPos(&mut point).is_err()
+            || !ScreenToClient(hwnd, &mut point).as_bool()
+            || GetClientRect(hwnd, &mut client_rect).is_err()
+        {
+            return None;
+        }
+    }
+    horizontal_resize_edge_at(
+        point.x,
+        client_rect.right - client_rect.left,
+        horizontal_resize_edge_width_for_dpi(window_dpi(hwnd)),
+    )
+}
+
 fn cursor_is_on_drag_region(hwnd: HWND) -> bool {
     let mut pt = POINT::default();
     unsafe {
         if GetCursorPos(&mut pt).is_err() || !ScreenToClient(hwnd, &mut pt).as_bool() {
+            return false;
+        }
+    }
+    let mut client_rect = RECT::default();
+    unsafe {
+        if GetClientRect(hwnd, &mut client_rect).is_err() {
             return false;
         }
     }
@@ -3062,7 +3136,7 @@ fn cursor_is_on_drag_region(hwnd: HWND) -> bool {
     is_drag_region_point(
         pt.x,
         pt.y,
-        total_widget_width_for_state(s),
+        client_rect.right - client_rect.left,
         header_band_bottom(s),
     )
 }
@@ -3084,8 +3158,47 @@ fn drag_follow_position(
     )
 }
 
-fn active_model_count(show_claude_code: bool, show_codex: bool, show_antigravity: bool) -> i32 {
-    (show_claude_code as i32 + show_codex as i32 + show_antigravity as i32).max(1)
+fn horizontal_resize_rect(
+    session: HorizontalResizeSession,
+    cursor_screen_x: i32,
+    minimum_width: i32,
+    maximum_width: i32,
+    required_height: i32,
+) -> RECT {
+    let start_width = session
+        .start_window_rect
+        .right
+        .saturating_sub(session.start_window_rect.left);
+    let delta = cursor_screen_x.saturating_sub(session.start_cursor_screen_x);
+    let desired_width = match session.edge {
+        HorizontalResizeEdge::Left => start_width.saturating_sub(delta),
+        HorizontalResizeEdge::Right => start_width.saturating_add(delta),
+    };
+    let width = desired_width.clamp(minimum_width, maximum_width);
+    let (left, right) = match session.edge {
+        HorizontalResizeEdge::Left => (
+            session.start_window_rect.right.saturating_sub(width),
+            session.start_window_rect.right,
+        ),
+        HorizontalResizeEdge::Right => (
+            session.start_window_rect.left,
+            session.start_window_rect.left.saturating_add(width),
+        ),
+    };
+
+    RECT {
+        left,
+        top: session.start_window_rect.top,
+        right,
+        bottom: session
+            .start_window_rect
+            .top
+            .saturating_add(required_height),
+    }
+}
+
+fn clear_horizontal_resize_session(session: &mut Option<HorizontalResizeSession>) -> bool {
+    session.take().is_some()
 }
 
 fn active_family_count(
@@ -3101,6 +3214,171 @@ fn active_family_count(
         .max(1)
 }
 
+fn scaled_for_dpi(px: i32, dpi: u32) -> i32 {
+    let dpi = dpi.max(1);
+    (px as f64 * dpi as f64 / 96.0).round() as i32
+}
+
+fn logical_from_device(px: i32, dpi: u32) -> i32 {
+    let dpi = dpi.max(1);
+    (px as f64 * 96.0 / dpi as f64).round() as i32
+}
+
+fn completed_resize_settings(
+    rect: RECT,
+    dpi: u32,
+    manual_position: Option<(i32, i32)>,
+) -> (i32, Option<(i32, i32)>) {
+    (
+        logical_from_device(rect.right - rect.left, dpi),
+        manual_position.map(|_| (rect.left, rect.top)),
+    )
+}
+
+fn usage_bar_logical_width(segment_count: i32) -> i32 {
+    (SEGMENT_W + SEGMENT_GAP) * segment_count - SEGMENT_GAP + BAR_RIGHT_MARGIN
+}
+
+fn usage_bar_device_width(segment_count: i32, dpi: u32) -> i32 {
+    (scaled_for_dpi(SEGMENT_W, dpi) + scaled_for_dpi(SEGMENT_GAP, dpi)) * segment_count
+        - scaled_for_dpi(SEGMENT_GAP, dpi)
+        + scaled_for_dpi(BAR_RIGHT_MARGIN, dpi)
+}
+
+fn fixed_widget_logical_width(active_families: i32) -> i32 {
+    LEFT_DIVIDER_W
+        + DIVIDER_RIGHT_MARGIN
+        + LABEL_WIDTH
+        + LABEL_RIGHT_MARGIN
+        + MODEL_RIGHT_MARGIN * (active_families - 1)
+        + RIGHT_MARGIN
+}
+
+fn fixed_widget_device_width(active_families: i32, dpi: u32) -> i32 {
+    scaled_for_dpi(LEFT_DIVIDER_W, dpi)
+        + scaled_for_dpi(DIVIDER_RIGHT_MARGIN, dpi)
+        + scaled_for_dpi(LABEL_WIDTH, dpi)
+        + scaled_for_dpi(LABEL_RIGHT_MARGIN, dpi)
+        + scaled_for_dpi(MODEL_RIGHT_MARGIN, dpi) * (active_families - 1)
+        + scaled_for_dpi(RIGHT_MARGIN, dpi)
+}
+
+fn default_widget_width_logical_for(active_families: i32) -> i32 {
+    let active_families = active_families.max(1);
+    let column_width = usage_bar_logical_width(row_bar_segment_count(active_families)) + TEXT_WIDTH;
+    fixed_widget_logical_width(active_families) + column_width * active_families
+}
+
+fn minimum_widget_width_logical_for(active_families: i32) -> i32 {
+    let active_families = active_families.max(1);
+    let text_width = if active_families == 1 {
+        TEXT_WIDTH
+    } else {
+        MIN_MULTI_PROVIDER_TEXT_WIDTH
+    };
+    let column_width = usage_bar_logical_width(row_bar_segment_count(active_families)) + text_width;
+    fixed_widget_logical_width(active_families) + column_width * active_families
+}
+
+fn widget_width_limits_device(active_families: i32, dpi: u32, work_area_width: i32) -> (i32, i32) {
+    let work_area_width = work_area_width.max(1);
+    let active_families = active_families.max(1);
+    let minimum_text_width = if active_families == 1 {
+        TEXT_WIDTH
+    } else {
+        MIN_MULTI_PROVIDER_TEXT_WIDTH
+    };
+    let minimum_column_width = usage_bar_device_width(row_bar_segment_count(active_families), dpi)
+        + scaled_for_dpi(minimum_text_width, dpi);
+    let minimum = (fixed_widget_device_width(active_families, dpi)
+        + minimum_column_width * active_families)
+        .min(work_area_width);
+    let maximum = scaled_for_dpi(MAX_WIDGET_WIDTH_LOGICAL, dpi)
+        .min(work_area_width)
+        .max(minimum);
+    (minimum, maximum)
+}
+
+fn resolved_widget_width_device(
+    saved_logical_width: Option<i32>,
+    active_families: i32,
+    dpi: u32,
+    work_area_width: i32,
+) -> i32 {
+    let desired = saved_logical_width.map_or_else(
+        || {
+            fixed_widget_device_width(active_families, dpi)
+                + (usage_bar_device_width(row_bar_segment_count(active_families), dpi)
+                    + scaled_for_dpi(TEXT_WIDTH, dpi))
+                    * active_families
+        },
+        |logical_width| scaled_for_dpi(logical_width, dpi),
+    );
+    let (minimum, maximum) = widget_width_limits_device(active_families, dpi, work_area_width);
+    desired.clamp(minimum, maximum)
+}
+
+fn resolved_widget_size_device(
+    saved_logical_width: Option<i32>,
+    active_families: i32,
+    dpi: u32,
+    work_area_width: i32,
+    required_height: i32,
+) -> (i32, i32) {
+    (
+        resolved_widget_width_device(saved_logical_width, active_families, dpi, work_area_width),
+        required_height,
+    )
+}
+
+fn provider_column_width_for_client_at_dpi(
+    client_width: i32,
+    active_families: i32,
+    dpi: u32,
+) -> i32 {
+    let active_families = active_families.max(1);
+    let fixed = fixed_widget_device_width(active_families, dpi);
+    ((client_width - fixed) / active_families).max(0)
+}
+
+fn provider_column_width_for_client(client_width: i32, active_families: i32) -> i32 {
+    provider_column_width_for_client_at_dpi(
+        client_width,
+        active_families,
+        CURRENT_DPI.load(Ordering::Relaxed),
+    )
+}
+
+fn clamp_position_to_work_area(
+    work_area: RECT,
+    width: i32,
+    height: i32,
+    desired_x: i32,
+    desired_y: i32,
+) -> (i32, i32) {
+    let max_x = (work_area.right - width).max(work_area.left);
+    let max_y = (work_area.bottom - height).max(work_area.top);
+    (
+        desired_x.clamp(work_area.left, max_x),
+        desired_y.clamp(work_area.top, max_y),
+    )
+}
+
+fn default_popup_position(work_area: RECT, width: i32, height: i32) -> (i32, i32) {
+    clamp_position_to_work_area(
+        work_area,
+        width,
+        height,
+        work_area.right - width,
+        work_area.bottom - height,
+    )
+}
+
+fn reset_saved_position(tray_offset: &mut i32, manual_position: &mut Option<(i32, i32)>) {
+    *tray_offset = 0;
+    *manual_position = None;
+}
+
 fn row_bar_segment_count(active_models: i32) -> i32 {
     match active_models {
         1 => SEGMENT_COUNT,
@@ -3110,25 +3388,20 @@ fn row_bar_segment_count(active_models: i32) -> i32 {
 }
 
 fn total_widget_width_for(active_models: i32) -> i32 {
-    let bar_segments = row_bar_segment_count(active_models);
-    let model_width = model_usage_width(bar_segments);
-
-    sc(LEFT_DIVIDER_W)
-        + sc(DIVIDER_RIGHT_MARGIN)
-        + sc(LABEL_WIDTH)
-        + sc(LABEL_RIGHT_MARGIN)
-        + model_width * active_models
-        + sc(MODEL_RIGHT_MARGIN) * (active_models - 1)
-        + sc(RIGHT_MARGIN)
+    sc(default_widget_width_logical_for(active_models))
 }
 
 fn total_widget_width_for_state(state: &AppState) -> i32 {
-    total_widget_width_for(active_family_count(
+    total_widget_width_for(active_family_count_for_state(state))
+}
+
+fn active_family_count_for_state(state: &AppState) -> i32 {
+    active_family_count(
         state.show_claude_code,
         state.show_codex,
         state.show_antigravity,
         state.show_github_copilot,
-    ))
+    )
 }
 
 fn total_widget_width() -> i32 {
@@ -3359,10 +3632,11 @@ pub fn run() {
 
         // Create as a top-level layered popup, anchored above the taskbar.
         let title = native_interop::wide_str(language.strings().window_title);
-        let initial_model_count = active_model_count(
+        let initial_model_count = active_family_count(
             settings.show_claude_code,
             settings.show_codex,
             settings.show_antigravity,
+            settings.show_github_copilot,
         );
         let hwnd = CreateWindowExW(
             WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_NOACTIVATE,
@@ -3371,7 +3645,12 @@ pub fn run() {
             WS_POPUP,
             0,
             0,
-            total_widget_width_for(initial_model_count),
+            resolved_widget_width_device(
+                settings.widget_width_logical,
+                initial_model_count,
+                96,
+                i32::MAX / 4,
+            ),
             sc(WIDGET_HEIGHT),
             HWND::default(),
             HMENU::default(),
@@ -3471,10 +3750,11 @@ pub fn run() {
                 dragging: false,
                 drag_start_mouse_x: 0,
                 drag_start_mouse_y: 0,
-                drag_start_client_x: 0,
                 drag_start_window_x: 0,
                 drag_start_window_y: 0,
-                manual_position: None,
+                resize_session: None,
+                manual_position: settings.manual_x.zip(settings.manual_y),
+                widget_width_logical: settings.widget_width_logical,
                 widget_visible: settings.widget_visible,
                 always_on_top: settings.always_on_top,
             });
@@ -3657,7 +3937,16 @@ fn render_layered() {
         return;
     }
 
-    let width = total_widget_width();
+    let width = {
+        let mut rect = RECT::default();
+        unsafe {
+            if GetClientRect(hwnd, &mut rect).is_ok() && rect.right > rect.left {
+                rect.right - rect.left
+            } else {
+                total_widget_width()
+            }
+        }
+    };
 
     let palette = popup_palette(app_theme);
     let provider_tint_dark = theme_is_dark_variant(app_theme);
@@ -3992,6 +4281,7 @@ fn paint_content(
 
         draw_provider_header_row(
             hdc,
+            width,
             content_x,
             layout.provider_header_y,
             heading_text,
@@ -4064,6 +4354,7 @@ fn paint_content(
 
         draw_row(
             hdc,
+            width,
             content_x,
             layout.weekly_row_y,
             text_color,
@@ -4085,18 +4376,22 @@ fn paint_content(
         // text.
         if let Some(secondary_y) = layout.weekly_secondary_y {
             let (claude_col_x, codex_col_x, antigravity_col_x) = provider_column_x_positions(
+                width,
                 content_x,
                 show_claude_code,
                 show_codex,
                 show_antigravity,
                 show_github_copilot,
             );
-            let pace_column_width = model_usage_width(row_bar_segment_count(active_family_count(
-                show_claude_code,
-                show_codex,
-                show_antigravity,
-                show_github_copilot,
-            )));
+            let pace_column_width = provider_column_width_for_client(
+                width,
+                active_family_count(
+                    show_claude_code,
+                    show_codex,
+                    show_antigravity,
+                    show_github_copilot,
+                ),
+            );
 
             if show_claude_code {
                 draw_weekly_pace_extra_lines(
@@ -4179,6 +4474,7 @@ fn paint_content(
             }
             draw_row(
                 hdc,
+                width,
                 content_x,
                 session_row_y,
                 text_color,
@@ -4228,6 +4524,7 @@ fn paint_content(
             });
             draw_row(
                 hdc,
+                width,
                 content_x,
                 height - sc(5) - sc(SEGMENT_H),
                 text_color,
@@ -4300,7 +4597,7 @@ fn paint_content(
                 show_antigravity,
                 show_github_copilot,
             );
-            let divider_column_width = model_usage_width(row_bar_segment_count(active_families));
+            let divider_column_width = provider_column_width_for_client(width, active_families);
             let column_divider_w = sc(1).max(1);
             let column_divider_brush = CreateSolidBrush(COLORREF(border.to_colorref()));
             let first_column_x = content_x + sc(LABEL_WIDTH) + sc(LABEL_RIGHT_MARGIN);
@@ -4726,7 +5023,7 @@ fn position_at_taskbar() {
     refresh_dpi();
     // Drop the app-state lock before any Win32 call that may synchronously
     // re-enter our window procedure.
-    let (hwnd, tray_offset, taskbar_hwnd, manual_position) = {
+    let (hwnd, taskbar_hwnd, manual_position, saved_width, active_families) = {
         let state = lock_state();
         let s = match state.as_ref() {
             Some(s) => s,
@@ -4740,93 +5037,78 @@ fn position_at_taskbar() {
 
         (
             s.hwnd.to_hwnd(),
-            s.tray_offset,
             s.taskbar_hwnd,
             s.manual_position,
+            s.widget_width_logical,
+            active_family_count_for_state(s),
         )
     };
 
-    let widget_width = total_widget_width();
     let widget_height = widget_height();
-
-    // AUM-WINDOW-UI-01C-2-STEP2: a free-dragged popup keeps its manual x/y —
-    // never recomputed from the taskbar — but still needs its size kept
-    // current (Compact/Standard, provider toggles, display density, etc. all
-    // change `widget_width`/`widget_height` independently of placement).
-    // `taskbar_hwnd` isn't even needed here: sizing is purely content-driven.
-    if let Some((x, y)) = manual_position {
-        native_interop::move_window(hwnd, x, y, widget_width, widget_height);
-        diagnose::log(format!(
-            "resized manually-placed popup at x={x} y={y} w={widget_width} h={widget_height}"
-        ));
+    let work_area = manual_position
+        .and_then(|(x, y)| native_interop::get_monitor_work_area_for_point(POINT { x, y }))
+        .or_else(|| native_interop::get_monitor_work_area(hwnd))
+        .or_else(|| taskbar_hwnd.and_then(native_interop::get_monitor_work_area));
+    let Some(work_area) = work_area else {
+        diagnose::log("position_at_taskbar skipped: unable to query monitor work area");
         return;
-    }
-
-    let taskbar_hwnd = match taskbar_hwnd {
-        Some(h) => h,
-        None => {
-            diagnose::log("position_at_taskbar skipped: no taskbar handle");
-            return;
-        }
     };
-
-    let taskbar_rect = match native_interop::get_taskbar_rect(taskbar_hwnd) {
-        Some(r) => r,
-        None => {
-            diagnose::log("position_at_taskbar skipped: unable to query taskbar rect");
-            return;
-        }
+    let widget_width = resolved_widget_width_device(
+        saved_width,
+        active_families,
+        CURRENT_DPI.load(Ordering::Relaxed),
+        work_area.right - work_area.left,
+    );
+    let (x, y) = match manual_position {
+        Some((x, y)) => clamp_position_to_work_area(work_area, widget_width, widget_height, x, y),
+        None => default_popup_position(work_area, widget_width, widget_height),
     };
-
-    // The popup's usable bounds: the monitor's work area (screen minus the
-    // taskbar), so the popup never overlaps the taskbar. If the work area
-    // can't be queried, fall back to "everything above the taskbar,
-    // unbounded at the top" rather than treating it as (0, 0).
-    let work_area = native_interop::get_monitor_work_area(taskbar_hwnd).unwrap_or(RECT {
-        left: taskbar_rect.left,
-        top: i32::MIN / 2,
-        right: taskbar_rect.right,
-        bottom: taskbar_rect.top,
-    });
-
-    let mut tray_left = taskbar_rect.right;
-
-    if let Some(tray_hwnd) = native_interop::find_child_window(taskbar_hwnd, "TrayNotifyWnd") {
-        if let Some(tray_rect) = native_interop::get_window_rect_safe(tray_hwnd) {
-            tray_left = tray_rect.left;
-        }
-    }
-
-    let max_offset = (tray_left - taskbar_rect.left - widget_width).max(0);
-    let tray_offset = tray_offset.clamp(0, max_offset);
-    let offset_changed = {
-        let mut state = lock_state();
-        if let Some(s) = state.as_mut() {
-            if s.tray_offset != tray_offset {
-                s.tray_offset = tray_offset;
-                true
-            } else {
-                false
+    if manual_position.is_some() && manual_position != Some((x, y)) {
+        {
+            let mut state = lock_state();
+            if let Some(state) = state.as_mut() {
+                state.manual_position = Some((x, y));
             }
-        } else {
-            false
         }
-    };
-    if offset_changed {
         save_state_settings();
     }
-
-    let (x, y) = compute_auto_popup_position(
-        work_area,
-        tray_left,
-        widget_width,
-        widget_height,
-        tray_offset,
-    );
     native_interop::move_window(hwnd, x, y, widget_width, widget_height);
     diagnose::log(format!(
         "positioned popup at x={x} y={y} w={widget_width} h={widget_height}"
     ));
+}
+
+fn resize_limits_for_window(hwnd: HWND) -> (i32, i32, i32) {
+    let (active_families, required_height) = {
+        let state = lock_state();
+        state
+            .as_ref()
+            .map(|s| (active_family_count_for_state(s), widget_height_for_state(s)))
+            .unwrap_or((1, sc(WIDGET_HEIGHT)))
+    };
+    let dpi = window_dpi(hwnd);
+    let work_area_width = native_interop::get_monitor_work_area(hwnd)
+        .map(|area| area.right - area.left)
+        .unwrap_or_else(|| scaled_for_dpi(MAX_WIDGET_WIDTH_LOGICAL, dpi));
+    let (minimum, maximum) = widget_width_limits_device(active_families, dpi, work_area_width);
+    (minimum, maximum, required_height)
+}
+
+fn finish_horizontal_resize(hwnd: HWND) {
+    let rect = native_interop::get_window_rect_safe(hwnd);
+    let dpi = window_dpi(hwnd);
+    {
+        let mut state = lock_state();
+        if let (Some(state), Some(rect)) = (state.as_mut(), rect) {
+            let (logical_width, manual_position) =
+                completed_resize_settings(rect, dpi, state.manual_position);
+            state.widget_width_logical = Some(logical_width);
+            state.manual_position = manual_position;
+        }
+    }
+    save_state_settings();
+    position_at_taskbar();
+    render_layered();
 }
 
 fn window_size_needs_sync(
@@ -4840,15 +5122,33 @@ fn window_size_needs_sync(
 }
 
 fn sync_usage_geometry_if_needed(hwnd: HWND) {
-    let required_size = {
+    let required = {
         let state = lock_state();
-        state
-            .as_ref()
-            .map(|s| (total_widget_width_for_state(s), widget_height_for_state(s)))
+        state.as_ref().map(|s| {
+            (
+                s.resize_session.is_some(),
+                s.widget_width_logical,
+                active_family_count_for_state(s),
+                widget_height_for_state(s),
+            )
+        })
     };
-    let Some((required_width, required_height)) = required_size else {
+    let Some((resizing, saved_width, active_families, required_height)) = required else {
         return;
     };
+    if resizing {
+        return;
+    }
+    let work_area_width = native_interop::get_monitor_work_area(hwnd)
+        .map(|area| area.right - area.left)
+        .unwrap_or(i32::MAX / 4);
+    let (required_width, required_height) = resolved_widget_size_device(
+        saved_width,
+        active_families,
+        CURRENT_DPI.load(Ordering::Relaxed),
+        work_area_width,
+        required_height,
+    );
 
     if window_size_needs_sync(
         native_interop::get_window_rect_safe(hwnd),
@@ -4962,6 +5262,23 @@ unsafe extern "system" fn wnd_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     match msg {
+        // The popup has no native sizing frame. Keep the entire surface in
+        // the client area so edge presses are handled by our capture-based
+        // horizontal resize path below rather than DefWindowProc's sizing loop.
+        WM_NCHITTEST => LRESULT(HTCLIENT as isize),
+        WM_SIZE => {
+            let resizing = {
+                let state = lock_state();
+                state
+                    .as_ref()
+                    .map(|state| state.resize_session.is_some())
+                    .unwrap_or(false)
+            };
+            if resizing {
+                render_layered();
+            }
+            LRESULT(0)
+        }
         WM_PAINT => {
             // For non-embedded fallback, paint normally
             let embedded = {
@@ -5084,10 +5401,18 @@ unsafe extern "system" fn wnd_proc(
             LRESULT(0)
         }
         WM_SETCURSOR => {
-            let is_dragging = {
+            let (is_resizing, is_dragging) = {
                 let state = lock_state();
-                state.as_ref().map(|s| s.dragging).unwrap_or(false)
+                state
+                    .as_ref()
+                    .map(|s| (s.resize_session.is_some(), s.dragging))
+                    .unwrap_or((false, false))
             };
+            if is_resizing || horizontal_resize_edge_under_cursor(hwnd).is_some() {
+                let cursor = LoadCursorW(HINSTANCE::default(), IDC_SIZEWE).unwrap_or_default();
+                SetCursor(cursor);
+                return LRESULT(1);
+            }
             if is_dragging {
                 let cursor = LoadCursorW(HINSTANCE::default(), IDC_SIZEALL).unwrap_or_default();
                 SetCursor(cursor);
@@ -5103,36 +5428,67 @@ unsafe extern "system" fn wnd_proc(
         WM_LBUTTONDOWN => {
             let client_x = (lparam.0 & 0xFFFF) as i16 as i32;
             let client_y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
-            let in_drag_region = {
+            let mut client_rect = RECT::default();
+            let _ = GetClientRect(hwnd, &mut client_rect);
+            let client_width = client_rect.right - client_rect.left;
+            let resize_edge_width = horizontal_resize_edge_width_for_dpi(window_dpi(hwnd));
+            let interaction = {
                 let state = lock_state();
                 match state.as_ref() {
-                    Some(s) => is_drag_region_point(
+                    Some(s) => pointer_interaction_target(
                         client_x,
                         client_y,
-                        total_widget_width_for_state(s),
+                        client_width,
+                        resize_edge_width,
                         header_band_bottom(s),
                     ),
-                    None => false,
+                    None => PointerInteractionTarget::None,
                 }
             };
-            if !in_drag_region {
+
+            let mut pt = POINT::default();
+            if GetCursorPos(&mut pt).is_err() {
+                return LRESULT(0);
+            }
+            let window_rect = native_interop::get_window_rect_safe(hwnd);
+
+            if let PointerInteractionTarget::HorizontalResize(edge) = interaction {
+                let Some(start_window_rect) = window_rect else {
+                    return LRESULT(0);
+                };
+                let mut state = lock_state();
+                if let Some(state) = state.as_mut() {
+                    state.resize_session = Some(HorizontalResizeSession {
+                        edge,
+                        start_cursor_screen_x: pt.x,
+                        start_window_rect,
+                    });
+                }
+                drop(state);
+                SetCapture(hwnd);
+                if GetCapture() != hwnd {
+                    let mut state = lock_state();
+                    if let Some(state) = state.as_mut() {
+                        clear_horizontal_resize_session(&mut state.resize_session);
+                    }
+                }
                 return LRESULT(0);
             }
 
-            let mut pt = POINT::default();
-            let _ = GetCursorPos(&mut pt);
+            if interaction != PointerInteractionTarget::HeaderDrag {
+                return LRESULT(0);
+            }
+
             // AUM-WINDOW-UI-01C-2-STEP2: the window's current screen
             // position is the reference point free-drag deltas are applied
             // to in `WM_MOUSEMOVE` — captured once here rather than derived
             // from any taskbar/tray formula, since a free drag no longer
             // assumes the popup starts taskbar-anchored.
-            let window_rect = native_interop::get_window_rect_safe(hwnd);
             let mut state = lock_state();
             if let Some(s) = state.as_mut() {
                 s.dragging = true;
                 s.drag_start_mouse_x = pt.x;
                 s.drag_start_mouse_y = pt.y;
-                s.drag_start_client_x = client_x;
                 if let Some(rect) = window_rect {
                     s.drag_start_window_x = rect.left;
                     s.drag_start_window_y = rect.top;
@@ -5142,6 +5498,32 @@ unsafe extern "system" fn wnd_proc(
             LRESULT(0)
         }
         WM_MOUSEMOVE => {
+            let resize_session = {
+                let state = lock_state();
+                state.as_ref().and_then(|state| state.resize_session)
+            };
+            if let Some(resize_session) = resize_session {
+                let mut point = POINT::default();
+                if GetCursorPos(&mut point).is_ok() {
+                    let (minimum, maximum, required_height) = resize_limits_for_window(hwnd);
+                    let rect = horizontal_resize_rect(
+                        resize_session,
+                        point.x,
+                        minimum,
+                        maximum,
+                        required_height,
+                    );
+                    native_interop::move_window(
+                        hwnd,
+                        rect.left,
+                        rect.top,
+                        rect.right - rect.left,
+                        rect.bottom - rect.top,
+                    );
+                }
+                return LRESULT(0);
+            }
+
             let is_dragging = {
                 let state = lock_state();
                 state.as_ref().map(|s| s.dragging).unwrap_or(false)
@@ -5149,6 +5531,8 @@ unsafe extern "system" fn wnd_proc(
             if is_dragging {
                 let mut pt = POINT::default();
                 let _ = GetCursorPos(&mut pt);
+                let current_width =
+                    native_interop::get_window_rect_safe(hwnd).map(|rect| rect.right - rect.left);
                 // AUM-WINDOW-UI-01C-2-STEP2: free 2-axis follow — the popup
                 // tracks the cursor directly (window start + cursor delta),
                 // no taskbar/tray/work-area math and no clamping here (see
@@ -5166,7 +5550,7 @@ unsafe extern "system" fn wnd_proc(
                         (pt.x, pt.y),
                     );
                     let hwnd_val = s.hwnd.to_hwnd();
-                    let width = total_widget_width_for_state(s);
+                    let width = current_width.unwrap_or_else(|| total_widget_width_for_state(s));
                     let height = widget_height_for_state(s);
                     (hwnd_val, x, y, width, height)
                 };
@@ -5176,6 +5560,19 @@ unsafe extern "system" fn wnd_proc(
             LRESULT(0)
         }
         WM_LBUTTONUP => {
+            let finished_resize = {
+                let mut state = lock_state();
+                state
+                    .as_mut()
+                    .map(|state| clear_horizontal_resize_session(&mut state.resize_session))
+                    .unwrap_or(false)
+            };
+            if finished_resize {
+                let _ = ReleaseCapture();
+                finish_horizontal_resize(hwnd);
+                return LRESULT(0);
+            }
+
             let mut pt = POINT::default();
             let _ = GetCursorPos(&mut pt);
             let drag_result = {
@@ -5184,8 +5581,6 @@ unsafe extern "system" fn wnd_proc(
                     if s.dragging {
                         s.dragging = false;
                         Some((
-                            s.taskbar_index,
-                            s.drag_start_client_x,
                             s.drag_start_window_x,
                             s.drag_start_window_y,
                             s.drag_start_mouse_x,
@@ -5198,14 +5593,8 @@ unsafe extern "system" fn wnd_proc(
                     None
                 }
             };
-            if let Some((
-                current_taskbar_index,
-                drag_start_client_x,
-                start_window_x,
-                start_window_y,
-                start_mouse_x,
-                start_mouse_y,
-            )) = drag_result
+            if let Some((start_window_x, start_window_y, start_mouse_x, start_mouse_y)) =
+                drag_result
             {
                 let _ = ReleaseCapture();
                 let (final_x, final_y) = drag_follow_position(
@@ -5213,56 +5602,59 @@ unsafe extern "system" fn wnd_proc(
                     (start_mouse_x, start_mouse_y),
                     (pt.x, pt.y),
                 );
-                if let Some((target_index, target_taskbar)) = taskbar_at_point(pt) {
-                    // AUM-WINDOW-UI-01C-2-STEP2: dropped back onto a taskbar
-                    // (the same one or a different monitor's) — always
-                    // returns to taskbar-anchored auto placement, clearing
-                    // any manual placement first. Same-taskbar drops now
-                    // need an explicit `position_at_taskbar()` call too
-                    // (unlike before STEP2): `WM_MOUSEMOVE` free-follows the
-                    // cursor rather than already tracking the taskbar-auto
-                    // formula live, so the popup isn't necessarily snapped
-                    // into place yet at drop time.
-                    {
-                        let mut state = lock_state();
-                        if let Some(s) = state.as_mut() {
-                            s.manual_position = None;
-                        }
-                    }
-                    if target_index != current_taskbar_index {
-                        let new_offset = offset_for_drop_point(
-                            target_taskbar.hwnd,
-                            target_taskbar.rect,
-                            pt,
-                            drag_start_client_x,
-                        );
-                        {
-                            let mut state = lock_state();
-                            if let Some(s) = state.as_mut() {
-                                s.tray_offset = new_offset;
-                            }
-                        }
-                        if select_taskbar_anchor(target_index) {
-                            position_at_taskbar();
-                            render_layered();
-                        }
-                    } else {
-                        position_at_taskbar();
-                        render_layered();
-                    }
-                    save_state_settings();
-                } else {
-                    // Dropped away from any taskbar: runtime-only manual
-                    // placement. `tray_offset`/`taskbar_index` are left
-                    // untouched, and this is never persisted to
-                    // `SettingsFile` (no `save_state_settings()` call here).
-                    let mut state = lock_state();
-                    if let Some(s) = state.as_mut() {
-                        s.manual_position = Some((final_x, final_y));
-                    }
+                // Persist every completed header drag, clamped to the nearest
+                // current monitor's work area so the widget never overlaps a
+                // taskbar or becomes stranded after monitor topology changes.
+                let window_rect = native_interop::get_window_rect_safe(hwnd);
+                let work_area = native_interop::get_monitor_work_area_for_point(POINT {
+                    x: final_x,
+                    y: final_y,
+                });
+                let (clamped_x, clamped_y) = match (window_rect, work_area) {
+                    (Some(rect), Some(area)) => clamp_position_to_work_area(
+                        area,
+                        rect.right - rect.left,
+                        rect.bottom - rect.top,
+                        final_x,
+                        final_y,
+                    ),
+                    _ => (final_x, final_y),
+                };
+                if let Some(rect) = window_rect {
+                    native_interop::move_window(
+                        hwnd,
+                        clamped_x,
+                        clamped_y,
+                        rect.right - rect.left,
+                        rect.bottom - rect.top,
+                    );
                 }
+                let mut state = lock_state();
+                if let Some(s) = state.as_mut() {
+                    s.manual_position = Some((clamped_x, clamped_y));
+                }
+                drop(state);
+                save_state_settings();
             }
             LRESULT(0)
+        }
+        WM_CAPTURECHANGED | WM_CANCELMODE => {
+            let cancelled_resize = {
+                let mut state = lock_state();
+                state
+                    .as_mut()
+                    .map(|state| clear_horizontal_resize_session(&mut state.resize_session))
+                    .unwrap_or(false)
+            };
+            if cancelled_resize {
+                if msg == WM_CANCELMODE {
+                    let _ = ReleaseCapture();
+                }
+                finish_horizontal_resize(hwnd);
+                LRESULT(0)
+            } else {
+                DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
         }
         WM_RBUTTONUP => {
             show_context_menu(hwnd);
@@ -5339,12 +5731,7 @@ unsafe extern "system" fn wnd_proc(
                     {
                         let mut state = lock_state();
                         if let Some(s) = state.as_mut() {
-                            s.tray_offset = 0;
-                            // AUM-WINDOW-UI-01C-2-STEP2: also clears any
-                            // runtime free-placement, so this menu item is
-                            // the manual→auto escape hatch as well as the
-                            // existing tray-offset reset.
-                            s.manual_position = None;
+                            reset_saved_position(&mut s.tray_offset, &mut s.manual_position);
                         }
                     }
                     save_state_settings();
@@ -6615,6 +7002,7 @@ fn paint(hdc: HDC, hwnd: HWND) {
 /// never passes `true` here.
 fn draw_provider_header_row(
     hdc: HDC,
+    client_width: i32,
     x: i32,
     y: i32,
     text_color: &Color,
@@ -6635,8 +7023,7 @@ fn draw_provider_header_row(
         show_antigravity,
         show_github_copilot,
     );
-    let segment_count = row_bar_segment_count(active_models);
-    let column_width = model_usage_width(segment_count);
+    let column_width = provider_column_width_for_client(client_width, active_models);
 
     unsafe {
         let _ = SetTextColor(hdc, COLORREF(text_color.to_colorref()));
@@ -6807,19 +7194,20 @@ fn draw_header_remaining_if_fits(
 /// shown — harmless, since every caller here gates on the matching
 /// `show_*` flag before using it.
 fn provider_column_x_positions(
+    client_width: i32,
     content_x: i32,
     show_claude_code: bool,
     show_codex: bool,
     show_antigravity: bool,
     show_github_copilot: bool,
 ) -> (i32, i32, i32) {
-    let segment_count = row_bar_segment_count(active_family_count(
+    let active_families = active_family_count(
         show_claude_code,
         show_codex,
         show_antigravity,
         show_github_copilot,
-    ));
-    let column_width = model_usage_width(segment_count);
+    );
+    let column_width = provider_column_width_for_client(client_width, active_families);
 
     let mut model_x = content_x + sc(LABEL_WIDTH) + sc(LABEL_RIGHT_MARGIN);
     let mut claude_x = 0;
@@ -6840,7 +7228,7 @@ fn provider_column_x_positions(
 }
 
 /// One line of pace-guidance text under a provider's column, sized to that
-/// provider's own bar+value column width (`model_usage_width`) — comfortable
+/// provider's dynamically allocated bar+value column width — comfortable
 /// for the common single-provider popup; a 2-3 provider layout may clip a
 /// long localized string. Not visually verified on this machine — see
 /// completion report.
@@ -6902,6 +7290,7 @@ struct RowCell<'a> {
 
 fn draw_row(
     hdc: HDC,
+    client_width: i32,
     x: i32,
     y: i32,
     text_color: &Color,
@@ -6914,6 +7303,10 @@ fn draw_row(
     let seg_h = sc(SEGMENT_H);
     let active_models = (cells.len() as i32).max(1);
     let segment_count = row_bar_segment_count(active_models);
+    let column_width = provider_column_width_for_client(client_width, active_models);
+    let text_width = (column_width
+        - usage_bar_device_width(segment_count, CURRENT_DPI.load(Ordering::Relaxed)))
+    .max(0);
     let use_model_text_colors = active_models > 1;
     // `is_warning` always wins the *value text* color, regardless of
     // `use_model_text_colors` — but never touches the bar segments below
@@ -6949,6 +7342,7 @@ fn draw_row(
                 model_x,
                 y,
                 segment_count,
+                text_width,
                 cell.percent,
                 cell.text,
                 cell.accent,
@@ -6957,16 +7351,10 @@ fn draw_row(
                 track_outline,
             );
             if index + 1 < cells.len() {
-                model_x += model_usage_width(segment_count) + sc(MODEL_RIGHT_MARGIN);
+                model_x += column_width + sc(MODEL_RIGHT_MARGIN);
             }
         }
     }
-}
-
-fn model_usage_width(segment_count: i32) -> i32 {
-    (sc(SEGMENT_W) + sc(SEGMENT_GAP)) * segment_count - sc(SEGMENT_GAP)
-        + sc(BAR_RIGHT_MARGIN)
-        + sc(TEXT_WIDTH)
 }
 
 /// A usage-bar cell has nothing to draw when there's no percentage *and* no
@@ -6998,6 +7386,7 @@ fn draw_usage_bar(
     bar_x: i32,
     y: i32,
     segment_count: i32,
+    text_width: i32,
     percent: Option<f64>,
     text: &str,
     accent: &Color,
@@ -7117,7 +7506,7 @@ fn draw_usage_bar(
         let mut text_rect = RECT {
             left: text_x,
             top: y,
-            right: text_x + sc(TEXT_WIDTH),
+            right: text_x + text_width,
             bottom: y + seg_h,
         };
         let _ = SetTextColor(hdc, COLORREF(text_color.to_colorref()));
@@ -7668,6 +8057,265 @@ mod tests {
         // popup_width (2000) > work area width (1920): must not panic on
         // clamp(min, max) with min > max, and must fall back to the left edge.
         assert_eq!(clamp_popup_x(500, 0, 1920, 2000), 0);
+    }
+
+    // ── Resizable widget geometry and persistence ───────────────────────
+
+    fn resize_session(
+        edge: HorizontalResizeEdge,
+        start_cursor_screen_x: i32,
+        start_window_rect: RECT,
+    ) -> HorizontalResizeSession {
+        HorizontalResizeSession {
+            edge,
+            start_cursor_screen_x,
+            start_window_rect,
+        }
+    }
+
+    #[test]
+    fn horizontal_resize_edge_detection_finds_left_right_and_center() {
+        let width = 600;
+        let edge = 6;
+        assert_eq!(
+            horizontal_resize_edge_at(0, width, edge),
+            Some(HorizontalResizeEdge::Left)
+        );
+        assert_eq!(
+            horizontal_resize_edge_at(5, width, edge),
+            Some(HorizontalResizeEdge::Left)
+        );
+        assert_eq!(horizontal_resize_edge_at(6, width, edge), None);
+        assert_eq!(horizontal_resize_edge_at(300, width, edge), None);
+        assert_eq!(
+            horizontal_resize_edge_at(594, width, edge),
+            Some(HorizontalResizeEdge::Right)
+        );
+        assert_eq!(
+            horizontal_resize_edge_at(599, width, edge),
+            Some(HorizontalResizeEdge::Right)
+        );
+        assert_eq!(horizontal_resize_edge_at(-1, width, edge), None);
+        assert_eq!(horizontal_resize_edge_at(width, width, edge), None);
+    }
+
+    #[test]
+    fn horizontal_resize_edge_width_scales_at_96_144_and_192_dpi() {
+        assert_eq!(horizontal_resize_edge_width_for_dpi(96), 6);
+        assert_eq!(horizontal_resize_edge_width_for_dpi(144), 9);
+        assert_eq!(horizontal_resize_edge_width_for_dpi(192), 12);
+    }
+
+    #[test]
+    fn right_resize_keeps_left_top_and_content_height_fixed() {
+        let start = RECT {
+            left: 100,
+            top: 200,
+            right: 500,
+            bottom: 300,
+        };
+        let rect = horizontal_resize_rect(
+            resize_session(HorizontalResizeEdge::Right, 500, start),
+            650,
+            315,
+            1200,
+            113,
+        );
+        assert_eq!((rect.left, rect.right), (100, 650));
+        assert_eq!((rect.top, rect.bottom), (200, 313));
+    }
+
+    #[test]
+    fn left_resize_keeps_right_top_and_content_height_fixed() {
+        let start = RECT {
+            left: 100,
+            top: 200,
+            right: 500,
+            bottom: 300,
+        };
+        let rect = horizontal_resize_rect(
+            resize_session(HorizontalResizeEdge::Left, 100, start),
+            -50,
+            315,
+            1200,
+            113,
+        );
+        assert_eq!((rect.left, rect.right), (-50, 500));
+        assert_eq!((rect.top, rect.bottom), (200, 313));
+    }
+
+    #[test]
+    fn horizontal_resize_clamps_to_minimum_and_maximum_widths() {
+        let start = RECT {
+            left: 100,
+            top: 200,
+            right: 500,
+            bottom: 300,
+        };
+        let session = resize_session(HorizontalResizeEdge::Right, 500, start);
+        let minimum = horizontal_resize_rect(session, -1000, 315, 1200, 113);
+        let maximum = horizontal_resize_rect(session, 5000, 315, 1200, 113);
+        assert_eq!(minimum.right - minimum.left, 315);
+        assert_eq!(maximum.right - maximum.left, 1200);
+        assert_eq!((minimum.left, maximum.left), (100, 100));
+        assert_eq!((minimum.top, minimum.bottom), (200, 313));
+        assert_eq!((maximum.top, maximum.bottom), (200, 313));
+    }
+
+    #[test]
+    fn resize_edge_takes_priority_over_header_drag() {
+        assert_eq!(
+            pointer_interaction_target(2, 10, 600, 6, 30),
+            PointerInteractionTarget::HorizontalResize(HorizontalResizeEdge::Left)
+        );
+        assert_eq!(
+            pointer_interaction_target(598, 10, 600, 6, 30),
+            PointerInteractionTarget::HorizontalResize(HorizontalResizeEdge::Right)
+        );
+        assert_eq!(
+            pointer_interaction_target(300, 10, 600, 6, 30),
+            PointerInteractionTarget::HeaderDrag
+        );
+        assert_eq!(
+            pointer_interaction_target(300, 40, 600, 6, 30),
+            PointerInteractionTarget::None
+        );
+    }
+
+    #[test]
+    fn completed_left_resize_updates_manual_x_and_logical_width() {
+        let rect = RECT {
+            left: -120,
+            top: 240,
+            right: 480,
+            bottom: 353,
+        };
+        let (logical_width, manual_position) =
+            completed_resize_settings(rect, 144, Some((100, 240)));
+        assert_eq!(logical_width, 400);
+        assert_eq!(manual_position, Some((-120, 240)));
+
+        let (_, automatic_position) = completed_resize_settings(rect, 144, None);
+        assert_eq!(automatic_position, None);
+    }
+
+    #[test]
+    fn cancel_or_capture_loss_clears_resize_session_once() {
+        let mut session = Some(resize_session(
+            HorizontalResizeEdge::Left,
+            100,
+            RECT {
+                left: 100,
+                top: 200,
+                right: 500,
+                bottom: 300,
+            },
+        ));
+        assert!(clear_horizontal_resize_session(&mut session));
+        assert!(session.is_none());
+        assert!(!clear_horizontal_resize_session(&mut session));
+    }
+
+    #[test]
+    fn legacy_settings_default_to_no_saved_width_or_position() {
+        let settings: SettingsFile = serde_json::from_str("{}").unwrap();
+        assert_eq!(settings.widget_width_logical, None);
+        assert_eq!(settings.manual_x, None);
+        assert_eq!(settings.manual_y, None);
+    }
+
+    #[test]
+    fn widget_width_and_manual_position_round_trip() {
+        let settings = SettingsFile {
+            widget_width_logical: Some(777),
+            manual_x: Some(-1200),
+            manual_y: Some(240),
+            ..SettingsFile::default()
+        };
+        let json = serde_json::to_string(&settings).unwrap();
+        let decoded: SettingsFile = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.widget_width_logical, Some(777));
+        assert_eq!(decoded.manual_x.zip(decoded.manual_y), Some((-1200, 240)));
+    }
+
+    #[test]
+    fn invalid_saved_width_is_clamped_without_affecting_other_settings() {
+        assert_eq!(normalize_saved_widget_width(Some(-50)), Some(1));
+        assert_eq!(normalize_saved_widget_width(Some(5000)), Some(1200));
+        assert_eq!(normalize_saved_widget_width(None), None);
+        assert_eq!(
+            resolved_widget_width_device(Some(1), 1, 96, 1920),
+            minimum_widget_width_logical_for(1)
+        );
+    }
+
+    #[test]
+    fn logical_and_device_widths_convert_across_dpi() {
+        assert_eq!(scaled_for_dpi(400, 96), 400);
+        assert_eq!(scaled_for_dpi(400, 144), 600);
+        assert_eq!(logical_from_device(600, 144), 400);
+    }
+
+    #[test]
+    fn provider_count_minimum_widths_match_layout_budgets() {
+        assert_eq!(minimum_widget_width_logical_for(1), 315);
+        assert_eq!(minimum_widget_width_logical_for(2), 353);
+        assert_eq!(minimum_widget_width_logical_for(3), 477);
+        assert_eq!(minimum_widget_width_logical_for(4), 623);
+    }
+
+    #[test]
+    fn client_width_is_distributed_evenly_to_provider_columns() {
+        assert_eq!(provider_column_width_for_client_at_dpi(315, 1, 96), 273);
+        assert_eq!(provider_column_width_for_client_at_dpi(353, 2, 96), 154);
+        assert_eq!(provider_column_width_for_client_at_dpi(477, 3, 96), 143);
+        assert_eq!(provider_column_width_for_client_at_dpi(623, 4, 96), 143);
+        assert_eq!(provider_column_width_for_client_at_dpi(1000, 4, 96), 237);
+    }
+
+    #[test]
+    fn default_position_is_work_area_bottom_right() {
+        let work_area = RECT {
+            left: 100,
+            top: 50,
+            right: 2020,
+            bottom: 1090,
+        };
+        assert_eq!(default_popup_position(work_area, 400, 90), (1620, 1000));
+    }
+
+    #[test]
+    fn saved_position_is_clamped_inside_current_work_area() {
+        let work_area = RECT {
+            left: -1920,
+            top: 0,
+            right: 0,
+            bottom: 1040,
+        };
+        assert_eq!(
+            clamp_position_to_work_area(work_area, 500, 100, -3000, 1200),
+            (-1920, 940)
+        );
+    }
+
+    #[test]
+    fn reset_position_clears_manual_coordinates_but_not_width() {
+        let mut tray_offset = 42;
+        let mut manual_position = Some((300, 400));
+        let width = Some(700);
+        reset_saved_position(&mut tray_offset, &mut manual_position);
+        assert_eq!(tray_offset, 0);
+        assert_eq!(manual_position, None);
+        assert_eq!(width, Some(700));
+    }
+
+    #[test]
+    fn geometry_height_changes_preserve_user_width() {
+        let before = resolved_widget_size_device(Some(700), 3, 96, 1920, 70);
+        let after = resolved_widget_size_device(Some(700), 3, 96, 1920, 140);
+        assert_eq!(before.0, 700);
+        assert_eq!(after.0, 700);
+        assert_eq!((before.1, after.1), (70, 140));
     }
 
     // ── AUM-WINDOW-UI-01C-2-STEP1: compute_auto_popup_position ─────────────
