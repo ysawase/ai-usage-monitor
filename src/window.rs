@@ -7382,6 +7382,7 @@ unsafe extern "system" fn wnd_proc(
                             s.force_notify_auth_error = true;
                         }
                     }
+                    sync_usage_geometry_if_needed(hwnd);
                     render_layered();
                     let sh = SendHwnd::from_hwnd(hwnd);
                     std::thread::spawn(move || {
