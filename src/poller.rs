@@ -1007,7 +1007,10 @@ fn cli_refresh_token(source: &CredentialSource) {
 
 #[cfg(feature = "legacy-auto-refresh")]
 fn cli_refresh_windows_token() {
-    let claude_path = resolve_windows_claude_path();
+    let Some(claude_path) = resolve_windows_claude_path() else {
+        diagnose::log("unable to resolve Windows Claude CLI for token refresh");
+        return;
+    };
     let is_cmd = claude_path.to_lowercase().ends_with(".cmd");
     diagnose::log(format!(
         "attempting Windows Claude token refresh via {claude_path}"
@@ -1126,41 +1129,83 @@ fn wait_for_refresh(child: &mut std::process::Child) {
     }
 }
 
-/// Resolve the full path to the `claude` CLI executable.
-#[cfg(feature = "legacy-auto-refresh")]
-fn resolve_windows_claude_path() -> String {
-    for name in &["claude.cmd", "claude"] {
-        if Command::new(name)
-            .arg("--version")
-            .creation_flags(CREATE_NO_WINDOW)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok()
-        {
-            return name.to_string();
+/// Resolve a usable Windows Claude CLI executable without assuming that a
+/// stale credential file means the CLI is still installed.
+pub(crate) fn resolve_windows_claude_path() -> Option<String> {
+    let mut candidates = Vec::new();
+    if let Some(home) = resolve_user_home() {
+        candidates.push(home.join(".local").join("bin").join("claude.exe"));
+        candidates.push(home.join(".local").join("bin").join("claude.cmd"));
+    }
+    if let Some(appdata) = std::env::var_os("APPDATA") {
+        let appdata = PathBuf::from(appdata);
+        candidates.push(appdata.join("npm").join("claude.cmd"));
+        candidates.push(appdata.join("npm").join("claude.exe"));
+    }
+    if let Some(local_appdata) = std::env::var_os("LOCALAPPDATA") {
+        candidates.push(
+            PathBuf::from(local_appdata)
+                .join("Microsoft")
+                .join("WinGet")
+                .join("Links")
+                .join("claude.exe"),
+        );
+    }
+    for candidate in candidates {
+        if candidate.is_file() {
+            return Some(candidate.to_string_lossy().into_owned());
         }
     }
 
-    for name in &["claude.cmd", "claude"] {
+    for name in &["claude.exe", "claude.cmd", "claude"] {
         if let Ok(output) = Command::new("where.exe")
             .arg(name)
             .creation_flags(CREATE_NO_WINDOW)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
             .output()
         {
             if output.status.success() {
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 if let Some(first_line) = stdout.lines().next() {
-                    let path = first_line.trim().to_string();
+                    let path = first_line.trim();
                     if !path.is_empty() {
-                        return path;
+                        return Some(path.to_string());
                     }
                 }
             }
         }
     }
 
-    "claude.cmd".to_string()
+    None
+}
+
+pub(crate) fn claude_auth_launch_target() -> Option<ClaudeAuthLaunchTarget> {
+    if let Some(creds) = read_first_credentials() {
+        match creds.source {
+            CredentialSource::Windows(_) => {
+                if let Some(path) = resolve_windows_claude_path() {
+                    return Some(ClaudeAuthLaunchTarget::Windows(path));
+                }
+            }
+            CredentialSource::Wsl { distro } => {
+                if wsl_has_claude(&distro) {
+                    return Some(ClaudeAuthLaunchTarget::Wsl { distro });
+                }
+            }
+        }
+    }
+
+    if let Some(path) = resolve_windows_claude_path() {
+        return Some(ClaudeAuthLaunchTarget::Windows(path));
+    }
+    for distro in list_wsl_distros() {
+        if wsl_has_claude(&distro) {
+            return Some(ClaudeAuthLaunchTarget::Wsl { distro });
+        }
+    }
+
+    None
 }
 
 pub(crate) fn resolve_windows_codex_path() -> Option<String> {
@@ -1177,10 +1222,38 @@ pub(crate) fn resolve_windows_codex_path() -> Option<String> {
         }
     }
 
+    let mut candidates = Vec::new();
+    if let Some(home) = resolve_user_home() {
+        candidates.push(home.join(".local").join("bin").join("codex.exe"));
+        candidates.push(home.join(".local").join("bin").join("codex.cmd"));
+        candidates.push(home.join(".local").join("bin").join("codex.ps1"));
+    }
+    if let Some(appdata) = std::env::var_os("APPDATA") {
+        let appdata = PathBuf::from(appdata);
+        candidates.push(appdata.join("npm").join("codex.cmd"));
+        candidates.push(appdata.join("npm").join("codex.ps1"));
+        candidates.push(appdata.join("npm").join("codex.exe"));
+    }
+    if let Some(local_appdata) = std::env::var_os("LOCALAPPDATA") {
+        let links = PathBuf::from(local_appdata)
+            .join("Microsoft")
+            .join("WinGet")
+            .join("Links");
+        candidates.push(links.join("codex.exe"));
+        candidates.push(links.join("codex.cmd"));
+    }
+    for candidate in candidates {
+        if candidate.is_file() {
+            return Some(candidate.to_string_lossy().into_owned());
+        }
+    }
+
     for name in &["codex.cmd", "codex.ps1", "codex.exe", "codex"] {
         if let Ok(output) = Command::new("where.exe")
             .arg(name)
             .creation_flags(CREATE_NO_WINDOW)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
             .output()
         {
             if output.status.success() {
@@ -1813,18 +1886,43 @@ enum CredentialSource {
     Wsl { distro: String },
 }
 
-fn read_first_credentials() -> Option<Credentials> {
-    if let Some(creds) = read_windows_credentials() {
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ClaudeAuthLaunchTarget {
+    Windows(String),
+    Wsl { distro: String },
+}
+
+fn prefer_current_credentials(
+    first_expired: &mut Option<Credentials>,
+    creds: Credentials,
+) -> Option<Credentials> {
+    if !is_token_expired(creds.expires_at) {
         return Some(creds);
+    }
+    if first_expired.is_none() {
+        *first_expired = Some(creds);
+    }
+    None
+}
+
+fn read_first_credentials() -> Option<Credentials> {
+    let mut first_expired = None;
+
+    if let Some(creds) = read_windows_credentials() {
+        if let Some(current) = prefer_current_credentials(&mut first_expired, creds) {
+            return Some(current);
+        }
     }
 
     for distro in list_wsl_distros() {
         if let Some(creds) = read_wsl_credentials(&distro) {
-            return Some(creds);
+            if let Some(current) = prefer_current_credentials(&mut first_expired, creds) {
+                return Some(current);
+            }
         }
     }
 
-    None
+    first_expired
 }
 
 fn read_windows_credentials() -> Option<Credentials> {
@@ -1958,6 +2056,25 @@ fn list_wsl_distros() -> Vec<String> {
         .filter(|line| !line.is_empty())
         .map(ToOwned::to_owned)
         .collect()
+}
+
+fn wsl_has_claude(distro: &str) -> bool {
+    match run_with_timeout(
+        Command::new("wsl.exe")
+            .arg("-d")
+            .arg(distro)
+            .arg("--")
+            .arg("bash")
+            .arg("-lic")
+            .arg("command -v claude >/dev/null 2>&1 || [ -x \"$HOME/.local/bin/claude\" ]")
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null()),
+        Duration::from_secs(5),
+    ) {
+        Some(output) => output.status.success(),
+        None => false,
+    }
 }
 
 fn decode_wsl_text(bytes: &[u8]) -> String {
@@ -2227,6 +2344,33 @@ mod tests {
             path,
             PathBuf::from(r"C:\Users\sandbox\.claude\.credentials.json")
         );
+    }
+
+    #[test]
+    fn expired_windows_credentials_do_not_hide_current_wsl_credentials() {
+        let mut first_expired = None;
+        let windows = Credentials {
+            access_token: "expired".to_string(),
+            expires_at: Some(0),
+            source: CredentialSource::Windows(PathBuf::from(
+                r"C:\Users\sandbox\.claude\.credentials.json",
+            )),
+        };
+        assert!(prefer_current_credentials(&mut first_expired, windows).is_none());
+
+        let wsl = Credentials {
+            access_token: "current".to_string(),
+            expires_at: None,
+            source: CredentialSource::Wsl {
+                distro: "Ubuntu".to_string(),
+            },
+        };
+        let selected = prefer_current_credentials(&mut first_expired, wsl)
+            .expect("current WSL credentials should be selected");
+        assert!(matches!(
+            selected.source,
+            CredentialSource::Wsl { ref distro } if distro == "Ubuntu"
+        ));
     }
 
     #[test]
