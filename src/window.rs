@@ -1411,7 +1411,11 @@ fn format_window_time_with_reset_mode(
             DisplayBasis::UsedPercentage => {
                 let elapsed_secs = elapsed_secs?;
                 let duration = format_duration(elapsed_secs, granularity, strings);
-                Some(format!("{} {duration}", strings.elapsed))
+                if compact_japanese_text(strings) {
+                    Some(format!("{duration}{}", strings.elapsed))
+                } else {
+                    Some(format!("{} {duration}", strings.elapsed))
+                }
             }
             DisplayBasis::RemainingAllowance => {
                 let duration = format_duration(remaining_secs?, granularity, strings);
@@ -1539,6 +1543,19 @@ fn pace_basis_prefix(basis: DisplayBasis, strings: Strings) -> &'static str {
     }
 }
 
+fn compact_japanese_text(strings: Strings) -> bool {
+    strings.window_title == LanguageId::Japanese.strings().window_title
+}
+
+fn pace_percent_text(basis: DisplayBasis, display_pct: f64, strings: Strings) -> String {
+    let prefix = pace_basis_prefix(basis, strings);
+    if compact_japanese_text(strings) {
+        format!("{prefix}{display_pct:.0}%")
+    } else {
+        format!("{prefix} {display_pct:.0}%")
+    }
+}
+
 /// Builds the weekly (7d) window's pace-guidance display, or `None` when
 /// `used_percent` itself is unknown or non-finite (nothing to show at all —
 /// distinct from a known value with unusable reset data, which still shows
@@ -1559,7 +1576,7 @@ fn weekly_pace_guidance_lines_with_reset_mode(
     let used_percent = used_percent.clamp(0.0, 100.0);
 
     let display_pct = display_value(basis, used_percent);
-    let pct_text = format!("{} {display_pct:.0}%", pace_basis_prefix(basis, strings));
+    let pct_text = pace_percent_text(basis, display_pct, strings);
 
     let remaining_secs = remaining_secs_at(resets_at, now);
     let elapsed_secs = remaining_secs.and_then(|r| elapsed_secs_in_window(r, WEEKLY_WINDOW_SECS));
@@ -1717,7 +1734,7 @@ fn short_window_pace_guidance_lines_with_reset_mode(
     }
 
     let display_pct = display_value(basis, used_percent);
-    let pct_text = format!("{} {display_pct:.0}%", pace_basis_prefix(basis, strings));
+    let pct_text = pace_percent_text(basis, display_pct, strings);
     let status_suffix = if is_overpacing {
         format!(" {}", strings.weekly_pace_overpacing)
     } else {
@@ -9825,8 +9842,21 @@ mod tests {
         let strings = LanguageId::Japanese.strings();
         assert_eq!(strings.authentication_expired, "認証切れ");
         assert_eq!(strings.credentials_unavailable, "認証情報を確認できません");
-        assert_eq!(strings.authentication_problem, "認証を確認してください");
+        assert_eq!(strings.authentication_problem, "認証要確認");
         assert_eq!(strings.fetch_failed, "取得失敗");
+    }
+    #[test]
+    fn japanese_compact_copy_keeps_usage_meaning() {
+        let strings = LanguageId::Japanese.strings();
+        assert_eq!(
+            pace_percent_text(DisplayBasis::UsedPercentage, 42.0, strings),
+            "使用42%"
+        );
+        assert_eq!(
+            pace_percent_text(DisplayBasis::RemainingAllowance, 58.0, strings),
+            "残58%"
+        );
+        assert_eq!(strings.pace_diff_label, "予定差");
     }
 
     // ── AUTH-RECOVERY-CTA-IMPLEMENT-01: only a high-confidence auth state,
@@ -13010,7 +13040,7 @@ mod tests {
                 strings,
             )
             .as_deref(),
-            Some("あと6日8時間")
+            Some("あと6日8h")
         );
         assert_eq!(
             format_window_time(
@@ -13021,7 +13051,7 @@ mod tests {
                 strings,
             )
             .as_deref(),
-            Some("あと3時間16分")
+            Some("あと3h16m")
         );
     }
 
@@ -13048,7 +13078,7 @@ mod tests {
             strings,
         );
         assert_eq!(selected, existing);
-        assert_eq!(selected.as_deref(), Some("あと2日5時間"));
+        assert_eq!(selected.as_deref(), Some("あと2日5h"));
     }
 
     #[test]
@@ -13068,7 +13098,7 @@ mod tests {
         )
         .unwrap();
         let reset_text = format_absolute_reset_time(Some(reset_at), now, strings).unwrap();
-        assert_eq!(text, "経過 2時間0分");
+        assert_eq!(text, "2h0m経過");
         assert!(!text.contains(&reset_text));
     }
 
@@ -13712,7 +13742,7 @@ mod tests {
         let strings = LanguageId::Japanese.strings();
         let remaining = Duration::from_secs(5 * 86400 + 23 * 3600);
         let text = compact_weekly_remaining_text(Some(now + remaining), now, strings);
-        assert_eq!(text.as_deref(), Some("残り 5日23時間"));
+        assert_eq!(text.as_deref(), Some("残 5日23h"));
     }
 
     #[test]
@@ -13721,7 +13751,7 @@ mod tests {
         let strings = LanguageId::Japanese.strings();
         let remaining = Duration::from_secs(10 * 3600 + 30 * 60);
         let text = compact_weekly_remaining_text(Some(now + remaining), now, strings);
-        assert_eq!(text.as_deref(), Some("残り 10時間"));
+        assert_eq!(text.as_deref(), Some("残 10h"));
     }
 
     #[test]
@@ -13730,7 +13760,7 @@ mod tests {
         let strings = LanguageId::Japanese.strings();
         let remaining = Duration::from_secs(5 * 60 + 30);
         let text = compact_weekly_remaining_text(Some(now + remaining), now, strings);
-        assert_eq!(text.as_deref(), Some("残り 0時間"));
+        assert_eq!(text.as_deref(), Some("残 0h"));
     }
 
     #[test]
