@@ -22,6 +22,7 @@ pub mod diagnose;
 pub mod antigravity_statusline;
 pub mod localization;
 pub mod models;
+mod poll_diagnostics;
 pub mod poller;
 pub mod vercel_ai_gateway;
 

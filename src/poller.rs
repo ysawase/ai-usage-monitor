@@ -125,6 +125,152 @@ pub(crate) enum ProviderPollOutcome {
         error: PollError,
     },
 }
+#[derive(Default)]
+struct ProviderPollDiagnosticEntry {
+    last_success_at: Option<SystemTime>,
+    last_error: Option<PollError>,
+}
+
+#[derive(Default)]
+struct ProviderPollDiagnosticState {
+    entries: [ProviderPollDiagnosticEntry; 5],
+}
+
+static PROVIDER_POLL_DIAGNOSTICS: OnceLock<Mutex<ProviderPollDiagnosticState>> = OnceLock::new();
+
+fn provider_diagnostic_index(provider: QuotaFamilyId) -> usize {
+    match provider {
+        QuotaFamilyId::Claude => 0,
+        QuotaFamilyId::Codex => 1,
+        QuotaFamilyId::Antigravity => 2,
+        QuotaFamilyId::GithubCopilot => 3,
+        QuotaFamilyId::VercelAiGateway => 4,
+    }
+}
+
+fn provider_poll_source_diagnostic_name(source: ProviderPollSource) -> &'static str {
+    match source {
+        ProviderPollSource::AnthropicOauthUsage => "anthropic_oauth_usage",
+        ProviderPollSource::ChatgptWhamUsage => "codex_app_server",
+        ProviderPollSource::AntigravityQuotaUsage => "antigravity_statusline_cache",
+        ProviderPollSource::GithubBillingApi => "github_billing_api",
+        ProviderPollSource::VercelAiGatewayQuotasApi => "vercel_ai_gateway_quotas_api",
+    }
+}
+
+fn poll_error_diagnostic_name(error: PollError) -> &'static str {
+    match error {
+        PollError::AuthRequired => "auth_required",
+        PollError::NoCredentials => "no_credentials",
+        PollError::TokenExpired => "token_expired",
+        PollError::RequestFailed => "request_failed",
+    }
+}
+
+fn system_time_unix_text(time: Option<SystemTime>) -> String {
+    match time {
+        Some(time) => time
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_secs().to_string())
+            .unwrap_or_else(|_| "unknown".to_string()),
+        None => "none".to_string(),
+    }
+}
+
+fn format_provider_poll_failure_diagnostic(
+    provider: QuotaFamilyId,
+    source: ProviderPollSource,
+    error: PollError,
+    attempted_at: SystemTime,
+    last_success_at: Option<SystemTime>,
+) -> String {
+    format!(
+        "provider_poll provider={} source={} result=error class={} attempted_at_unix={} last_success_at_unix={}",
+        provider.stable_id(),
+        provider_poll_source_diagnostic_name(source),
+        poll_error_diagnostic_name(error),
+        system_time_unix_text(Some(attempted_at)),
+        system_time_unix_text(last_success_at),
+    )
+}
+
+fn format_provider_poll_recovery_diagnostic(
+    provider: QuotaFamilyId,
+    source: ProviderPollSource,
+    previous_error: PollError,
+    attempted_at: SystemTime,
+    acquired_at: SystemTime,
+) -> String {
+    let latency_ms = acquired_at
+        .duration_since(attempted_at)
+        .map(|duration| duration.as_millis().to_string())
+        .unwrap_or_else(|_| "unknown".to_string());
+
+    format!(
+        "provider_poll provider={} source={} result=recovered previous_class={} attempted_at_unix={} acquired_at_unix={} latency_ms={}",
+        provider.stable_id(),
+        provider_poll_source_diagnostic_name(source),
+        poll_error_diagnostic_name(previous_error),
+        system_time_unix_text(Some(attempted_at)),
+        system_time_unix_text(Some(acquired_at)),
+        latency_ms,
+    )
+}
+
+/// Records only sanitized polling metadata. Never logs credentials, tokens,
+/// API keys, response bodies, prompts, or quota payload values.
+fn record_provider_poll_diagnostic(provider: QuotaFamilyId, outcome: &ProviderPollOutcome) {
+    let diagnostics = PROVIDER_POLL_DIAGNOSTICS
+        .get_or_init(|| Mutex::new(ProviderPollDiagnosticState::default()));
+
+    let line = {
+        let mut diagnostics = diagnostics.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = &mut diagnostics.entries[provider_diagnostic_index(provider)];
+
+        match outcome {
+            ProviderPollOutcome::Disabled => None,
+            ProviderPollOutcome::Success {
+                source,
+                attempted_at,
+                acquired_at,
+                ..
+            } => {
+                let previous_error = entry.last_error.take();
+                entry.last_success_at = Some(*acquired_at);
+
+                previous_error.map(|error| {
+                    format_provider_poll_recovery_diagnostic(
+                        provider,
+                        *source,
+                        error,
+                        *attempted_at,
+                        *acquired_at,
+                    )
+                })
+            }
+            ProviderPollOutcome::Error {
+                source,
+                attempted_at,
+                error,
+            } => {
+                let line = format_provider_poll_failure_diagnostic(
+                    provider,
+                    *source,
+                    *error,
+                    *attempted_at,
+                    entry.last_success_at,
+                );
+                entry.last_error = Some(*error);
+                Some(line)
+            }
+        }
+    };
+
+    if let Some(line) = line {
+        crate::poll_diagnostics::append_sanitized(&line);
+        diagnose::log(line);
+    }
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct PollReport {
@@ -391,6 +537,7 @@ pub(crate) fn poll_report_with_github_copilot_updates(
         &mut || poll_github_copilot(github_copilot_plan),
         &mut SystemTime::now,
     );
+    record_provider_poll_diagnostic(QuotaFamilyId::GithubCopilot, &report.github_copilot);
     on_provider_complete(QuotaFamilyId::GithubCopilot, &report.github_copilot);
     report
 }
@@ -426,6 +573,7 @@ pub(crate) fn poll_report_with_github_copilot_and_vercel_updates(
         &mut || crate::vercel_ai_gateway::poll(),
         &mut SystemTime::now,
     );
+    record_provider_poll_diagnostic(QuotaFamilyId::VercelAiGateway, &report.vercel_ai_gateway);
     on_provider_complete(QuotaFamilyId::VercelAiGateway, &report.vercel_ai_gateway);
 
     report
@@ -523,15 +671,13 @@ fn poll_report_with_clock_and_updates(
     mut now: impl FnMut() -> SystemTime,
     on_provider_complete: &mut impl FnMut(QuotaFamilyId, &ProviderPollOutcome),
 ) -> PollReport {
-    let active_provider_count = show_claude_code as u8 + show_codex as u8 + show_antigravity as u8;
-
     let claude_code = poll_provider(
         show_claude_code,
         ProviderPollSource::AnthropicOauthUsage,
         &mut poll_claude_code,
         &mut now,
     );
-    log_partial_failure("Claude Code", &claude_code, active_provider_count);
+    record_provider_poll_diagnostic(QuotaFamilyId::Claude, &claude_code);
     on_provider_complete(QuotaFamilyId::Claude, &claude_code);
 
     let codex = poll_provider(
@@ -540,7 +686,7 @@ fn poll_report_with_clock_and_updates(
         &mut poll_codex,
         &mut now,
     );
-    log_partial_failure("Codex", &codex, active_provider_count);
+    record_provider_poll_diagnostic(QuotaFamilyId::Codex, &codex);
     on_provider_complete(QuotaFamilyId::Codex, &codex);
 
     let antigravity_source = ProviderPollSource::AntigravityQuotaUsage;
@@ -551,7 +697,7 @@ fn poll_report_with_clock_and_updates(
         &mut poll_antigravity,
         &mut now,
     );
-    log_partial_failure("Antigravity", &antigravity, active_provider_count);
+    record_provider_poll_diagnostic(QuotaFamilyId::Antigravity, &antigravity);
     on_provider_complete(QuotaFamilyId::Antigravity, &antigravity);
 
     PollReport {
@@ -586,18 +732,6 @@ fn poll_provider(
             attempted_at,
             error,
         },
-    }
-}
-
-fn log_partial_failure(
-    provider_name: &str,
-    outcome: &ProviderPollOutcome,
-    active_provider_count: u8,
-) {
-    if active_provider_count > 1 {
-        if let ProviderPollOutcome::Error { error, .. } = outcome {
-            diagnose::log(format!("{provider_name} usage poll failed: {error:?}"));
-        }
     }
 }
 
@@ -2033,6 +2167,38 @@ pub fn app_is_past_reset(data: &AppUsageData) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_poll_failure_diagnostic_contains_safe_triage_metadata() {
+        let line = format_provider_poll_failure_diagnostic(
+            QuotaFamilyId::Claude,
+            ProviderPollSource::AnthropicOauthUsage,
+            PollError::RequestFailed,
+            UNIX_EPOCH + Duration::from_secs(200),
+            Some(UNIX_EPOCH + Duration::from_secs(100)),
+        );
+
+        assert_eq!(
+            line,
+            "provider_poll provider=claude source=anthropic_oauth_usage result=error class=request_failed attempted_at_unix=200 last_success_at_unix=100"
+        );
+    }
+
+    #[test]
+    fn provider_poll_recovery_diagnostic_reports_previous_class_and_latency() {
+        let line = format_provider_poll_recovery_diagnostic(
+            QuotaFamilyId::Codex,
+            ProviderPollSource::ChatgptWhamUsage,
+            PollError::AuthRequired,
+            UNIX_EPOCH + Duration::from_secs(500),
+            UNIX_EPOCH + Duration::from_millis(500_250),
+        );
+
+        assert_eq!(
+            line,
+            "provider_poll provider=codex source=codex_app_server result=recovered previous_class=auth_required attempted_at_unix=500 acquired_at_unix=500 latency_ms=250"
+        );
+    }
 
     #[test]
     fn user_home_prefers_dirs_value() {
