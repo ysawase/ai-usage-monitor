@@ -9,6 +9,7 @@ mod diagnose;
 mod localization;
 mod models;
 mod native_interop;
+mod poll_diagnostics;
 mod poller;
 mod snapshot_schema;
 mod snapshot_store;

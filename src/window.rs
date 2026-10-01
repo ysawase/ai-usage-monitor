@@ -1411,7 +1411,11 @@ fn format_window_time_with_reset_mode(
             DisplayBasis::UsedPercentage => {
                 let elapsed_secs = elapsed_secs?;
                 let duration = format_duration(elapsed_secs, granularity, strings);
-                Some(format!("{} {duration}", strings.elapsed))
+                if compact_japanese_text(strings) {
+                    Some(format!("{duration}{}", strings.elapsed))
+                } else {
+                    Some(format!("{} {duration}", strings.elapsed))
+                }
             }
             DisplayBasis::RemainingAllowance => {
                 let duration = format_duration(remaining_secs?, granularity, strings);
@@ -1539,6 +1543,19 @@ fn pace_basis_prefix(basis: DisplayBasis, strings: Strings) -> &'static str {
     }
 }
 
+fn compact_japanese_text(strings: Strings) -> bool {
+    strings.window_title == LanguageId::Japanese.strings().window_title
+}
+
+fn pace_percent_text(basis: DisplayBasis, display_pct: f64, strings: Strings) -> String {
+    let prefix = pace_basis_prefix(basis, strings);
+    if compact_japanese_text(strings) {
+        format!("{prefix}{display_pct:.0}%")
+    } else {
+        format!("{prefix} {display_pct:.0}%")
+    }
+}
+
 /// Builds the weekly (7d) window's pace-guidance display, or `None` when
 /// `used_percent` itself is unknown or non-finite (nothing to show at all —
 /// distinct from a known value with unusable reset data, which still shows
@@ -1559,7 +1576,7 @@ fn weekly_pace_guidance_lines_with_reset_mode(
     let used_percent = used_percent.clamp(0.0, 100.0);
 
     let display_pct = display_value(basis, used_percent);
-    let pct_text = format!("{} {display_pct:.0}%", pace_basis_prefix(basis, strings));
+    let pct_text = pace_percent_text(basis, display_pct, strings);
 
     let remaining_secs = remaining_secs_at(resets_at, now);
     let elapsed_secs = remaining_secs.and_then(|r| elapsed_secs_in_window(r, WEEKLY_WINDOW_SECS));
@@ -1717,7 +1734,7 @@ fn short_window_pace_guidance_lines_with_reset_mode(
     }
 
     let display_pct = display_value(basis, used_percent);
-    let pct_text = format!("{} {display_pct:.0}%", pace_basis_prefix(basis, strings));
+    let pct_text = pace_percent_text(basis, display_pct, strings);
     let status_suffix = if is_overpacing {
         format!(" {}", strings.weekly_pace_overpacing)
     } else {
@@ -4103,57 +4120,111 @@ fn quota_row_visible(provider_cells: &[(bool, bool)]) -> bool {
         .any(|(provider_is_shown, cell_is_enabled)| *provider_is_shown && *cell_is_enabled)
 }
 
-fn needs_weekly_row(state: &AppState) -> bool {
-    quota_row_visible(&[
-        (state.show_claude_code, true),
-        (state.show_codex, true),
-        (state.show_antigravity, true),
-        // GitHub Copilot and Vercel AI Gateway do not use the weekly row.
-        (state.show_github_copilot, false),
-        (state.show_vercel_ai_gateway, false),
-    ])
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ProviderVisibility {
+    show_claude_code: bool,
+    show_codex: bool,
+    show_antigravity: bool,
+    show_github_copilot: bool,
+    show_vercel_ai_gateway: bool,
 }
 
-fn needs_monthly_row(state: &AppState) -> bool {
-    quota_row_visible(&[
-        (state.show_claude_code, false),
-        (state.show_codex, false),
-        (state.show_antigravity, false),
-        (state.show_github_copilot, true),
-        (state.show_vercel_ai_gateway, true),
-    ])
+impl ProviderVisibility {
+    fn from_state(state: &AppState) -> Self {
+        Self {
+            show_claude_code: state.show_claude_code,
+            show_codex: state.show_codex,
+            show_antigravity: state.show_antigravity,
+            show_github_copilot: state.show_github_copilot,
+            show_vercel_ai_gateway: state.show_vercel_ai_gateway,
+        }
+    }
+
+    fn weekly_row(self) -> bool {
+        quota_row_visible(&[
+            (self.show_claude_code, true),
+            (self.show_codex, true),
+            (self.show_antigravity, true),
+            (self.show_github_copilot, false),
+            (self.show_vercel_ai_gateway, false),
+        ])
+    }
+
+    fn monthly_row(self) -> bool {
+        quota_row_visible(&[
+            (self.show_claude_code, false),
+            (self.show_codex, false),
+            (self.show_antigravity, false),
+            (self.show_github_copilot, true),
+            (self.show_vercel_ai_gateway, true),
+        ])
+    }
 }
 
-fn needs_session_row(state: &AppState) -> bool {
-    let visibility = state.short_window_visibility;
-    let claude_shows = session_row_cell_shows(
-        state.session_state,
-        state.session_percent,
-        &state.session_text,
-        state.session_pace.as_ref(),
-        visibility,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SessionRowShows {
+    claude_code: bool,
+    codex: bool,
+    antigravity: bool,
+}
+
+impl SessionRowShows {
+    fn from_state(state: &AppState) -> Self {
+        let visibility = state.short_window_visibility;
+        Self {
+            claude_code: session_row_cell_shows(
+                state.session_state,
+                state.session_percent,
+                &state.session_text,
+                state.session_pace.as_ref(),
+                visibility,
+            ),
+            codex: session_row_cell_shows(
+                state.codex_session_state,
+                state.codex_session_percent,
+                &state.codex_session_text,
+                state.codex_session_pace.as_ref(),
+                visibility,
+            ),
+            antigravity: session_row_cell_shows(
+                state.antigravity_session_state,
+                state.antigravity_session_percent,
+                &state.antigravity_session_text,
+                state.antigravity_session_pace.as_ref(),
+                visibility,
+            ),
+        }
+    }
+}
+
+fn popup_visible_rows(
+    layout: PopupLayout,
+    providers: ProviderVisibility,
+    weekly_extra_lines: i32,
+    session_shows: SessionRowShows,
+    antigravity_extra_item_count: i32,
+) -> VisibleRows {
+    let session_row = session_row_visible(
+        providers.show_claude_code,
+        session_shows.claude_code,
+        providers.show_codex,
+        session_shows.codex,
+        providers.show_antigravity,
+        session_shows.antigravity,
     );
-    let codex_shows = session_row_cell_shows(
-        state.codex_session_state,
-        state.codex_session_percent,
-        &state.codex_session_text,
-        state.codex_session_pace.as_ref(),
-        visibility,
-    );
-    let antigravity_shows = session_row_cell_shows(
-        state.antigravity_session_state,
-        state.antigravity_session_percent,
-        &state.antigravity_session_text,
-        state.antigravity_session_pace.as_ref(),
-        visibility,
-    );
-    session_row_visible(
-        state.show_claude_code,
-        claude_shows,
-        state.show_codex,
-        codex_shows,
-        state.show_antigravity,
-        antigravity_shows,
+    let antigravity_extra_rows = if providers.show_antigravity {
+        antigravity_extra_item_count
+    } else {
+        0
+    };
+
+    visible_rows_for_quota(
+        layout,
+        providers.weekly_row(),
+        weekly_extra_lines,
+        session_row,
+        providers.monthly_row(),
+        antigravity_extra_rows,
     )
 }
 
@@ -4243,12 +4314,11 @@ fn popup_height_logical(rows: VisibleRows) -> i32 {
 /// of a `&AppState`-taking variant (used where a lock is already held)
 /// alongside a self-locking `widget_height()` convenience wrapper below.
 fn widget_height_for_state(state: &AppState) -> i32 {
-    let rows = visible_rows_for_quota(
+    let rows = popup_visible_rows(
         state.popup_layout,
-        needs_weekly_row(state),
+        ProviderVisibility::from_state(state),
         weekly_pace_extra_lines(state),
-        needs_session_row(state),
-        needs_monthly_row(state),
+        SessionRowShows::from_state(state),
         state.antigravity_extra_items.len() as i32,
     );
     widget_height_for_rows(rows)
@@ -5706,50 +5776,41 @@ fn paint_content(
             antigravity_session_pace,
             short_window_visibility,
         );
-        let needs_session_row = session_row_visible(
+        let providers = ProviderVisibility {
             show_claude_code,
-            session_row_cell_shows(
+            show_codex,
+            show_antigravity,
+            show_github_copilot,
+            show_vercel_ai_gateway,
+        };
+        let session_shows = SessionRowShows {
+            claude_code: session_row_cell_shows(
                 session_state,
                 session_pct,
                 session_text,
                 session_pace,
                 short_window_visibility,
             ),
-            show_codex,
-            session_row_cell_shows(
+            codex: session_row_cell_shows(
                 codex_session_state,
                 codex_session_pct,
                 codex_session_text,
                 codex_session_pace,
                 short_window_visibility,
             ),
-            show_antigravity,
-            session_row_cell_shows(
+            antigravity: session_row_cell_shows(
                 antigravity_session_state,
                 antigravity_session_pct,
                 antigravity_session_text,
                 antigravity_session_pace,
                 short_window_visibility,
             ),
-        );
-        let needs_weekly_row = quota_row_visible(&[
-            (show_claude_code, true),
-            (show_codex, true),
-            (show_antigravity, true),
-            (show_github_copilot, false),
-        ]);
-        let needs_monthly_row = quota_row_visible(&[
-            (show_claude_code, false),
-            (show_codex, false),
-            (show_antigravity, false),
-            (show_github_copilot, true),
-        ]);
-        let rows = visible_rows_for_quota(
+        };
+        let rows = popup_visible_rows(
             popup_layout,
-            needs_weekly_row,
+            providers,
             weekly_lines,
-            needs_session_row,
-            needs_monthly_row,
+            session_shows,
             antigravity_extra_items.len() as i32,
         );
         let layout = pace_row_layout(height, rows);
@@ -6979,6 +7040,10 @@ unsafe extern "system" fn wnd_proc(
                 }
                 TIMER_COUNTDOWN => {
                     update_display();
+                    // Countdown-driven pace changes can add/remove rows or
+                    // detail lines, so synchronize the real window size
+                    // before painting the newly computed layout.
+                    sync_usage_geometry_if_needed(hwnd);
                     render_layered();
                     schedule_countdown_timer();
                 }
@@ -7380,6 +7445,7 @@ unsafe extern "system" fn wnd_proc(
                             s.force_notify_auth_error = true;
                         }
                     }
+                    sync_usage_geometry_if_needed(hwnd);
                     render_layered();
                     let sh = SendHwnd::from_hwnd(hwnd);
                     std::thread::spawn(move || {
@@ -9822,8 +9888,21 @@ mod tests {
         let strings = LanguageId::Japanese.strings();
         assert_eq!(strings.authentication_expired, "認証切れ");
         assert_eq!(strings.credentials_unavailable, "認証情報を確認できません");
-        assert_eq!(strings.authentication_problem, "認証を確認してください");
+        assert_eq!(strings.authentication_problem, "認証要確認");
         assert_eq!(strings.fetch_failed, "取得失敗");
+    }
+    #[test]
+    fn japanese_compact_copy_keeps_usage_meaning() {
+        let strings = LanguageId::Japanese.strings();
+        assert_eq!(
+            pace_percent_text(DisplayBasis::UsedPercentage, 42.0, strings),
+            "使用42%"
+        );
+        assert_eq!(
+            pace_percent_text(DisplayBasis::RemainingAllowance, 58.0, strings),
+            "残58%"
+        );
+        assert_eq!(strings.pace_diff_label, "予定差");
     }
 
     // ── AUTH-RECOVERY-CTA-IMPLEMENT-01: only a high-confidence auth state,
@@ -13007,7 +13086,7 @@ mod tests {
                 strings,
             )
             .as_deref(),
-            Some("あと6日8時間")
+            Some("あと6日8h")
         );
         assert_eq!(
             format_window_time(
@@ -13018,7 +13097,7 @@ mod tests {
                 strings,
             )
             .as_deref(),
-            Some("あと3時間16分")
+            Some("あと3h16m")
         );
     }
 
@@ -13045,7 +13124,7 @@ mod tests {
             strings,
         );
         assert_eq!(selected, existing);
-        assert_eq!(selected.as_deref(), Some("あと2日5時間"));
+        assert_eq!(selected.as_deref(), Some("あと2日5h"));
     }
 
     #[test]
@@ -13065,7 +13144,7 @@ mod tests {
         )
         .unwrap();
         let reset_text = format_absolute_reset_time(Some(reset_at), now, strings).unwrap();
-        assert_eq!(text, "経過 2時間0分");
+        assert_eq!(text, "2h0m経過");
         assert!(!text.contains(&reset_text));
     }
 
@@ -13709,7 +13788,7 @@ mod tests {
         let strings = LanguageId::Japanese.strings();
         let remaining = Duration::from_secs(5 * 86400 + 23 * 3600);
         let text = compact_weekly_remaining_text(Some(now + remaining), now, strings);
-        assert_eq!(text.as_deref(), Some("残り 5日23時間"));
+        assert_eq!(text.as_deref(), Some("残 5日23h"));
     }
 
     #[test]
@@ -13718,7 +13797,7 @@ mod tests {
         let strings = LanguageId::Japanese.strings();
         let remaining = Duration::from_secs(10 * 3600 + 30 * 60);
         let text = compact_weekly_remaining_text(Some(now + remaining), now, strings);
-        assert_eq!(text.as_deref(), Some("残り 10時間"));
+        assert_eq!(text.as_deref(), Some("残 10h"));
     }
 
     #[test]
@@ -13727,7 +13806,7 @@ mod tests {
         let strings = LanguageId::Japanese.strings();
         let remaining = Duration::from_secs(5 * 60 + 30);
         let text = compact_weekly_remaining_text(Some(now + remaining), now, strings);
-        assert_eq!(text.as_deref(), Some("残り 0時間"));
+        assert_eq!(text.as_deref(), Some("残 0h"));
     }
 
     #[test]
@@ -14837,6 +14916,85 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn popup_visible_rows_exhaustive_matrix_keeps_provider_rows_consistent() {
+        for provider_mask in 0u8..32 {
+            let providers = ProviderVisibility {
+                show_claude_code: provider_mask & 0b00001 != 0,
+                show_codex: provider_mask & 0b00010 != 0,
+                show_antigravity: provider_mask & 0b00100 != 0,
+                show_github_copilot: provider_mask & 0b01000 != 0,
+                show_vercel_ai_gateway: provider_mask & 0b10000 != 0,
+            };
+            let expected_weekly =
+                providers.show_claude_code || providers.show_codex || providers.show_antigravity;
+            let expected_monthly =
+                providers.show_github_copilot || providers.show_vercel_ai_gateway;
+
+            for session_mask in 0u8..8 {
+                let session_shows = SessionRowShows {
+                    claude_code: session_mask & 0b001 != 0,
+                    codex: session_mask & 0b010 != 0,
+                    antigravity: session_mask & 0b100 != 0,
+                };
+                let expected_session = (providers.show_claude_code && session_shows.claude_code)
+                    || (providers.show_codex && session_shows.codex)
+                    || (providers.show_antigravity && session_shows.antigravity);
+
+                for layout in [PopupLayout::Compact, PopupLayout::Standard] {
+                    for weekly_extra_lines in 0..=2 {
+                        for antigravity_extra_item_count in [0, 1, 3] {
+                            let rows = popup_visible_rows(
+                                layout,
+                                providers,
+                                weekly_extra_lines,
+                                session_shows,
+                                antigravity_extra_item_count,
+                            );
+
+                            assert_eq!(
+                                rows.weekly_row, expected_weekly,
+                                "provider_mask={provider_mask:05b}"
+                            );
+                            assert_eq!(
+                                rows.monthly_row, expected_monthly,
+                                "provider_mask={provider_mask:05b}"
+                            );
+
+                            let expected_session_row = match layout {
+                                PopupLayout::Compact => false,
+                                PopupLayout::Standard => expected_session,
+                            };
+                            assert_eq!(
+                                rows.session_row, expected_session_row,
+                                "provider_mask={provider_mask:05b} session_mask={session_mask:03b}"
+                            );
+
+                            let expected_weekly_extra_lines = match layout {
+                                PopupLayout::Compact => 0,
+                                PopupLayout::Standard if expected_weekly => weekly_extra_lines,
+                                PopupLayout::Standard => 0,
+                            };
+                            assert_eq!(
+                                rows.weekly_extra_lines, expected_weekly_extra_lines,
+                                "provider_mask={provider_mask:05b}"
+                            );
+
+                            let expected_antigravity_extra_rows = if providers.show_antigravity {
+                                antigravity_extra_item_count
+                            } else {
+                                0
+                            };
+                            assert_eq!(
+                                rows.antigravity_extra_rows, expected_antigravity_extra_rows,
+                                "hidden Antigravity must never reserve or draw extra rows"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
     #[test]
     fn popup_height_logical_with_session_row_is_widget_height_plus_weekly_extra() {
         // AUM-WINDOW-UI-01C-1: baseline is `WIDGET_HEIGHT - BASIS_LABEL_ROW_H`
