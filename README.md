@@ -48,21 +48,18 @@ If you use Claude Code through WSL, that is supported too. The monitor can read 
 
 ## Install
 
-Install the latest version from WinGet:
+**This fork does not currently have a public installer or WinGet package.** No release assets are published from this repository. The WinGet package `CodeZeno.ClaudeCodeUsageMonitor` and [CodeZeno releases](https://github.com/CodeZeno/Claude-Code-Usage-Monitor/releases) install the **upstream project**, not this fork's multi-provider build.
 
-```powershell
-winget install CodeZeno.ClaudeCodeUsageMonitor
-```
+Current installation paths are for authorized local development and private testing only:
 
-If you prefer not to use WinGet, you can still download the latest `claude-code-usage-monitor.exe` from the [Releases](https://github.com/CodeZeno/Claude-Code-Usage-Monitor/releases) page and run it directly.
+- [Local MSIX trial](packaging/msix/README.md): build and sign a test package on an authorized development PC.
+- [Microsoft Store Private audience checkpoint](packaging/msix/STORE_PRIVATE_CHECKPOINT.md): instructions for self-only Store validation, not public distribution.
+
+Neither route is a public installer. Public distribution remains on hold.
 
 ## Use
 
-After installing with WinGet, run:
-
-```powershell
-claude-code-usage-monitor
-```
+For an authorized local build or private MSIX installation, launch the locally built executable or installed package. A standalone unpackaged EXE does not provide the `aum-quota.exe` alias used by the Antigravity statusline bridge.
 
 Once running, the desktop widget appears just above the taskbar by default, and one tray icon appears in the notification area.
 
@@ -204,7 +201,7 @@ Notes:
 - Default builds do not automatically refresh expired Claude credentials; use the provider login/auth recovery flow and then refresh or restart the monitor
 - If Codex usage is unavailable because the CLI/app-server session is not authenticated, sign in with the Codex CLI; the monitor does not manage Codex credentials itself
 - If your Antigravity token is expired, open Antigravity and sign in again. The monitor does not write Windows Credential Manager entries itself.
-- Portable installs can update themselves by downloading the latest release from this repository
+- This fork has no published release/update channel. Store MSIX builds exclude self-update; do not use upstream releases as updates for this fork.
 - Proxies should be trusted because proxied usage requests include your OAuth bearer token inside the TLS connection
 
 ## How It Works
