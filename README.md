@@ -5,9 +5,9 @@
 
 ![Screenshot](.github/animation.gif)
 
-A lightweight Windows taskbar widget for people already using Claude Code, with optional Codex, Google Antigravity, GitHub Copilot, and Vercel AI Gateway usage display.
+A lightweight Windows desktop widget for people already using Claude Code, with optional Codex, Google Antigravity, GitHub Copilot, and Vercel AI Gateway usage display.
 
-It sits in your taskbar and shows your configured providers' available quota windows without needing to open the terminal or provider site.
+It appears on your desktop, just above the taskbar by default, and shows your configured providers' available quota windows without needing to open the terminal or provider site.
 
 ## What You Get
 
@@ -17,11 +17,11 @@ It sits in your taskbar and shows your configured providers' available quota win
 - Optional Antigravity quota items captured through its official statusline integration
 - Optional Vercel AI Gateway spend versus configured budget
 - A live countdown until each limit resets
-- A small native widget that lives directly in the Windows taskbar
+- A small native desktop widget, positioned just above the taskbar by default
 - A single provider-independent system tray icon for toggling the widget and opening settings
-- Left-click the tray icon to toggle the taskbar widget on or off
+- Left-click the tray icon to show or hide the desktop widget
 - Right-click options for refresh, displayed models, update frequency, language, startup, widget visibility, and updates
-- Multi-monitor taskbar placement, so the widget can live on the taskbar for the screen you prefer
+- Multi-monitor support, so you can position the desktop widget on your preferred display
 
 ## Who This Is For
 
@@ -64,12 +64,12 @@ After installing with WinGet, run:
 claude-code-usage-monitor
 ```
 
-Once running, it will appear in your taskbar and as one tray icon in the notification area.
+Once running, the desktop widget appears just above the taskbar by default, and one tray icon appears in the notification area.
 
-- Drag the left divider to move the taskbar widget
-- On multi-monitor setups, drag the widget onto another Windows taskbar to move it to that screen
-- Right-click the taskbar widget or tray icon for refresh, displayed models, update frequency, Start with Windows, reset position, language, updates, and exit
-- Left-click the tray icon to toggle the taskbar widget on or off
+- Drag a non-interactive background area of the widget to move it
+- On multi-monitor setups, drag the widget onto another display to move it there
+- Right-click the desktop widget or tray icon for refresh, displayed models, update frequency, Start with Windows, reset position, language, updates, and exit
+- Left-click the tray icon to show or hide the desktop widget
 - Enable `Start with Windows` from the right-click menu if you want it to launch automatically when you sign in
 
 ### Models
@@ -100,7 +100,7 @@ The widget keeps its labels short. Here's what each one actually represents:
 
 The app uses one provider-independent tray icon regardless of how many providers are enabled.
 
-Left-click toggles the taskbar widget. Right-click opens the same context menu used by the widget.
+Left-click toggles the desktop widget. Right-click opens the same context menu used by the widget.
 
 Provider usage percentages and quota details stay in the widget instead of being duplicated as separate provider tray icons.
 
@@ -123,6 +123,16 @@ Settings are saved to:
 ```text
 %APPDATA%\ClaudeCodeUsageMonitor\settings.json
 ```
+
+## Optional provider setup and recovery
+
+These providers have independent accounts and quota units. A missing reading is **not** a zero quota or proof that your plan is exhausted. Start by enabling only the providers you actually use under **Displayed AI / Models**.
+
+- **Antigravity**: Open **Help > Antigravity Setup** and copy the `/statusline` command into the Antigravity CLI. The bridge uses a separate `aum-quota.exe` executable: the local test MSIX bundles it and declares an execution alias, while an unpackaged standalone EXE alone does **not** make the bridge command resolvable. If no reading appears, first confirm that the bridge executable can be found and that Antigravity has refreshed its status line. To undo the integration, use `/statusline delete` in Antigravity.
+- **GitHub Copilot**: Install GitHub CLI (`gh`) and authenticate it. Use `gh auth status` locally to check the session, then choose your Copilot plan under the app's model settings; when the plan is unknown, only observed AI-credit usage is shown. An API failure can mean authentication, access rights, CLI availability, or a service error, so this app does not automatically run a login or change scopes.
+- **Vercel AI Gateway**: Install/sign in to Vercel CLI and configure `AI_GATEWAY_API_KEY` for the Windows user before starting the monitor. Only the matching key's reported spend/budget is displayed. An empty/missing key results in a credentials-unavailable state; a rejected key or CLI failure may still be shown as a generic fetch failure, so check the local session and permissions without assuming the key has expired. **Restart the monitor** after adding the user environment variable, because a running process may not inherit changes.
+
+Do not paste API keys, OAuth tokens, cookies, or private CLI output into support requests. Recovery instructions are guidance only; the monitor never changes provider credentials or permissions for you. The standalone-EXE release workflow does not currently package `aum-quota.exe` and should not be treated as an Antigravity-ready installer.
 
 ## Account Support
 
@@ -157,7 +167,7 @@ What the app sends over the network:
 What the app stores locally:
 
 - Widget position
-- Selected taskbar / screen
+- Selected screen / display
 - Widget visibility
 - Polling frequency
 - Language preference
@@ -203,8 +213,8 @@ The monitor:
 
 1. Uses each enabled provider's supported local integration or authenticated source
 2. Reads current usage from Anthropic, the official Codex app-server, the Antigravity statusline-derived cache, and/or GitHub's billing API through the GitHub CLI
-3. Shows the result directly in the Windows taskbar
-4. Keeps the widget aligned with the selected taskbar and tray area
+3. Shows the result in the desktop widget rather than inside the Windows taskbar
+4. Positions the widget above the taskbar by default and restores its saved location
 5. Refreshes periodically in the background
 
 A legacy Claude Messages-header fallback exists only in builds compiled with the optional `claude-messages-fallback` feature; default builds do not enable it.
