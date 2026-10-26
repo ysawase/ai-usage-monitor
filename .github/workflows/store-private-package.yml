@@ -2,6 +2,12 @@ name: Store Private Package (manual)
 
 # Self-only packaging. No publishing, tag release, WinGet, or public audience change.
 on:
+  # Temporary branch-only packaging smoke test; no upload or Store actions.
+  push:
+    branches:
+      - chore/store-private-release-automation-20261026
+    paths:
+      - '.github/workflows/store-private-package.yml'
   workflow_dispatch:
     inputs:
       version:
@@ -27,7 +33,7 @@ jobs:
       - name: Validate version and update package version only
         shell: pwsh
         env:
-          REQUESTED_VERSION: ${{ inputs.version }}
+          REQUESTED_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.version || '1.4.999' }}
         run: |
           $ErrorActionPreference = "Stop"
           if ($env:REQUESTED_VERSION -notmatch '^[1-9][0-9]*\.[0-9]+\.[0-9]+$') {
@@ -81,6 +87,7 @@ jobs:
           Get-FileHash -Algorithm SHA256 $msix | Format-Table
 
       - name: Upload unsigned package for private submission review
+        if: github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@v4
         with:
           name: unsigned-store-private-${{ env.STORE_PACKAGE_VERSION }}
