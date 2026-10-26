@@ -22,3 +22,15 @@ Official docs:
 - https://learn.microsoft.com/en-us/windows/apps/publish/msstore-dev-cli/commands
 
 Restrictions: no general public distribution, tag-release automation, accidental WinGet publication, automatic Store submission or credential leaks.
+
+## Tenant setup check (2026-10-27 JST)
+
+Read-only Partner Center browser inspection: `Account settings > Organization profile > Tenants > Developer` showed **Current tenant associations: No data available**. Choosing `Create Microsoft Entra ID` opened the Microsoft for your business signup (`signup.microsoft.com/createaccount?scenario=PartnerCenter`), which requests a work/school email and shows an account / sign-in / payment sequence. No tenant was created, no billing details entered, and no account permissions changed.
+
+Microsoft currently states that **Microsoft Entra ID Free has no product charge but requires a credit card for identity verification**. The Partner Center work-account signup requires a legitimate accessible business email (not an Outlook.com personal address), business information and payment-method entry. This is a one-time human-managed account/billing/privilege boundary, not an automated CLI step. Never claim it is card-free or bypass it. If the user has an existing qualifying work/Entra account, prefer association over another tenant.
+
+- https://learn.microsoft.com/en-us/azure/cost-management-billing/manage/microsoft-entra-id-free
+- https://learn.microsoft.com/en-us/partner-center/enroll/create-work-account
+- https://learn.microsoft.com/en-us/windows/apps/publish/partner-center/associate-existing-azure-ad-tenant-with-partner-center-account
+
+**No-auth fallback:** Continue producing and validating a single unsigned MSIX via the manual-only GitHub workflow or L15 build. For each approved self-only release, use Partner Center's existing Store submission UI to upload that MSIX; certification supplies the Store-signed package. This reduces the repeat build steps without creating a new tenant, but upload/submit remains manual until the required Entra setup is authorized and validated. Do not sideload the unsigned MSIX as a replacement for the Store-signed app. Do not change Private audience or install/delete existing app packages as a shortcut.
