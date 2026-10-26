@@ -44,7 +44,7 @@ jobs:
           $lockAnchor = 'name = "claude-code-usage-monitor"' + "`n" + 'version = "' + $oldVersion + '"'
           $normalLock = $lock.Replace("`r`n", "`n")
           if (-not $normalLock.Contains($lockAnchor)) { throw "Cargo.lock expected package missing." }
-          $cargo = [regex]::Replace($cargo, $versionPattern, { param($m) $m.Groups[1].Value + $version + $m.Groups[2].Value }, 1)
+          $cargo = ([regex]::new($versionPattern)).Replace($cargo, { param($m) $m.Groups[1].Value + $version + $m.Groups[2].Value }, 1)
           $normalLock = $normalLock.Replace($lockAnchor, 'name = "claude-code-usage-monitor"' + "`n" + 'version = "' + $version + '"')
           [System.IO.File]::WriteAllText((Join-Path $PWD 'Cargo.toml'), $cargo)
           [System.IO.File]::WriteAllText((Join-Path $PWD 'Cargo.lock'), $normalLock)
