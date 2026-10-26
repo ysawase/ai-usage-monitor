@@ -1,0 +1,51 @@
+name: Store Private Connection Check (read-only)
+
+# Manual only. Never creates drafts, uploads packages, submits, or changes visibility.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  connection-check:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - name: Verify Microsoft credentials are configured
+        shell: pwsh
+        env:
+          TENANT: ${{ secrets.AZURE_AD_TENANT_ID }}
+          SELLER: ${{ secrets.SELLER_ID }}
+          CLIENT: ${{ secrets.AZURE_AD_APPLICATION_CLIENT_ID }}
+          SECRET: ${{ secrets.AZURE_AD_APPLICATION_SECRET }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($name in @('TENANT', 'SELLER', 'CLIENT', 'SECRET')) {
+            if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($name))) {
+              throw "Missing required GitHub Actions secret for $name. No API call was made."
+            }
+          }
+          Write-Host 'All four required secrets are present (values not printed).'
+
+      - name: Install Microsoft Store Developer CLI
+        uses: microsoft/microsoft-store-apppublisher@v1.1
+
+      - name: Authenticate and inspect this app (read-only)
+        shell: pwsh
+        env:
+          TENANT: ${{ secrets.AZURE_AD_TENANT_ID }}
+          SELLER: ${{ secrets.SELLER_ID }}
+          CLIENT: ${{ secrets.AZURE_AD_APPLICATION_CLIENT_ID }}
+          SECRET: ${{ secrets.AZURE_AD_APPLICATION_SECRET }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Do not turn on command tracing: CLI command arguments include a secret.
+          msstore reconfigure --tenantId $env:TENANT --sellerId $env:SELLER --clientId $env:CLIENT --clientSecret $env:SECRET
+          if ($LASTEXITCODE -ne 0) { throw 'Store authentication failed' }
+          # Verify only our existing private product; do not modify it.
+          msstore apps get 9MZRWSD4MTGC
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot read the target app' }
+          msstore submission status 9MZRWSD4MTGC
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot read the target submission status' }
+          Write-Host 'Read-only Store connection check passed. No submission was created or changed.'
