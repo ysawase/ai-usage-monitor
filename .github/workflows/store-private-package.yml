@@ -71,7 +71,7 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $root = "target/msix-store"
-          $msix = Join-Path $root "AIUsageMonitor.Store_$env:STORE_PACKAGE_VERSION" + "_x64.msix"
+          $msix = Join-Path $root ("AIUsageMonitor.Store_{0}_x64.msix" -f $env:STORE_PACKAGE_VERSION)
           if (-not (Test-Path $msix)) { throw "Expected MSIX is missing: $msix" }
           [xml]$manifest = Get-Content -LiteralPath (Join-Path $root "staging/AppxManifest.xml") -Raw
           if ($manifest.Package.Identity.Name -ne "Solidaily.SolidailyAIUsageMonitor") { throw "Wrong package identity" }
