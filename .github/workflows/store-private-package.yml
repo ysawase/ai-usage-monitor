@@ -1,0 +1,89 @@
+name: Store Private Package (manual)
+
+# Self-only packaging. No publishing, tag release, WinGet, or public audience change.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version matching an approved Store update (e.g. 1.4.11)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: store-private-package-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  package:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out the explicitly selected branch
+        uses: actions/checkout@v4
+
+      - name: Validate version and update package version only
+        shell: pwsh
+        env:
+          REQUESTED_VERSION: ${{ inputs.version }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          if ($env:REQUESTED_VERSION -notmatch '^[1-9][0-9]*\.[0-9]+\.[0-9]+$') {
+            throw "Expected numeric major.minor.patch, without suffix."
+          }
+          $version = $env:REQUESTED_VERSION
+          $cargo = Get-Content -LiteralPath Cargo.toml -Raw
+          $lock = Get-Content -LiteralPath Cargo.lock -Raw
+          $versionPattern = '(?m)^(version\s*=\s*")[0-9]+\.[0-9]+\.[0-9]+(")'
+          $cargoMatch = [regex]::Match($cargo, $versionPattern)
+          if (-not $cargoMatch.Success) { throw "Cargo.toml version missing." }
+          $old = $cargoMatch.Groups[0].Value
+          $oldVersion = [regex]::Match($old, '[0-9]+\.[0-9]+\.[0-9]+').Value
+          $lockAnchor = 'name = "claude-code-usage-monitor"' + "`n" + 'version = "' + $oldVersion + '"'
+          $normalLock = $lock.Replace("`r`n", "`n")
+          if (-not $normalLock.Contains($lockAnchor)) { throw "Cargo.lock expected package missing." }
+          $cargo = [regex]::Replace($cargo, $versionPattern, { param($m) $m.Groups[1].Value + $version + $m.Groups[2].Value }, 1)
+          $normalLock = $normalLock.Replace($lockAnchor, 'name = "claude-code-usage-monitor"' + "`n" + 'version = "' + $version + '"')
+          [System.IO.File]::WriteAllText((Join-Path $PWD 'Cargo.toml'), $cargo)
+          [System.IO.File]::WriteAllText((Join-Path $PWD 'Cargo.lock'), $normalLock)
+          "STORE_PACKAGE_VERSION=$version.0" >> $env:GITHUB_ENV
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Test with Store feature flags
+        shell: pwsh
+        run: cargo test --locked --no-default-features --features antigravity
+
+      - name: Build unsigned Store MSIX
+        shell: pwsh
+        run: |
+          ./packaging/msix/build-store-msix.ps1 `
+            -PackageIdentityName "Solidaily.SolidailyAIUsageMonitor" `
+            -Publisher "CN=E66E9477-9B41-4543-A013-15F4B0542C98" `
+            -PublisherDisplayName "Solidaily" `
+            -DisplayName "Solidaily AI Usage Monitor"
+
+      - name: Validate package identity and expected contents
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $root = "target/msix-store"
+          $msix = Join-Path $root "AIUsageMonitor.Store_$env:STORE_PACKAGE_VERSION" + "_x64.msix"
+          if (-not (Test-Path $msix)) { throw "Expected MSIX is missing: $msix" }
+          [xml]$manifest = Get-Content -LiteralPath (Join-Path $root "staging/AppxManifest.xml") -Raw
+          if ($manifest.Package.Identity.Name -ne "Solidaily.SolidailyAIUsageMonitor") { throw "Wrong package identity" }
+          if ($manifest.Package.Identity.Version -ne $env:STORE_PACKAGE_VERSION) { throw "Wrong package version" }
+          if (-not (Test-Path (Join-Path $root "staging/aum-quota.exe"))) { throw "Missing quota bridge" }
+          if (-not (Test-Path (Join-Path $root "staging/claude-code-usage-monitor.exe"))) { throw "Missing app" }
+          Get-FileHash -Algorithm SHA256 $msix | Format-Table
+
+      - name: Upload unsigned package for private submission review
+        uses: actions/upload-artifact@v4
+        with:
+          name: unsigned-store-private-${{ env.STORE_PACKAGE_VERSION }}
+          path: target/msix-store/AIUsageMonitor.Store_${{ env.STORE_PACKAGE_VERSION }}_x64.msix
+          if-no-files-found: error
+          retention-days: 7
