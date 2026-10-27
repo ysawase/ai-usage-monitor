@@ -37,7 +37,7 @@ use crate::models::{AppUsageData, BankedResetCount, QuotaFamilyId, QuotaMetric, 
 use crate::native_interop::TIMER_UPDATE_CHECK;
 use crate::native_interop::{
     self, Color, TIMER_COUNTDOWN, TIMER_POLL, TIMER_RESET_POLL, TIMER_VIRTUAL_DESKTOP_EVENT_SETTLE,
-    WM_APP_TRAY, WM_APP_USAGE_UPDATED,
+    WM_APP_TRAY, WM_APP_TRAY_REPOSITION, WM_APP_USAGE_UPDATED,
 };
 use crate::poller;
 use crate::snapshot_schema;
@@ -95,6 +95,8 @@ enum PointerInteractionTarget {
 enum AuthAction {
     ClaudeLogin,
     CodexLogin,
+    AntigravitySetup,
+    ProviderDiagnosis(QuotaFamilyId),
 }
 
 impl AuthAction {
@@ -105,10 +107,23 @@ impl AuthAction {
         match self {
             Self::ClaudeLogin => ("claude", &["auth", "login"]),
             Self::CodexLogin => ("codex", &["login"]),
+            Self::AntigravitySetup => ("", &[]),
+            Self::ProviderDiagnosis(_) => ("", &[]),
         }
     }
 
     fn launch(self, hwnd: HWND) {
+        match self {
+            Self::AntigravitySetup => {
+                show_antigravity_setup(hwnd);
+                return;
+            }
+            Self::ProviderDiagnosis(family) => {
+                show_single_provider_diagnosis(hwnd, family);
+                return;
+            }
+            _ => {}
+        }
         let (program, args) = self.command();
         if !launch_visible_auth_command(hwnd, program, args) {
             diagnose::log(format!("unable to launch auth command for {program}"));
@@ -126,6 +141,13 @@ impl AuthAction {
 /// (confirmed against `agy --help` during AUTH-RECOVERY-CTA-DESIGN-01).
 /// Generic failures are never guessed to be auth-related.
 fn provider_auth_action(family: QuotaFamilyId, state: CellState) -> Option<AuthAction> {
+    if family == QuotaFamilyId::Antigravity {
+        return if matches!(state, CellState::FetchFailed | CellState::CredentialsUnavailable | CellState::AuthenticationProblem) {
+            Some(AuthAction::AntigravitySetup)
+        } else {
+            None
+        };
+    }
     let is_auth_state = matches!(
         state,
         CellState::AuthenticationExpired
@@ -133,14 +155,18 @@ fn provider_auth_action(family: QuotaFamilyId, state: CellState) -> Option<AuthA
             | CellState::CredentialsUnavailable
     );
     if !is_auth_state {
-        return None;
+        return if state == CellState::FetchFailed {
+            Some(AuthAction::ProviderDiagnosis(family))
+        } else {
+            None
+        };
     }
     match family {
         QuotaFamilyId::Claude => Some(AuthAction::ClaudeLogin),
         QuotaFamilyId::Codex => Some(AuthAction::CodexLogin),
-        QuotaFamilyId::Antigravity
-        | QuotaFamilyId::GithubCopilot
-        | QuotaFamilyId::VercelAiGateway => None,
+        QuotaFamilyId::Antigravity => Some(AuthAction::AntigravitySetup),
+        QuotaFamilyId::GithubCopilot | QuotaFamilyId::VercelAiGateway =>
+            Some(AuthAction::ProviderDiagnosis(family)),
     }
 }
 
@@ -175,6 +201,31 @@ fn launch_visible_auth_command(hwnd: HWND, program: &str, args: &[&str]) -> bool
     for arg in args {
         command_line.push(' ');
         command_line.push_str(arg);
+    }
+    // Use the first-party login flow normally.  If it fails, allow an
+    // explicit, opt-in recovery using a known locally installed older binary.
+    // The native installer's cached binary has no .exe suffix, so Windows
+    // needs a temporary .exe copy.  This app never handles OAuth credentials.
+    if program == "claude" && args == ["auth", "login"] {
+        command_line.push_str(" & if errorlevel 1 (");
+        command_line.push_str("echo. & echo Claude Code login failed.");
+        command_line
+            .push_str(" & echo An older installed Claude Code 2.1.308 can be tried if present.");
+        command_line
+            .push_str(" & choice /c YN /n /m \"Try installed Claude Code 2.1.308? [Y/N] \"");
+        command_line.push_str(" & if errorlevel 2 (echo Recovery cancelled.) else (");
+        command_line.push_str("powershell.exe -NoProfile -ExecutionPolicy Bypass -Command ");
+        command_line.push_str(
+            "\"$source=Join-Path $env:USERPROFILE '.local\\share\\claude\\versions\\2.1.308'; ",
+        );
+        command_line.push_str("if (!(Test-Path -LiteralPath $source -PathType Leaf)) { Write-Host 'Claude Code 2.1.308 is not installed.'; exit 1 }; ");
+        command_line.push_str("$exe=Join-Path $env:TEMP 'claude-auth-recovery-2.1.308.exe'; ");
+        command_line.push_str(
+            "Copy-Item -LiteralPath $source -Destination $exe -Force -ErrorAction Stop; ",
+        );
+        command_line.push_str("& $exe auth login\"");
+        command_line.push_str(" )");
+        command_line.push_str(" )");
     }
     unsafe {
         let operation = native_interop::wide_str("open");
@@ -943,12 +994,18 @@ fn antigravity_extra_items_from(
 /// is `CellState::Loading` set once at `AppState` construction and left
 /// alone here.
 fn provider_error_cell_state(provider: QuotaFamilyId, error: poller::PollError) -> CellState {
+    // The Vercel adapter reports a missing AI_GATEWAY_API_KEY as NoCredentials
+    // but some CLI failures are grouped as AuthRequired, even if their
+    // precise cause is unknown. Preserve generic failure text for those.
     match (provider, error) {
         (QuotaFamilyId::Claude, poller::PollError::TokenExpired) => {
             CellState::AuthenticationExpired
         }
         (
-            QuotaFamilyId::Claude | QuotaFamilyId::Codex | QuotaFamilyId::Antigravity,
+            QuotaFamilyId::Claude
+            | QuotaFamilyId::Codex
+            | QuotaFamilyId::Antigravity
+            | QuotaFamilyId::VercelAiGateway,
             poller::PollError::NoCredentials,
         ) => CellState::CredentialsUnavailable,
         (
@@ -1986,6 +2043,9 @@ const IDM_HELP_README: u16 = 102;
 const IDM_HELP_VERSION_INFORMATION: u16 = 103;
 #[cfg(feature = "antigravity")]
 const IDM_HELP_ANTIGRAVITY_SETUP: u16 = 104;
+#[cfg(feature = "antigravity")]
+const IDM_HELP_ANTIGRAVITY_CONNECTION_CHECK: u16 = 105;
+const IDM_HELP_PROVIDER_DIAGNOSIS: u16 = 106;
 const IDM_LANG_SYSTEM: u16 = 40;
 const IDM_LANG_ENGLISH: u16 = 41;
 const IDM_LANG_DUTCH: u16 = 42;
@@ -2816,8 +2876,17 @@ fn apply_virtual_desktop_scope_at_startup(hwnd: HWND) {
     {
         let mut state = lock_state();
         if let Some(s) = state.as_mut() {
+            // An explicit CurrentOnly choice is bound to the desktop at launch,
+            // not a stale desktop ID saved in an earlier Windows session.
+            // Failure to sense keeps the saved target and fails open.
+            if let Some(current) = sensed {
+                s.virtual_desktop_target = Some(current);
+            }
             s.virtual_desktop_current = sensed;
         }
+    }
+    if sensed.is_some() {
+        save_state_settings();
     }
     start_virtual_desktop_event_sync();
     sync_effective_widget_visibility(hwnd);
@@ -3323,6 +3392,7 @@ fn show_info_message(hwnd: HWND, title: &str, message: &str) {
 }
 
 const README_URL: &str = "https://github.com/ysawase/ai-usage-monitor#readme";
+const ANTIGRAVITY_CLI_GUIDE_URL: &str = "https://www.antigravity.google/docs/cli/install/";
 
 /// The exact `/statusline <command>` this app's own packaged App Execution
 /// Alias needs, verified against a real installed MSIX — see
@@ -3387,6 +3457,132 @@ fn build_provider_help_text(strings: Strings) -> String {
     message
 }
 
+/// Explanations deliberately do not infer token or network causes from a
+/// generic fetch error. This reads last-polled in-memory state only.
+fn provider_recovery_guidance(family: QuotaFamilyId, state: CellState, ja: bool) -> &'static str {
+    match (family, state, ja) {
+        (_, CellState::Ok, true) => "直近の取得は成功しています。",
+        (_, CellState::Ok, false) => "The latest poll succeeded.",
+        (_, CellState::Loading, true) => "取得処理中、またはまだ結果がありません。",
+        (_, CellState::Loading, false) => "Waiting for a polling result.",
+        (_, CellState::Disabled, true) => "表示または取得が無効です。表示設定を確認してください。",
+        (_, CellState::Disabled, false) => "Disabled. Check display settings.",
+        (_, CellState::NotAvailable, true) => "この期間の利用枠データは確認できません。",
+        (_, CellState::NotAvailable, false) => "Quota data for this window is unavailable.",
+        (QuotaFamilyId::Claude | QuotaFamilyId::Codex,
+         CellState::AuthenticationExpired | CellState::AuthenticationProblem | CellState::CredentialsUnavailable,
+         true) => "認証の確認が必要です。ウィジェットの認証メッセージをクリックすると公式CLIのログイン操作を開始できます。",
+        (QuotaFamilyId::Claude | QuotaFamilyId::Codex,
+         CellState::AuthenticationExpired | CellState::AuthenticationProblem | CellState::CredentialsUnavailable,
+         false) => "Check authentication. Click the authentication message in the widget to start the official CLI login.",
+        (QuotaFamilyId::Antigravity, _, true) => "連携データの状態は「ヘルプ → Antigravityの接続を確認...」で確認できます。設定方法は同じヘルプの「Antigravityのセットアップ...」を開いてください。",
+        (QuotaFamilyId::Antigravity, _, false) => "Use Help → Check Antigravity connection... for a cache diagnosis, or Antigravity Setup... for configuration.",
+        (QuotaFamilyId::GithubCopilot, _, true) => "GitHub Copilotの取得に失敗しました。GitHub CLIのログイン状態・必要な権限・通信状態を確認してください。原因は現時点では特定できません。",
+        (QuotaFamilyId::GithubCopilot, _, false) => "GitHub Copilot retrieval failed. Check GitHub CLI authentication, permissions and connectivity. The exact cause is unknown.",
+        (QuotaFamilyId::VercelAiGateway, CellState::CredentialsUnavailable, true) => "Vercel AI Gatewayの認証情報を確認できません。環境変数AI_GATEWAY_API_KEYなど、既存の設定を確認してください。キー自体は表示しません。",
+        (QuotaFamilyId::VercelAiGateway, CellState::CredentialsUnavailable, false) => "Vercel AI Gateway credentials were unavailable. Check the AI_GATEWAY_API_KEY setting. No key value is displayed.",
+        (QuotaFamilyId::VercelAiGateway, _, true) => "Vercel AI Gatewayの取得に失敗しました。通信・認証・APIの応答など複数の原因が考えられ、ここでは断定できません。",
+        (QuotaFamilyId::VercelAiGateway, _, false) => "Vercel AI Gateway retrieval failed. Network, authentication or API response may be involved; no single cause is confirmed.",
+        (_, _, true) => "取得に失敗しました。認証・通信・サービス状態などを確認してください。原因は特定できていません。",
+        (_, _, false) => "Retrieval failed. Check authentication, connectivity and service status; the cause is not confirmed.",
+    }
+}
+
+/// Only actionable retrieval failures should draw attention to the diagnostic entry.
+/// Missing quota windows, loading states, and intentionally hidden services
+/// are not evidence of a broken connection.
+fn is_connection_issue_state(state: CellState) -> bool {
+    matches!(
+        state,
+        CellState::FetchFailed
+            | CellState::AuthenticationExpired
+            | CellState::AuthenticationProblem
+            | CellState::CredentialsUnavailable
+    )
+}
+
+fn any_enabled_connection_issue(rows: &[(bool, CellState)]) -> bool {
+    rows.iter()
+        .any(|&(enabled, state)| enabled && is_connection_issue_state(state))
+}
+
+fn widget_needs_connection_attention(s: &AppState) -> bool {
+    any_enabled_connection_issue(&[
+        (s.show_claude_code, s.weekly_state),
+        (s.show_codex, s.codex_weekly_state),
+        (s.show_antigravity, s.antigravity_weekly_state),
+        (s.show_github_copilot, s.github_copilot_state),
+        (s.show_vercel_ai_gateway, s.vercel_ai_gateway_state),
+    ])
+}
+
+fn connection_attention_now() -> bool {
+    let state = lock_state();
+    state
+        .as_ref()
+        .map(widget_needs_connection_attention)
+        .unwrap_or(false)
+}
+
+fn build_provider_diagnosis(ja: bool, rows: &[(QuotaFamilyId, CellState)]) -> String {
+    let mut body = if ja {
+        "各サービスの直近の取得状態です。原因が確認できない場合は推測していません。\n"
+    } else {
+        "Latest polling states. Unconfirmed causes are not treated as facts.\n"
+    }.to_string();
+    for &(family, state) in rows {
+        let label = match family {
+            QuotaFamilyId::Claude => "Claude Code",
+            QuotaFamilyId::Codex => "Codex",
+            QuotaFamilyId::Antigravity => "Antigravity",
+            QuotaFamilyId::GithubCopilot => "GitHub Copilot",
+            QuotaFamilyId::VercelAiGateway => "Vercel AI Gateway",
+        };
+        body.push_str("\n");
+        body.push_str(label);
+        body.push_str(": ");
+        body.push_str(provider_recovery_guidance(family, state, ja));
+        body.push_str("\n");
+    }
+    body
+}
+
+fn show_single_provider_diagnosis(hwnd: HWND, family: QuotaFamilyId) {
+    let (ja, state) = {
+        let guard = lock_state();
+        let Some(s) = guard.as_ref() else { return; };
+        let state = match family {
+            QuotaFamilyId::Claude => s.weekly_state,
+            QuotaFamilyId::Codex => s.codex_weekly_state,
+            QuotaFamilyId::Antigravity => s.antigravity_weekly_state,
+            QuotaFamilyId::GithubCopilot => s.github_copilot_state,
+            QuotaFamilyId::VercelAiGateway => s.vercel_ai_gateway_state,
+        };
+        (s.language == LanguageId::Japanese, state)
+    };
+    let title = if ja { "AIサービスの接続診断" } else { "AI provider connection diagnosis" };
+    show_info_message(hwnd, title, &build_provider_diagnosis(ja, &[(family, state)]));
+}
+
+fn show_provider_diagnosis(hwnd: HWND) {
+    let (ja, rows) = {
+        let state = lock_state();
+        let Some(s) = state.as_ref() else { return; };
+        (
+            s.language == LanguageId::Japanese,
+            vec![
+                (QuotaFamilyId::Claude, s.weekly_state),
+                (QuotaFamilyId::Codex, s.codex_weekly_state),
+                (QuotaFamilyId::Antigravity, s.antigravity_weekly_state),
+                (QuotaFamilyId::GithubCopilot, s.github_copilot_state),
+                (QuotaFamilyId::VercelAiGateway, s.vercel_ai_gateway_state),
+            ],
+        )
+    };
+    let title = if ja { "AIサービスの接続診断" } else { "AI provider connection diagnosis" };
+    show_info_message(hwnd, title, &build_provider_diagnosis(ja, &rows));
+}
+
 fn show_display_guide(hwnd: HWND) {
     let strings = current_strings();
     show_info_message(
@@ -3408,6 +3604,12 @@ fn show_display_guide(hwnd: HWND) {
 fn build_antigravity_setup_text(strings: Strings) -> String {
     let mut message = String::from(strings.antigravity_setup_intro);
     message.push_str("\n\n");
+    message.push_str(&antigravity_cache_diagnosis(strings, &crate::antigravity_statusline::read_cache(
+        &crate::antigravity_statusline::default_cache_path(),
+    )));
+    message.push_str("\n\n");
+    message.push_str(antigravity_cli_discovery_text(strings, antigravity_cli_on_path()));
+    message.push_str("\n\n");
     message.push_str(strings.antigravity_setup_command_label);
     message.push('\n');
     message.push_str(ANTIGRAVITY_SETUP_COMMAND);
@@ -3419,6 +3621,146 @@ fn build_antigravity_setup_text(strings: Strings) -> String {
     message.push_str(strings.antigravity_last_observed_label);
     message.push_str(&antigravity_last_observed_text(strings));
     message
+}
+
+/// Provide a user-facing reason from the same cache classification used by
+/// the poller. Never label a missing bridge as expired credentials.
+fn antigravity_cache_diagnosis(
+    strings: Strings,
+    result: &crate::antigravity_statusline::CacheReadResult,
+) -> &'static str {
+    use crate::antigravity_statusline::CacheReadResult;
+    let ja = strings.antigravity_setup_title == "Antigravityのセットアップ";
+    match (ja, result) {
+        (true, CacheReadResult::Missing) => "診断: 連携データがありません。まだ連携していないか、Antigravity CLIからデータを受信できていません。下のコマンドはAntigravity CLI内で設定するもので、WindowsのPowerShellに入力するコマンドではありません。CLIを使っていない場合は、インストールや連携が別途必要です。",
+        (true, CacheReadResult::Malformed(_)) => "診断: 連携ファイルを読み取れません。ファイルが破損しているか読み取りに失敗しています。認証切れと決めつけず、設定と連携状態を確認してください。",
+        (true, CacheReadResult::UnsupportedSchema(_)) => "診断: 連携データの形式がこのバージョンに対応していません。アプリの更新を確認してください。",
+        (true, CacheReadResult::Valid(_)) => "診断: 連携データは存在します。数字が表示されない場合は、利用枠のリセット時刻を過ぎている可能性があります。Antigravity CLIで利用状況が再出力されるか確認してください。",
+        (false, CacheReadResult::Missing) => "Diagnosis: No bridge data found. The Antigravity CLI may not have been configured or may not have emitted a reading. Run the command below inside Antigravity CLI, not in Windows PowerShell. The CLI must be installed and configured separately.",
+        (false, CacheReadResult::Malformed(_)) => "Diagnosis: The bridge data could not be read. Check the CLI integration; do not assume this is an authentication error.",
+        (false, CacheReadResult::UnsupportedSchema(_)) => "Diagnosis: The bridge data format is unsupported by this version. Check for an app update.",
+        (false, CacheReadResult::Valid(_)) => "Diagnosis: Bridge data exists. If no quota is shown, its reset time may have passed. Check whether Antigravity CLI emits a newer reading.",
+    }
+}
+
+/// Read-only CLI discovery for setup guidance. Not finding the executable in
+/// PATH does not prove the CLI is absent (a user may have another install).
+fn antigravity_cli_on_path() -> bool {
+    std::env::var_os("PATH")
+        .into_iter()
+        .flat_map(|paths| std::env::split_paths(&paths).collect::<Vec<_>>())
+        .any(|dir| ["agy.exe", "agy.cmd", "agy.bat"].iter().any(|name| dir.join(name).is_file()))
+}
+
+fn antigravity_cli_discovery_text(strings: Strings, found: bool) -> &'static str {
+    let ja = strings.antigravity_setup_title == "Antigravityのセットアップ";
+    match (ja, found) {
+        (true, true) => "CLI確認: コマンド検索パス内にAntigravity CLIが見つかりました。起動・ログイン・連携設定まで完了していることを意味するものではありません。",
+        (true, false) => "CLI確認: コマンド検索パス内にAntigravity CLIが見つかりませんでした。未導入のほか、インストール先が検索パスに未登録の可能性があります。現在の連携方式はCLIが必要です。",
+        (false, true) => "CLI check: Antigravity CLI found on PATH. This does not establish that it is signed in or configured.",
+        (false, false) => "CLI check: Antigravity CLI not found on PATH. It may be missing or installed outside PATH. The current bridge requires Antigravity CLI.",
+    }
+}
+
+/// A connection verification is based on real, still-current quota entries,
+/// not the mere existence of the statusline cache. It must never imply that
+/// future updates are guaranteed or that Antigravity is signed in.
+#[derive(Debug, PartialEq, Eq)]
+enum AntigravityConnectionState {
+    NoCache,
+    UnreadableCache,
+    UnsupportedSchema,
+    EmptyQuota,
+    AwaitingFreshReading,
+    CurrentQuota { active: usize, total: usize },
+}
+
+fn antigravity_connection_state(
+    cache: &crate::antigravity_statusline::CacheReadResult,
+    now: SystemTime,
+) -> AntigravityConnectionState {
+    use crate::antigravity_statusline::CacheReadResult;
+    use crate::models::QuotaItemAvailability;
+    match cache {
+        CacheReadResult::Missing => AntigravityConnectionState::NoCache,
+        CacheReadResult::Malformed(_) => AntigravityConnectionState::UnreadableCache,
+        CacheReadResult::UnsupportedSchema(_) => AntigravityConnectionState::UnsupportedSchema,
+        CacheReadResult::Valid(value) => {
+            let items = crate::antigravity_statusline::quota_items_from_cache(value, now);
+            if items.is_empty() {
+                return AntigravityConnectionState::EmptyQuota;
+            }
+            let active = items.iter().filter(|i| i.availability == QuotaItemAvailability::Available).count();
+            if active == 0 {
+                AntigravityConnectionState::AwaitingFreshReading
+            } else {
+                AntigravityConnectionState::CurrentQuota { active, total: items.len() }
+            }
+        }
+    }
+}
+
+fn antigravity_connection_result_text(strings: Strings, state: &AntigravityConnectionState) -> String {
+    let ja = strings.antigravity_setup_title == "Antigravityのセットアップ";
+    let message = match (ja, state) {
+        (true, AntigravityConnectionState::NoCache) =>
+            "まだ利用枠のデータを受信していません。Antigravity CLIを使用して、下の「セットアップ」の手順と設定を確認してください。",
+        (true, AntigravityConnectionState::UnreadableCache) =>
+            "受信ファイルを読み取れません。ファイルの破損や読み取りエラーが考えられます。CLIの連携設定を確認してください。",
+        (true, AntigravityConnectionState::UnsupportedSchema) =>
+            "受信データが現在のアプリに対応していません。アプリの更新を確認してください。",
+        (true, AntigravityConnectionState::EmptyQuota) =>
+            "データは存在しますが、表示できる利用枠の項目がありません。CLIから新しいデータが送られるか確認してください。",
+        (true, AntigravityConnectionState::AwaitingFreshReading) =>
+            "以前の利用枠データはありますが、すべてリセット時刻を過ぎています。CLIで使用状況を更新してから再確認してください。",
+        (true, AntigravityConnectionState::CurrentQuota { .. }) =>
+            "現在有効な利用枠データを読み取れています。接続データの確認は成功しました。ただし、CLIのログイン状態や継続的な更新を保証するものではありません。",
+        (false, AntigravityConnectionState::NoCache) =>
+            "No quota data has been received. Open Antigravity CLI, then follow the setup instructions in the Help menu.",
+        (false, AntigravityConnectionState::UnreadableCache) =>
+            "The bridge cache cannot be read. Check whether the CLI integration is configured and the cache file is valid.",
+        (false, AntigravityConnectionState::UnsupportedSchema) =>
+            "This app cannot read the bridge's cache format. Check for an application update.",
+        (false, AntigravityConnectionState::EmptyQuota) =>
+            "Bridge data exists, but it contains no usable quota items. Check whether the CLI emits new data.",
+        (false, AntigravityConnectionState::AwaitingFreshReading) =>
+            "All cached quota items are past their reset times. Use Antigravity CLI to generate a new reading, then check again.",
+        (false, AntigravityConnectionState::CurrentQuota { .. }) =>
+            "Current quota data is readable. This does not guarantee that the CLI is signed in or will continue sending updates.",
+    };
+    match state {
+        AntigravityConnectionState::CurrentQuota { active, total } => {
+            if ja {
+                format!("{message}\n\n有効な利用枠: {active}/{total}項目")
+            } else {
+                format!("{message}\n\nCurrent quota items: {active}/{total}")
+            }
+        }
+        _ => message.to_string(),
+    }
+}
+
+/// User-triggered read-only verification: no network, credential access,
+/// CLI execution or settings writes. Each menu invocation checks fresh data.
+fn show_antigravity_connection_check(hwnd: HWND) {
+    let strings = current_strings();
+    let cache = crate::antigravity_statusline::read_cache(
+        &crate::antigravity_statusline::default_cache_path(),
+    );
+    let state = antigravity_connection_state(&cache, SystemTime::now());
+    let title = if strings.antigravity_setup_title == "Antigravityのセットアップ" {
+        "Antigravityの接続確認"
+    } else {
+        "Antigravity connection check"
+    };
+    let mut message = antigravity_connection_result_text(strings, &state);
+    message.push_str("\n\n");
+    if strings.antigravity_setup_title == "Antigravityのセットアップ" {
+        message.push_str("設定後はこの「接続を確認」メニューを再度開いてください。\n設定方法: ヘルプ → Antigravityのセットアップ...");
+    } else {
+        message.push_str("After setup, open this menu again to recheck.\nInstructions: Help → Antigravity Setup...");
+    }
+    show_info_message(hwnd, title, &message);
 }
 
 /// "Last observed: HH:MM" (local time) for a valid cache, or
@@ -3451,6 +3793,28 @@ fn show_antigravity_setup(hwnd: HWND) {
         strings.antigravity_setup_title,
         &build_antigravity_setup_text(strings),
     );
+    // The user explicitly chooses whether to open external documentation.
+    // Never download, install, authenticate, or modify CLI settings here.
+    if !antigravity_cli_on_path() {
+        let is_ja = strings.antigravity_setup_title == "Antigravityのセットアップ";
+        let question = if is_ja {
+            "公式のAntigravity CLI導入ガイドをブラウザーで開きますか？\n\nこの操作ではインストールや設定変更は行いません。"
+        } else {
+            "Open the official Antigravity CLI installation guide in your browser?\n\nThis will not install software or change settings."
+        };
+        let title = native_interop::wide_str(strings.antigravity_setup_title);
+        let question = native_interop::wide_str(question);
+        let answer = unsafe {
+            MessageBoxW(hwnd, PCWSTR::from_raw(question.as_ptr()), PCWSTR::from_raw(title.as_ptr()), MB_YESNO | MB_ICONQUESTION)
+        };
+        if answer == IDYES {
+            let verb = native_interop::wide_str("open");
+            let url = native_interop::wide_str(ANTIGRAVITY_CLI_GUIDE_URL);
+            unsafe {
+                let _ = ShellExecuteW(hwnd, PCWSTR::from_raw(verb.as_ptr()), PCWSTR::from_raw(url.as_ptr()), PCWSTR::null(), PCWSTR::null(), SW_SHOWNORMAL);
+            }
+        }
+    }
 }
 
 fn show_ai_quota_help(hwnd: HWND) {
@@ -5378,6 +5742,7 @@ fn render_layered() {
         antigravity_session_pct,
         antigravity_session_text,
         antigravity_session_pace,
+        antigravity_weekly_state,
         antigravity_weekly_pct,
         antigravity_weekly_text,
         antigravity_weekly_pace,
@@ -5427,6 +5792,7 @@ fn render_layered() {
                 s.antigravity_session_percent,
                 s.antigravity_session_text.clone(),
                 s.antigravity_session_pace.clone(),
+                s.antigravity_weekly_state,
                 s.antigravity_weekly_percent,
                 s.antigravity_weekly_text.clone(),
                 s.antigravity_weekly_pace.clone(),
@@ -5549,6 +5915,7 @@ fn render_layered() {
             antigravity_session_pct,
             &antigravity_session_text,
             antigravity_session_pace.as_ref(),
+            antigravity_weekly_state,
             antigravity_weekly_pct,
             &antigravity_weekly_text,
             antigravity_weekly_pace.as_ref(),
@@ -5662,6 +6029,7 @@ fn paint_content(
     antigravity_session_pct: Option<f64>,
     antigravity_session_text: &str,
     antigravity_session_pace: Option<&PaceGuidanceLines>,
+    antigravity_weekly_state: CellState,
     antigravity_weekly_pct: Option<f64>,
     antigravity_weekly_text: &str,
     antigravity_weekly_pace: Option<&PaceGuidanceLines>,
@@ -5844,7 +6212,7 @@ fn paint_content(
         let _ = DeleteObject(help_border_brush);
         let _ = SetTextColor(hdc, COLORREF(heading_text.to_colorref()));
         let mut help_text_rect = help_rect;
-        let mut help_text = native_interop::wide_str("?");
+        let mut help_text = native_interop::wide_str(if connection_attention_now() { "!" } else { "?" });
         let _ = DrawTextW(
             hdc,
             &mut help_text,
@@ -5918,7 +6286,7 @@ fn paint_content(
                 accent: antigravity_accent,
                 provider_text_color: antigravity_usage_text_color(provider_tint_dark),
                 is_warning: false,
-                auth_action: None,
+                auth_action: provider_auth_action(QuotaFamilyId::Antigravity, antigravity_weekly_state),
             });
         }
         if show_github_copilot {
@@ -6061,7 +6429,7 @@ fn paint_content(
                     accent: antigravity_accent,
                     provider_text_color: antigravity_usage_text_color(provider_tint_dark),
                     is_warning: antigravity_session_decision.3,
-                    auth_action: None,
+                    auth_action: provider_auth_action(QuotaFamilyId::Antigravity, antigravity_session_state),
                 });
             }
             if show_github_copilot {
@@ -6139,7 +6507,7 @@ fn paint_content(
                     accent: &github_copilot_accent,
                     provider_text_color: github_copilot_accent,
                     is_warning: false,
-                    auth_action: None,
+                    auth_action: provider_auth_action(QuotaFamilyId::GithubCopilot, if github_copilot_percent.is_none() && github_copilot_text == strings.fetch_failed { CellState::FetchFailed } else { CellState::Ok }),
                 });
             }
             if show_vercel_ai_gateway {
@@ -6149,7 +6517,7 @@ fn paint_content(
                     accent: &vercel_ai_gateway_accent,
                     provider_text_color: vercel_ai_gateway_accent,
                     is_warning: false,
-                    auth_action: None,
+                    auth_action: if vercel_ai_gateway_percent.is_none() && matches!(vercel_ai_gateway_text, t if t == strings.fetch_failed || t == strings.credentials_unavailable) { Some(AuthAction::ProviderDiagnosis(QuotaFamilyId::VercelAiGateway)) } else { None },
                 });
             }
             draw_row(
@@ -6291,6 +6659,35 @@ fn paint_content(
     }
 }
 
+/// Select a Claude-credential watcher only when Claude is the *sole* enabled
+/// provider. Other providers do not share Claude's credential source: waiting
+/// on ~/.claude/.credentials.json can suppress their recovery indefinitely.
+/// In mixed-provider configurations, keep periodic bounded retries instead.
+fn auth_watch_mode_for_failed_poll(
+    show_claude_code: bool,
+    show_codex: bool,
+    show_antigravity: bool,
+    show_github_copilot: bool,
+    show_vercel_ai_gateway: bool,
+    error: poller::PollError,
+) -> Option<poller::CredentialWatchMode> {
+    let claude_only = show_claude_code
+        && !show_codex
+        && !show_antigravity
+        && !show_github_copilot
+        && !show_vercel_ai_gateway;
+    if !claude_only {
+        return None;
+    }
+    match error {
+        poller::PollError::AuthRequired | poller::PollError::TokenExpired => {
+            Some(poller::CredentialWatchMode::ActiveSource)
+        }
+        poller::PollError::NoCredentials => Some(poller::CredentialWatchMode::AllSources),
+        poller::PollError::RequestFailed => None,
+    }
+}
+
 fn do_poll(send_hwnd: SendHwnd) {
     let hwnd = send_hwnd.to_hwnd();
     let (
@@ -6402,27 +6799,15 @@ fn do_poll(send_hwnd: SendHwnd) {
             }
         }
         Err(e) => {
-            let auth_watch = match e {
-                poller::PollError::AuthRequired
-                | poller::PollError::TokenExpired
-                | poller::PollError::NoCredentials
-                    if show_github_copilot
-                        && !show_claude_code
-                        && !show_codex
-                        && !show_antigravity =>
-                {
-                    None
-                }
-                poller::PollError::AuthRequired | poller::PollError::TokenExpired => Some((
-                    poller::CredentialWatchMode::ActiveSource,
-                    poller::credential_watch_snapshot(poller::CredentialWatchMode::ActiveSource),
-                )),
-                poller::PollError::NoCredentials => Some((
-                    poller::CredentialWatchMode::AllSources,
-                    poller::credential_watch_snapshot(poller::CredentialWatchMode::AllSources),
-                )),
-                poller::PollError::RequestFailed => None,
-            };
+            let auth_watch = auth_watch_mode_for_failed_poll(
+                show_claude_code,
+                show_codex,
+                show_antigravity,
+                show_github_copilot,
+                show_vercel_ai_gateway,
+                e,
+            )
+            .map(|mode| (mode, poller::credential_watch_snapshot(mode)));
             // Distinguish auth-required errors from transient errors.
             let notify_auth_error = {
                 let mut state = lock_state();
@@ -6915,8 +7300,14 @@ unsafe extern "system" fn on_tray_location_changed(
             }
         };
         if should_reposition {
-            position_at_taskbar();
-            render_layered();
+            let main_hwnd = {
+                let state = lock_state();
+                state.as_ref().map(|s| s.hwnd.to_hwnd())
+            };
+            if let Some(main_hwnd) = main_hwnd {
+                // Do not reposition/render synchronously inside a WinEvent callback.
+                let _ = PostMessageW(main_hwnd, WM_APP_TRAY_REPOSITION, WPARAM(0), LPARAM(0));
+            }
         }
     }
 }
@@ -6992,6 +7383,11 @@ unsafe extern "system" fn wnd_proc(
                 check_language_change();
             }
             refresh_dpi();
+            position_at_taskbar();
+            render_layered();
+            LRESULT(0)
+        }
+        WM_APP_TRAY_REPOSITION => {
             position_at_taskbar();
             render_layered();
             LRESULT(0)
@@ -7153,7 +7549,11 @@ unsafe extern "system" fn wnd_proc(
             };
 
             if interaction == PointerInteractionTarget::HelpButton {
-                show_display_guide(hwnd);
+                if connection_attention_now() {
+                    show_provider_diagnosis(hwnd);
+                } else {
+                    show_display_guide(hwnd);
+                }
                 return LRESULT(0);
             }
 
@@ -7454,6 +7854,7 @@ unsafe extern "system" fn wnd_proc(
                 }
                 IDM_HELP_DISPLAY_GUIDE => show_display_guide(hwnd),
                 IDM_HELP_AI_QUOTAS => show_ai_quota_help(hwnd),
+                IDM_HELP_PROVIDER_DIAGNOSIS => show_provider_diagnosis(hwnd),
                 IDM_HELP_README => {
                     if !open_readme(hwnd) {
                         let strings = current_strings();
@@ -7463,6 +7864,8 @@ unsafe extern "system" fn wnd_proc(
                 IDM_HELP_VERSION_INFORMATION => show_version_information(hwnd),
                 #[cfg(feature = "antigravity")]
                 IDM_HELP_ANTIGRAVITY_SETUP => show_antigravity_setup(hwnd),
+                #[cfg(feature = "antigravity")]
+                IDM_HELP_ANTIGRAVITY_CONNECTION_CHECK => show_antigravity_connection_check(hwnd),
                 #[cfg(feature = "self-update")]
                 IDM_VERSION_ACTION => {
                     let (install_channel, release) = {
@@ -7956,6 +8359,32 @@ fn show_context_menu(hwnd: HWND) {
             PCWSTR::from_raw(refresh_str.as_ptr()),
         );
 
+        let diagnosis_label = if strings.antigravity_setup_title == "Antigravityのセットアップ" {
+
+            "利用枠が表示されない？ 接続診断..."
+
+        } else {
+
+            "Quota not showing? Diagnose connection..."
+
+        };
+
+        let diagnosis_label = native_interop::wide_str(diagnosis_label);
+
+        let _ = AppendMenuW(
+
+            menu,
+
+            MENU_ITEM_FLAGS(0),
+
+            IDM_HELP_PROVIDER_DIAGNOSIS as usize,
+
+            PCWSTR::from_raw(diagnosis_label.as_ptr()),
+
+        );
+
+
+
         let reset_pos_str = native_interop::wide_str(strings.reset_position);
         let _ = AppendMenuW(
             menu,
@@ -8170,7 +8599,14 @@ fn show_context_menu(hwnd: HWND) {
             PCWSTR::from_raw(vercel_ai_gateway_model.as_ptr()),
         );
 
-        let displayed_ai_label = native_interop::wide_str(strings.displayed_ai);
+        // Keep the entry discoverable regardless of the current provider selection.
+        // Dynamic wording previously disagreed with the actual submenu checkmarks.
+        let displayed_ai_entry = if strings.antigravity_setup_title == "Antigravityのセットアップ" {
+            "＋ AIの追加・表示設定..."
+        } else {
+            "+ Add or change displayed AI..."
+        };
+        let displayed_ai_label = native_interop::wide_str(displayed_ai_entry);
         let _ = AppendMenuW(
             menu,
             MF_POPUP,
@@ -8692,6 +9128,7 @@ fn show_context_menu(hwnd: HWND) {
         for (id, label) in [
             (IDM_HELP_DISPLAY_GUIDE, strings.help_display_guide),
             (IDM_HELP_AI_QUOTAS, strings.help_ai_quotas),
+            (IDM_HELP_PROVIDER_DIAGNOSIS, if strings.antigravity_setup_title == "Antigravityのセットアップ" { "AIサービスの接続診断..." } else { "Diagnose AI connections..." }),
         ] {
             let label_str = native_interop::wide_str(label);
             let _ = AppendMenuW(
@@ -8710,6 +9147,18 @@ fn show_context_menu(hwnd: HWND) {
                 MENU_ITEM_FLAGS(0),
                 IDM_HELP_ANTIGRAVITY_SETUP as usize,
                 PCWSTR::from_raw(antigravity_setup_label.as_ptr()),
+            );
+            let verify_label = if strings.antigravity_setup_title == "Antigravityのセットアップ" {
+                "Antigravityの接続を確認..."
+            } else {
+                "Check Antigravity connection..."
+            };
+            let verify_label = native_interop::wide_str(verify_label);
+            let _ = AppendMenuW(
+                help_menu,
+                MENU_ITEM_FLAGS(0),
+                IDM_HELP_ANTIGRAVITY_CONNECTION_CHECK as usize,
+                PCWSTR::from_raw(verify_label.as_ptr()),
             );
         }
         let _ = AppendMenuW(help_menu, MF_SEPARATOR, 0, PCWSTR::null());
@@ -8841,6 +9290,7 @@ fn paint(hdc: HDC, hwnd: HWND) {
         antigravity_session_pct,
         antigravity_session_text,
         antigravity_session_pace,
+        antigravity_weekly_state,
         antigravity_weekly_pct,
         antigravity_weekly_text,
         antigravity_weekly_pace,
@@ -8887,6 +9337,7 @@ fn paint(hdc: HDC, hwnd: HWND) {
                 s.antigravity_session_percent,
                 s.antigravity_session_text.clone(),
                 s.antigravity_session_pace.clone(),
+                s.antigravity_weekly_state,
                 s.antigravity_weekly_percent,
                 s.antigravity_weekly_text.clone(),
                 s.antigravity_weekly_pace.clone(),
@@ -8968,6 +9419,7 @@ fn paint(hdc: HDC, hwnd: HWND) {
             antigravity_session_pct,
             &antigravity_session_text,
             antigravity_session_pace.as_ref(),
+            antigravity_weekly_state,
             antigravity_weekly_pct,
             &antigravity_weekly_text,
             antigravity_weekly_pace.as_ref(),
@@ -9370,6 +9822,16 @@ struct RowCell<'a> {
     auth_action: Option<AuthAction>,
 }
 
+/// The leading chevron stays visible even when a narrow provider column
+/// truncates the status, making its existing recovery click target discoverable.
+fn actionable_status_label(text: &str, action: Option<AuthAction>) -> String {
+    if action.is_some() && !text.is_empty() {
+        format!("› {text}")
+    } else {
+        text.to_owned()
+    }
+}
+
 fn draw_row(
     hdc: HDC,
     client_width: i32,
@@ -9421,6 +9883,7 @@ fn draw_row(
             } else {
                 *text_color
             };
+            let display_text = actionable_status_label(cell.text, cell.auth_action);
             let drawn_text_rect = draw_usage_bar(
                 hdc,
                 model_x,
@@ -9428,7 +9891,7 @@ fn draw_row(
                 segment_count,
                 text_width,
                 cell.percent,
-                cell.text,
+                &display_text,
                 cell.accent,
                 track,
                 &value_color,
@@ -9669,6 +10132,22 @@ fn draw_rounded_rect(hdc: HDC, rect: &RECT, color: &Color, radius: i32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn custom_window_message_ids_are_unique() {
+        let mut ids = vec![
+            WM_APP_USAGE_UPDATED,
+            WM_APP_TRAY,
+            WM_APP_DEFERRED_TRAY_TOGGLE,
+            WM_APP_TRAY_REPOSITION,
+        ];
+        #[cfg(feature = "self-update")]
+        ids.push(WM_APP_UPDATE_CHECK_COMPLETE);
+        let count = ids.len();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), count, "WM_APP message IDs must be unique");
+    }
     use crate::models::{QuotaItem, QuotaItemAvailability, QuotaUnit};
 
     fn generic_item(metric: Option<QuotaMetric>, resets_at: Option<SystemTime>) -> QuotaItem {
@@ -9905,6 +10384,140 @@ mod tests {
         assert_eq!(strings.pace_diff_label, "予定差");
     }
 
+    #[test]
+    fn vercel_missing_key_is_classified_without_guessing_other_failures() {
+        assert_eq!(
+            provider_error_cell_state(
+                QuotaFamilyId::VercelAiGateway,
+                poller::PollError::NoCredentials
+            ),
+            CellState::CredentialsUnavailable
+        );
+        assert_eq!(
+            provider_error_cell_state(
+                QuotaFamilyId::VercelAiGateway,
+                poller::PollError::AuthRequired
+            ),
+            CellState::FetchFailed
+        );
+        assert_eq!(
+            provider_error_cell_state(
+                QuotaFamilyId::VercelAiGateway,
+                poller::PollError::RequestFailed
+            ),
+            CellState::FetchFailed
+        );
+        // Never offer an automatic provider login CTA where none is safe.
+        assert_eq!(
+            provider_auth_action(
+                QuotaFamilyId::VercelAiGateway,
+                CellState::CredentialsUnavailable
+            ),
+            Some(AuthAction::ProviderDiagnosis(QuotaFamilyId::VercelAiGateway))
+        );
+    }
+
+    #[test]
+    fn copilot_ambiguous_auth_failure_is_not_claimed_as_expired_credentials() {
+        assert_eq!(
+            provider_error_cell_state(
+                QuotaFamilyId::GithubCopilot,
+                poller::PollError::AuthRequired
+            ),
+            CellState::FetchFailed
+        );
+    }
+
+    #[test]
+    fn credential_watch_stays_for_claude_only() {
+        assert_eq!(
+            auth_watch_mode_for_failed_poll(
+                true,
+                false,
+                false,
+                false,
+                false,
+                poller::PollError::NoCredentials
+            ),
+            Some(poller::CredentialWatchMode::AllSources)
+        );
+        assert_eq!(
+            auth_watch_mode_for_failed_poll(
+                true,
+                false,
+                false,
+                false,
+                false,
+                poller::PollError::TokenExpired
+            ),
+            Some(poller::CredentialWatchMode::ActiveSource)
+        );
+        assert_eq!(
+            auth_watch_mode_for_failed_poll(
+                true,
+                false,
+                false,
+                false,
+                false,
+                poller::PollError::RequestFailed
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn unrelated_provider_failures_keep_periodic_retry() {
+        let examples = [
+            (
+                false,
+                true,
+                false,
+                false,
+                false,
+                poller::PollError::NoCredentials,
+            ),
+            (
+                false,
+                false,
+                false,
+                false,
+                true,
+                poller::PollError::NoCredentials,
+            ),
+            (
+                false,
+                false,
+                false,
+                false,
+                true,
+                poller::PollError::AuthRequired,
+            ),
+            (
+                true,
+                true,
+                false,
+                false,
+                false,
+                poller::PollError::NoCredentials,
+            ),
+            (
+                false,
+                true,
+                false,
+                true,
+                false,
+                poller::PollError::NoCredentials,
+            ),
+        ];
+        for (claude, codex, ag, copilot, vercel, error) in examples {
+            assert_eq!(
+                auth_watch_mode_for_failed_poll(claude, codex, ag, copilot, vercel, error),
+                None,
+                "a non-Claude-only failure must never watch Claude credentials"
+            );
+        }
+    }
+
     // ── AUTH-RECOVERY-CTA-IMPLEMENT-01: only a high-confidence auth state,
     // for a provider with a safe official CLI login entry point, is ever
     // CTA-eligible. ──────────────────────────────────────────────────────
@@ -9936,35 +10549,111 @@ mod tests {
             CellState::Disabled,
             CellState::NotAvailable,
         ] {
-            assert_eq!(provider_auth_action(QuotaFamilyId::Claude, state), None);
-            assert_eq!(provider_auth_action(QuotaFamilyId::Codex, state), None);
+            let expected_claude = if state == CellState::FetchFailed { Some(AuthAction::ProviderDiagnosis(QuotaFamilyId::Claude)) } else { None };
+            let expected_codex = if state == CellState::FetchFailed { Some(AuthAction::ProviderDiagnosis(QuotaFamilyId::Codex)) } else { None };
+            assert_eq!(provider_auth_action(QuotaFamilyId::Claude, state), expected_claude);
+            assert_eq!(provider_auth_action(QuotaFamilyId::Codex, state), expected_codex);
         }
     }
 
     #[test]
-    fn github_copilot_and_antigravity_are_never_cta_eligible() {
-        for state in [
-            CellState::Loading,
-            CellState::Ok,
-            CellState::AuthenticationExpired,
-            CellState::AuthenticationProblem,
-            CellState::CredentialsUnavailable,
-            CellState::FetchFailed,
-            CellState::Disabled,
-            CellState::NotAvailable,
-        ] {
-            assert_eq!(
-                provider_auth_action(QuotaFamilyId::GithubCopilot, state),
-                None,
-                "GitHub Copilot must never be CTA-eligible (state={state:?}): its failure \
-                 signal can't distinguish not-logged-in from wrong-scope"
-            );
-            assert_eq!(
-                provider_auth_action(QuotaFamilyId::Antigravity, state),
-                None,
-                "Antigravity must never be CTA-eligible (state={state:?}): its CLI has no \
-                 login/auth subcommand"
-            );
+    fn github_copilot_is_never_cta_eligible() {
+        for state in [CellState::Ok, CellState::Loading, CellState::Disabled, CellState::NotAvailable] {
+            assert_eq!(provider_auth_action(QuotaFamilyId::GithubCopilot, state), None);
+        }
+        for state in [CellState::FetchFailed, CellState::AuthenticationProblem, CellState::CredentialsUnavailable] {
+            assert_eq!(provider_auth_action(QuotaFamilyId::GithubCopilot, state), Some(AuthAction::ProviderDiagnosis(QuotaFamilyId::GithubCopilot)));
+        }
+    }
+
+    #[test]
+    fn antigravity_missing_cache_diagnosis_is_not_auth_failure() {
+        let text = antigravity_cache_diagnosis(
+            LanguageId::Japanese.strings(),
+            &crate::antigravity_statusline::CacheReadResult::Missing,
+        );
+        assert!(text.contains("連携データがありません"));
+        assert!(!text.contains("認証切れ"));
+    }
+
+    #[test]
+    fn antigravity_cli_discovery_distinguishes_not_found_from_not_installed() {
+        let ja = LanguageId::Japanese.strings();
+        assert!(antigravity_cli_discovery_text(ja, false).contains("検索パス"));
+        assert!(antigravity_cli_discovery_text(ja, false).contains("可能性"));
+        assert!(antigravity_cli_discovery_text(ja, true).contains("見つかりました"));
+    }
+
+    #[test]
+    fn provider_diagnosis_does_not_claim_auth_for_generic_failures() {
+        let rows = [
+            (QuotaFamilyId::Claude, CellState::FetchFailed),
+            (QuotaFamilyId::Codex, CellState::FetchFailed),
+            (QuotaFamilyId::GithubCopilot, CellState::FetchFailed),
+            (QuotaFamilyId::VercelAiGateway, CellState::CredentialsUnavailable),
+            (QuotaFamilyId::Antigravity, CellState::FetchFailed),
+        ];
+        let ja = build_provider_diagnosis(true, &rows);
+        assert!(ja.contains("原因は特定できていません"));
+        assert!(ja.contains("GitHub CLI"));
+        assert!(ja.contains("AI_GATEWAY_API_KEY"));
+        assert!(ja.contains("Antigravityの接続を確認"));
+        assert!(!ja.contains("認証切れです"));
+        let en = build_provider_diagnosis(false, &rows);
+        assert!(en.contains("The exact cause is unknown"));
+        assert!(en.contains("No key value is displayed"));
+    }
+
+    #[test]
+    fn antigravity_connection_states_distinguish_readiness_and_stale_data() {
+        use crate::antigravity_statusline::{
+            CacheReadResult, SanitizedCache, SanitizedQuotaEntry, CACHE_SCHEMA_VERSION, CACHE_SOURCE,
+        };
+        use std::collections::BTreeMap;
+        let now = UNIX_EPOCH + Duration::from_secs(10_000);
+        assert_eq!(antigravity_connection_state(&CacheReadResult::Missing, now), AntigravityConnectionState::NoCache);
+        assert_eq!(antigravity_connection_state(&CacheReadResult::Malformed("bad".into()), now), AntigravityConnectionState::UnreadableCache);
+        assert_eq!(antigravity_connection_state(&CacheReadResult::UnsupportedSchema(999), now), AntigravityConnectionState::UnsupportedSchema);
+        let mut cache = SanitizedCache {
+            schema_version: CACHE_SCHEMA_VERSION,
+            source: CACHE_SOURCE.to_string(),
+            captured_at_unix: 9_000,
+            cli_version: None,
+            plan_tier: None,
+            quota: BTreeMap::new(),
+        };
+        assert_eq!(antigravity_connection_state(&CacheReadResult::Valid(cache.clone()), now), AntigravityConnectionState::EmptyQuota);
+        cache.quota.insert("gemini-weekly".into(), SanitizedQuotaEntry {
+            remaining_fraction: 0.4,
+            reset_time_unix: 9_999,
+            reset_in_seconds: None,
+        });
+        assert_eq!(antigravity_connection_state(&CacheReadResult::Valid(cache.clone()), now), AntigravityConnectionState::AwaitingFreshReading);
+        cache.quota.insert("3p-weekly".into(), SanitizedQuotaEntry {
+            remaining_fraction: 0.7,
+            reset_time_unix: 10_001,
+            reset_in_seconds: None,
+        });
+        assert_eq!(antigravity_connection_state(&CacheReadResult::Valid(cache), now), AntigravityConnectionState::CurrentQuota { active: 1, total: 2 });
+    }
+
+    #[test]
+    fn antigravity_connection_status_is_explicitly_not_live_auth_verification() {
+        let msg = antigravity_connection_result_text(
+            LanguageId::Japanese.strings(),
+            &AntigravityConnectionState::CurrentQuota { active: 1, total: 2 },
+        );
+        assert!(msg.contains("1/2"));
+        assert!(msg.contains("保証するものではありません"));
+    }
+
+    #[test]
+    fn antigravity_failure_opens_setup_not_login() {
+        for state in [CellState::FetchFailed, CellState::CredentialsUnavailable, CellState::AuthenticationProblem] {
+            assert_eq!(provider_auth_action(QuotaFamilyId::Antigravity, state), Some(AuthAction::AntigravitySetup));
+        }
+        for state in [CellState::Ok, CellState::Loading, CellState::Disabled, CellState::NotAvailable, CellState::AuthenticationExpired] {
+            assert_eq!(provider_auth_action(QuotaFamilyId::Antigravity, state), None);
         }
     }
 
@@ -10417,6 +11106,43 @@ mod tests {
             pointer_interaction_target(300, 210, 600, 6, 30, help_rect, &hits),
             PointerInteractionTarget::None
         );
+    }
+
+    #[test]
+    fn actionable_status_marked_only_when_there_is_a_recovery_action() {
+        assert_eq!(actionable_status_label("取得失敗", Some(AuthAction::ProviderDiagnosis(QuotaFamilyId::Claude))), "› 取得失敗");
+        assert_eq!(actionable_status_label("取得失敗", None), "取得失敗");
+        assert_eq!(actionable_status_label("", Some(AuthAction::ClaudeLogin)), "");
+    }
+
+    #[test]
+    fn connection_attention_only_for_enabled_provider_failures() {
+        for state in [
+            CellState::FetchFailed,
+            CellState::AuthenticationExpired,
+            CellState::AuthenticationProblem,
+            CellState::CredentialsUnavailable,
+        ] {
+            assert!(any_enabled_connection_issue(&[(true, state)]));
+            assert!(!any_enabled_connection_issue(&[(false, state)]));
+        }
+        for state in [
+            CellState::Ok,
+            CellState::Loading,
+            CellState::NotAvailable,
+            CellState::Disabled,
+        ] {
+            assert!(!any_enabled_connection_issue(&[(true, state)]));
+        }
+        assert!(any_enabled_connection_issue(&[
+            (false, CellState::FetchFailed),
+            (true, CellState::Ok),
+            (true, CellState::AuthenticationProblem),
+        ]));
+        assert!(!any_enabled_connection_issue(&[
+            (false, CellState::AuthenticationExpired),
+            (true, CellState::Ok),
+        ]));
     }
 
     #[test]
@@ -12538,6 +13264,7 @@ mod tests {
             IDM_RESET_DISPLAY_ABSOLUTE,
             IDM_HELP_DISPLAY_GUIDE,
             IDM_HELP_AI_QUOTAS,
+            IDM_HELP_PROVIDER_DIAGNOSIS,
             IDM_HELP_README,
             IDM_HELP_VERSION_INFORMATION,
             IDM_VIRTUAL_DESKTOP_SCOPE_ALL,
@@ -12550,6 +13277,8 @@ mod tests {
         ids.push(IDM_MODEL_ANTIGRAVITY);
         #[cfg(feature = "antigravity")]
         ids.push(IDM_HELP_ANTIGRAVITY_SETUP);
+        #[cfg(feature = "antigravity")]
+        ids.push(IDM_HELP_ANTIGRAVITY_CONNECTION_CHECK);
 
         for i in 0..ids.len() {
             for j in (i + 1)..ids.len() {

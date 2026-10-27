@@ -12,7 +12,7 @@ param(
     [ValidateNotNullOrEmpty()]
     [string]$PublisherDisplayName,
 
-    [string]$DisplayName = 'AI Usage Monitor',
+    [string]$DisplayName = 'Solidaily AI Usage Monitor',
 
     [string]$Description = 'Monitor usage limits and budgets for supported AI services.',
 

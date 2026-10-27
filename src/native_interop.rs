@@ -33,6 +33,7 @@ pub const TIMER_VIRTUAL_DESKTOP_EVENT_SETTLE: usize = 5;
 pub const WM_APP: u32 = 0x8000;
 pub const WM_APP_USAGE_UPDATED: u32 = WM_APP + 1;
 pub const WM_APP_TRAY: u32 = WM_APP + 3;
+pub const WM_APP_TRAY_REPOSITION: u32 = WM_APP + 5;
 
 #[derive(Clone, Copy, Debug)]
 pub struct TaskbarWindow {

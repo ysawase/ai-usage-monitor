@@ -18,8 +18,13 @@
     <DisplayName>AI Usage Monitor (Local MSIX Trial)</DisplayName>
     <PublisherDisplayName>Local sideload trial</PublisherDisplayName>
     <Description>Local-only full-trust MSIX compatibility trial for AI Usage Monitor.</Description>
-    <Logo>Assets\StoreLogo.png</Logo>
+    <Logo>Assets/StoreLogo.png</Logo>
   </Properties>
+
+  <Resources>
+    <Resource Language="en-US" />
+    <Resource Language="ja-JP" />
+  </Resources>
 
   <Dependencies>
     <TargetDeviceFamily
@@ -38,8 +43,8 @@
         DisplayName="AI Usage Monitor (Local MSIX Trial)"
         Description="Local-only full-trust MSIX compatibility trial for AI Usage Monitor."
         BackgroundColor="transparent"
-        Square44x44Logo="Assets\Square44x44Logo.png"
-        Square150x150Logo="Assets\Square150x150Logo.png" />
+        Square44x44Logo="Assets/Square44x44Logo.png"
+        Square150x150Logo="Assets/Square150x150Logo.png" />
       <Extensions>
         <desktop:Extension
           Category="windows.startupTask"
@@ -51,22 +56,11 @@
             Enabled="false"
             DisplayName="AI Usage Monitor" />
         </desktop:Extension>
-      </Extensions>
-    </Application>
-    <Application
-      Id="AumQuotaBridge"
-      Executable="aum-quota.exe"
-      uap10:RuntimeBehavior="win32App"
-      uap10:TrustLevel="mediumIL">
-      <uap:VisualElements
-        AppListEntry="none"
-        DisplayName="AI Usage Monitor (Local MSIX Trial)"
-        Description="Local-only full-trust MSIX compatibility trial for AI Usage Monitor."
-        BackgroundColor="transparent"
-        Square44x44Logo="Assets\Square44x44Logo.png"
-        Square150x150Logo="Assets\Square150x150Logo.png" />
-      <Extensions>
-        <uap3:Extension Category="windows.appExecutionAlias">
+        <uap3:Extension
+          Category="windows.appExecutionAlias"
+          Executable="aum-quota.exe"
+          uap10:RuntimeBehavior="win32App"
+          uap10:TrustLevel="mediumIL">
           <uap3:AppExecutionAlias>
             <desktop:ExecutionAlias Alias="aum-quota.exe" />
           </uap3:AppExecutionAlias>

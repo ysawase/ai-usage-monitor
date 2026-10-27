@@ -68,11 +68,17 @@ pub(super) const STRINGS: Strings = Strings {
     antigravity_setup_menu_item: "Antigravityのセットアップ...",
     antigravity_setup_title: "Antigravityのセットアップ",
     antigravity_setup_intro: concat!(
-        "Antigravityの利用状況は、Antigravity CLI自体のステータスライン機能を通じて読み取ります。",
-        "このアプリはGoogleアカウントの認証情報を読み取らず、Googleへ直接アクセスすることもありません。\n\n",
-        "1. Antigravity CLIを開きます。\n",
-        "2. 以下のコマンドを実行します。\n",
-        "3. Antigravityを通常どおり使用すると、利用状況が自動的にここに表示されます。"
+        "Antigravityの利用状況は、Antigravity CLIのステータスライン機能から読み取ります。\n",
+        "これは一般的なAntigravityのデスクトップアプリとは異なる、コマンド操作用のソフトです。\n",
+        "このモニターはGoogleの認証情報を読み取らず、Googleへ直接接続しません。\n\n",
+        "【接続までの手順】\n",
+        "1. お使いのPCにAntigravity CLI（agy）があるか、下の診断を確認します。\n",
+        "2. CLIがない場合は、提供元の案内に従ってCLIを導入・ログインしてください。\n",
+        "3. CLIを開き、下の /statusline コマンドをCLI内で実行します（PowerShellではありません）。\n",
+        "4. CLIで通常の操作をすると、利用状況がモニターに反映されます。\n",
+        "5. 反映しない場合はCLIの設定やコマンドの実行結果を確認してください。\n\n",
+        "注: この操作はCLI側のステータスライン設定を変更します。既存の表示を上書きする場合があります。\n",
+        "使わない場合は、この画面下部の解除コマンドで元に戻せます。"
     ),
     antigravity_setup_command_label: "実行するコマンド（クリップボードにコピー済み）:",
     antigravity_setup_disable_label: "後で解除するには、次を実行してください:",

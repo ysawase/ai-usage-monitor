@@ -65,11 +65,16 @@ pub(super) const STRINGS: Strings = Strings {
     antigravity_setup_menu_item: "Antigravity Setup...",
     antigravity_setup_title: "Antigravity Setup",
     antigravity_setup_intro: concat!(
-        "Antigravity usage is read through the Antigravity CLI's own status line feature. ",
-        "This app does not read your Google account credentials and does not contact Google directly.\n\n",
-        "1. Open the Antigravity CLI.\n",
-        "2. Run the command below.\n",
-        "3. Use Antigravity normally — your usage will appear here automatically."
+        "Antigravity usage is read through the Antigravity CLI's status line; this is a command-line tool, not merely the desktop application.\n",
+        "This monitor does not read Google credentials or contact Google directly.\n\n",
+        "Steps to connect:\n",
+        "1. Check below whether the Antigravity CLI (agy) is detected on PATH.\n",
+        "2. If it is unavailable, follow the provider's installation/sign-in instructions.\n",
+        "3. Open the Antigravity CLI and enter the /statusline command below INSIDE that CLI, not Windows PowerShell.\n",
+        "4. Use the CLI normally to send an updated reading to the monitor.\n",
+        "5. If it still does not appear, inspect the CLI configuration and command output.\n\n",
+        "CAUTION: /statusline changes the CLI's status line configuration and may replace existing display settings.\n",
+        "Use the removal command shown below to undo the integration."
     ),
     antigravity_setup_command_label: "Command to run (copied to clipboard):",
     antigravity_setup_disable_label: "To remove it later, run:",
