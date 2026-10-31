@@ -22,6 +22,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - name: Install .NET 8 SDK
         uses: actions/setup-dotnet@v4
         with:
@@ -33,7 +35,7 @@ jobs:
       - name: Ensure tracked Rust product files remain unchanged
         shell: pwsh
         run: |
-          git diff --exit-code HEAD^ HEAD -- src Cargo.toml Cargo.lock
+          git diff --exit-code origin/main HEAD -- src Cargo.toml Cargo.lock
       - name: Check forbidden integrations are absent
         shell: pwsh
         run: |
