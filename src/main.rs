@@ -57,3 +57,4 @@ fn main() {
     window::run();
 }
 mod muse_bridge;
+mod muse_status_view;
