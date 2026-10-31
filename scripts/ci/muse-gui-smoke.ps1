@@ -40,12 +40,18 @@ public static class MuseWin32Smoke {
 }
 '@
 
-$originalLocal = $env:LOCALAPPDATA
-$sandbox = Join-Path $env:RUNNER_TEMP ("aum-muse-ui-" + [guid]::NewGuid().ToString("N"))
-$env:LOCALAPPDATA = $sandbox
-$cacheDir = Join-Path $sandbox "Solidaily\AIUsageMonitor"
-New-Item -ItemType Directory -Force -Path $cacheDir | Out-Null
+# dirs::data_local_dir() uses Windows Known Folders, not the LOCALAPPDATA
+# environment override. This test must only write on an ephemeral CI runner.
+if ($env:GITHUB_ACTIONS -ne "true") {
+  throw "Refusing to write the Windows Known Folder outside GitHub Actions"
+}
+$localData = [System.Environment]::GetFolderPath([System.Environment+SpecialFolder]::LocalApplicationData)
+if ([string]::IsNullOrWhiteSpace($localData)) { throw "Windows LocalApplicationData folder unavailable" }
+$cacheDir = Join-Path $localData "Solidaily\AIUsageMonitor"
 $cache = Join-Path $cacheDir "muse-observation-v1.json"
+if (Test-Path -LiteralPath $cache) { throw "Refusing to overwrite an existing Muse observation" }
+New-Item -ItemType Directory -Force -Path $cacheDir | Out-Null
+Write-Output "MUSE_GUI_SMOKE: using Windows LocalApplicationData known folder"
 $process = $null
 
 function Observe-Dialog([int]$targetProcessId, [string]$expected, [string]$case) {
@@ -116,6 +122,6 @@ finally {
     try {if(-not $process.HasExited){Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue}}catch{}
     $process.Dispose()
   }
-  $env:LOCALAPPDATA=$originalLocal
-  Remove-Item -LiteralPath $sandbox -Force -Recurse -ErrorAction SilentlyContinue
+  # Remove only the test-owned observation; never delete a real profile tree.
+  Remove-Item -LiteralPath $cache -Force -ErrorAction SilentlyContinue
 }
