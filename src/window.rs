@@ -142,7 +142,12 @@ impl AuthAction {
 /// Generic failures are never guessed to be auth-related.
 fn provider_auth_action(family: QuotaFamilyId, state: CellState) -> Option<AuthAction> {
     if family == QuotaFamilyId::Antigravity {
-        return if matches!(state, CellState::FetchFailed | CellState::CredentialsUnavailable | CellState::AuthenticationProblem) {
+        return if matches!(
+            state,
+            CellState::FetchFailed
+                | CellState::CredentialsUnavailable
+                | CellState::AuthenticationProblem
+        ) {
             Some(AuthAction::AntigravitySetup)
         } else {
             None
@@ -165,8 +170,9 @@ fn provider_auth_action(family: QuotaFamilyId, state: CellState) -> Option<AuthA
         QuotaFamilyId::Claude => Some(AuthAction::ClaudeLogin),
         QuotaFamilyId::Codex => Some(AuthAction::CodexLogin),
         QuotaFamilyId::Antigravity => Some(AuthAction::AntigravitySetup),
-        QuotaFamilyId::GithubCopilot | QuotaFamilyId::VercelAiGateway =>
-            Some(AuthAction::ProviderDiagnosis(family)),
+        QuotaFamilyId::GithubCopilot | QuotaFamilyId::VercelAiGateway => {
+            Some(AuthAction::ProviderDiagnosis(family))
+        }
     }
 }
 
@@ -3530,7 +3536,8 @@ fn build_provider_diagnosis(ja: bool, rows: &[(QuotaFamilyId, CellState)]) -> St
         "各サービスの直近の取得状態です。原因が確認できない場合は推測していません。\n"
     } else {
         "Latest polling states. Unconfirmed causes are not treated as facts.\n"
-    }.to_string();
+    }
+    .to_string();
     for &(family, state) in rows {
         let label = match family {
             QuotaFamilyId::Claude => "Claude Code",
@@ -3551,7 +3558,9 @@ fn build_provider_diagnosis(ja: bool, rows: &[(QuotaFamilyId, CellState)]) -> St
 fn show_single_provider_diagnosis(hwnd: HWND, family: QuotaFamilyId) {
     let (ja, state) = {
         let guard = lock_state();
-        let Some(s) = guard.as_ref() else { return; };
+        let Some(s) = guard.as_ref() else {
+            return;
+        };
         let state = match family {
             QuotaFamilyId::Claude => s.weekly_state,
             QuotaFamilyId::Codex => s.codex_weekly_state,
@@ -3561,8 +3570,16 @@ fn show_single_provider_diagnosis(hwnd: HWND, family: QuotaFamilyId) {
         };
         (s.language == LanguageId::Japanese, state)
     };
-    let title = if ja { "AIサービスの接続診断" } else { "AI provider connection diagnosis" };
-    show_info_message(hwnd, title, &build_provider_diagnosis(ja, &[(family, state)]));
+    let title = if ja {
+        "AIサービスの接続診断"
+    } else {
+        "AI provider connection diagnosis"
+    };
+    show_info_message(
+        hwnd,
+        title,
+        &build_provider_diagnosis(ja, &[(family, state)]),
+    );
 }
 
 /// Read-only status view for personal muse.ai. Does not query a private endpoint,
@@ -3571,10 +3588,16 @@ fn show_muse_status(hwnd: HWND) {
     use crate::muse_bridge::{MuseConnectionState, MuseReading};
     let ja = {
         let guard = lock_state();
-        guard.as_ref().map_or(false, |s| s.language == LanguageId::Japanese)
+        guard
+            .as_ref()
+            .map_or(false, |s| s.language == LanguageId::Japanese)
     };
     let reading = dirs::data_local_dir()
-        .map(|dir| dir.join("Solidaily").join("AIUsageMonitor").join("muse-observation-v1.json"))
+        .map(|dir| {
+            dir.join("Solidaily")
+                .join("AIUsageMonitor")
+                .join("muse-observation-v1.json")
+        })
         .and_then(|path| {
             // Bound file size before reading; a malformed or secret-bearing file
             // must never be shown as a valid quota.
@@ -3585,34 +3608,65 @@ fn show_muse_status(hwnd: HWND) {
             }
         })
         .map(|raw| {
-            let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs());
             MuseReading::from_json(&raw, now)
         })
         .unwrap_or_else(MuseReading::not_connected);
     let body = match reading.state {
         MuseConnectionState::NotConnected => {
-            if ja { "Museは未接続です。ブラウザとの連携はまだ試験段階で、この画面からログインや接続はできません。".to_string() }
-            else { "Muse is not connected. The browser companion is experimental; sign-in and connection are not available from this screen.".to_string() }
+            if ja {
+                "Museは未接続です。ブラウザとの連携はまだ試験段階で、この画面からログインや接続はできません。".to_string()
+            } else {
+                "Muse is not connected. The browser companion is experimental; sign-in and connection are not available from this screen.".to_string()
+            }
         }
         MuseConnectionState::Invalid => {
-            if ja { "Museの連携データを確認できません。使用率0%ではありません。".to_string() }
-            else { "Muse connection data could not be validated. This does not mean 0% usage.".to_string() }
+            if ja {
+                "Museの連携データを確認できません。使用率0%ではありません。".to_string()
+            } else {
+                "Muse connection data could not be validated. This does not mean 0% usage."
+                    .to_string()
+            }
         }
         MuseConnectionState::Stale => {
-            if ja { "Museの取得データは古くなっています。現在の利用率として表示しません。".to_string() }
-            else { "The Muse observation is stale and cannot be displayed as current usage.".to_string() }
+            if ja {
+                "Museの取得データは古くなっています。現在の利用率として表示しません。".to_string()
+            } else {
+                "The Muse observation is stale and cannot be displayed as current usage."
+                    .to_string()
+            }
         }
         MuseConnectionState::Current => {
-            let used = reading.weekly_used_percent.map(|value| format!("{value:.0}%"))
-                .unwrap_or_else(|| if ja { "取得不可".to_string() } else { "Unavailable".to_string() });
+            let used = reading
+                .weekly_used_percent
+                .map(|value| format!("{value:.0}%"))
+                .unwrap_or_else(|| {
+                    if ja {
+                        "取得不可".to_string()
+                    } else {
+                        "Unavailable".to_string()
+                    }
+                });
             let plan = reading.plan.as_deref().unwrap_or("Unknown");
-            let reset = reading.weekly_resets_at_unix
+            let reset = reading
+                .weekly_resets_at_unix
                 .and_then(|secs| UNIX_EPOCH.checked_add(Duration::from_secs(secs)))
-                .and_then(|reset_time| format_absolute_reset_time(
-                    Some(reset_time),
-                    SystemTime::now(),
-                    current_strings()))
-                .unwrap_or_else(|| if ja { "不明".to_string() } else { "Unknown".to_string() });
+                .and_then(|reset_time| {
+                    format_absolute_reset_time(
+                        Some(reset_time),
+                        SystemTime::now(),
+                        current_strings(),
+                    )
+                })
+                .unwrap_or_else(|| {
+                    if ja {
+                        "不明".to_string()
+                    } else {
+                        "Unknown".to_string()
+                    }
+                });
             if ja {
                 format!("プラン: {plan}\n週間使用率: {used}\nリセット日時: {reset}\n\nこれはローカル連携データです。Metaの公式API取得を意味しません。")
             } else {
@@ -3620,13 +3674,23 @@ fn show_muse_status(hwnd: HWND) {
             }
         }
     };
-    show_info_message(hwnd, if ja { "Muse（試験的な接続状態）" } else { "Muse (experimental connection)" }, &body);
+    show_info_message(
+        hwnd,
+        if ja {
+            "Muse（試験的な接続状態）"
+        } else {
+            "Muse (experimental connection)"
+        },
+        &body,
+    );
 }
 
 fn show_provider_diagnosis(hwnd: HWND) {
     let (ja, rows) = {
         let state = lock_state();
-        let Some(s) = state.as_ref() else { return; };
+        let Some(s) = state.as_ref() else {
+            return;
+        };
         (
             s.language == LanguageId::Japanese,
             vec![
@@ -3638,7 +3702,11 @@ fn show_provider_diagnosis(hwnd: HWND) {
             ],
         )
     };
-    let title = if ja { "AIサービスの接続診断" } else { "AI provider connection diagnosis" };
+    let title = if ja {
+        "AIサービスの接続診断"
+    } else {
+        "AI provider connection diagnosis"
+    };
     show_info_message(hwnd, title, &build_provider_diagnosis(ja, &rows));
 }
 
@@ -3663,11 +3731,17 @@ fn show_display_guide(hwnd: HWND) {
 fn build_antigravity_setup_text(strings: Strings) -> String {
     let mut message = String::from(strings.antigravity_setup_intro);
     message.push_str("\n\n");
-    message.push_str(&antigravity_cache_diagnosis(strings, &crate::antigravity_statusline::read_cache(
-        &crate::antigravity_statusline::default_cache_path(),
-    )));
+    message.push_str(&antigravity_cache_diagnosis(
+        strings,
+        &crate::antigravity_statusline::read_cache(
+            &crate::antigravity_statusline::default_cache_path(),
+        ),
+    ));
     message.push_str("\n\n");
-    message.push_str(antigravity_cli_discovery_text(strings, antigravity_cli_on_path()));
+    message.push_str(antigravity_cli_discovery_text(
+        strings,
+        antigravity_cli_on_path(),
+    ));
     message.push_str("\n\n");
     message.push_str(strings.antigravity_setup_command_label);
     message.push('\n');
@@ -3708,7 +3782,11 @@ fn antigravity_cli_on_path() -> bool {
     std::env::var_os("PATH")
         .into_iter()
         .flat_map(|paths| std::env::split_paths(&paths).collect::<Vec<_>>())
-        .any(|dir| ["agy.exe", "agy.cmd", "agy.bat"].iter().any(|name| dir.join(name).is_file()))
+        .any(|dir| {
+            ["agy.exe", "agy.cmd", "agy.bat"]
+                .iter()
+                .any(|name| dir.join(name).is_file())
+        })
 }
 
 fn antigravity_cli_discovery_text(strings: Strings, found: bool) -> &'static str {
@@ -3749,17 +3827,26 @@ fn antigravity_connection_state(
             if items.is_empty() {
                 return AntigravityConnectionState::EmptyQuota;
             }
-            let active = items.iter().filter(|i| i.availability == QuotaItemAvailability::Available).count();
+            let active = items
+                .iter()
+                .filter(|i| i.availability == QuotaItemAvailability::Available)
+                .count();
             if active == 0 {
                 AntigravityConnectionState::AwaitingFreshReading
             } else {
-                AntigravityConnectionState::CurrentQuota { active, total: items.len() }
+                AntigravityConnectionState::CurrentQuota {
+                    active,
+                    total: items.len(),
+                }
             }
         }
     }
 }
 
-fn antigravity_connection_result_text(strings: Strings, state: &AntigravityConnectionState) -> String {
+fn antigravity_connection_result_text(
+    strings: Strings,
+    state: &AntigravityConnectionState,
+) -> String {
     let ja = strings.antigravity_setup_title == "Antigravityのセットアップ";
     let message = match (ja, state) {
         (true, AntigravityConnectionState::NoCache) =>
@@ -3864,13 +3951,25 @@ fn show_antigravity_setup(hwnd: HWND) {
         let title = native_interop::wide_str(strings.antigravity_setup_title);
         let question = native_interop::wide_str(question);
         let answer = unsafe {
-            MessageBoxW(hwnd, PCWSTR::from_raw(question.as_ptr()), PCWSTR::from_raw(title.as_ptr()), MB_YESNO | MB_ICONQUESTION)
+            MessageBoxW(
+                hwnd,
+                PCWSTR::from_raw(question.as_ptr()),
+                PCWSTR::from_raw(title.as_ptr()),
+                MB_YESNO | MB_ICONQUESTION,
+            )
         };
         if answer == IDYES {
             let verb = native_interop::wide_str("open");
             let url = native_interop::wide_str(ANTIGRAVITY_CLI_GUIDE_URL);
             unsafe {
-                let _ = ShellExecuteW(hwnd, PCWSTR::from_raw(verb.as_ptr()), PCWSTR::from_raw(url.as_ptr()), PCWSTR::null(), PCWSTR::null(), SW_SHOWNORMAL);
+                let _ = ShellExecuteW(
+                    hwnd,
+                    PCWSTR::from_raw(verb.as_ptr()),
+                    PCWSTR::from_raw(url.as_ptr()),
+                    PCWSTR::null(),
+                    PCWSTR::null(),
+                    SW_SHOWNORMAL,
+                );
             }
         }
     }
@@ -6271,7 +6370,8 @@ fn paint_content(
         let _ = DeleteObject(help_border_brush);
         let _ = SetTextColor(hdc, COLORREF(heading_text.to_colorref()));
         let mut help_text_rect = help_rect;
-        let mut help_text = native_interop::wide_str(if connection_attention_now() { "!" } else { "?" });
+        let mut help_text =
+            native_interop::wide_str(if connection_attention_now() { "!" } else { "?" });
         let _ = DrawTextW(
             hdc,
             &mut help_text,
@@ -6345,7 +6445,10 @@ fn paint_content(
                 accent: antigravity_accent,
                 provider_text_color: antigravity_usage_text_color(provider_tint_dark),
                 is_warning: false,
-                auth_action: provider_auth_action(QuotaFamilyId::Antigravity, antigravity_weekly_state),
+                auth_action: provider_auth_action(
+                    QuotaFamilyId::Antigravity,
+                    antigravity_weekly_state,
+                ),
             });
         }
         if show_github_copilot {
@@ -6488,7 +6591,10 @@ fn paint_content(
                     accent: antigravity_accent,
                     provider_text_color: antigravity_usage_text_color(provider_tint_dark),
                     is_warning: antigravity_session_decision.3,
-                    auth_action: provider_auth_action(QuotaFamilyId::Antigravity, antigravity_session_state),
+                    auth_action: provider_auth_action(
+                        QuotaFamilyId::Antigravity,
+                        antigravity_session_state,
+                    ),
                 });
             }
             if show_github_copilot {
@@ -6566,7 +6672,16 @@ fn paint_content(
                     accent: &github_copilot_accent,
                     provider_text_color: github_copilot_accent,
                     is_warning: false,
-                    auth_action: provider_auth_action(QuotaFamilyId::GithubCopilot, if github_copilot_percent.is_none() && github_copilot_text == strings.fetch_failed { CellState::FetchFailed } else { CellState::Ok }),
+                    auth_action: provider_auth_action(
+                        QuotaFamilyId::GithubCopilot,
+                        if github_copilot_percent.is_none()
+                            && github_copilot_text == strings.fetch_failed
+                        {
+                            CellState::FetchFailed
+                        } else {
+                            CellState::Ok
+                        },
+                    ),
                 });
             }
             if show_vercel_ai_gateway {
@@ -8419,31 +8534,21 @@ fn show_context_menu(hwnd: HWND) {
             PCWSTR::from_raw(refresh_str.as_ptr()),
         );
 
-        let diagnosis_label = if strings.antigravity_setup_title == "Antigravityのセットアップ" {
-
+        let diagnosis_label = if strings.antigravity_setup_title == "Antigravityのセットアップ"
+        {
             "利用枠が表示されない？ 接続診断..."
-
         } else {
-
             "Quota not showing? Diagnose connection..."
-
         };
 
         let diagnosis_label = native_interop::wide_str(diagnosis_label);
 
         let _ = AppendMenuW(
-
             menu,
-
             MENU_ITEM_FLAGS(0),
-
             IDM_HELP_PROVIDER_DIAGNOSIS as usize,
-
             PCWSTR::from_raw(diagnosis_label.as_ptr()),
-
         );
-
-
 
         let reset_pos_str = native_interop::wide_str(strings.reset_position);
         let _ = AppendMenuW(
@@ -8661,7 +8766,8 @@ fn show_context_menu(hwnd: HWND) {
 
         // Keep the entry discoverable regardless of the current provider selection.
         // Dynamic wording previously disagreed with the actual submenu checkmarks.
-        let displayed_ai_entry = if strings.antigravity_setup_title == "Antigravityのセットアップ" {
+        let displayed_ai_entry = if strings.antigravity_setup_title == "Antigravityのセットアップ"
+        {
             "＋ AIの追加・表示設定..."
         } else {
             "+ Add or change displayed AI..."
@@ -9188,8 +9294,22 @@ fn show_context_menu(hwnd: HWND) {
         for (id, label) in [
             (IDM_HELP_DISPLAY_GUIDE, strings.help_display_guide),
             (IDM_HELP_AI_QUOTAS, strings.help_ai_quotas),
-            (IDM_HELP_PROVIDER_DIAGNOSIS, if strings.antigravity_setup_title == "Antigravityのセットアップ" { "AIサービスの接続診断..." } else { "Diagnose AI connections..." }),
-            (IDM_HELP_MUSE_STATUS, if strings.antigravity_setup_title == "Antigravityのセットアップ" { "Museの接続状況（試験版）..." } else { "Muse connection (experimental)..." }),
+            (
+                IDM_HELP_PROVIDER_DIAGNOSIS,
+                if strings.antigravity_setup_title == "Antigravityのセットアップ" {
+                    "AIサービスの接続診断..."
+                } else {
+                    "Diagnose AI connections..."
+                },
+            ),
+            (
+                IDM_HELP_MUSE_STATUS,
+                if strings.antigravity_setup_title == "Antigravityのセットアップ" {
+                    "Museの接続状況（試験版）..."
+                } else {
+                    "Muse connection (experimental)..."
+                },
+            ),
         ] {
             let label_str = native_interop::wide_str(label);
             let _ = AppendMenuW(
@@ -9209,7 +9329,8 @@ fn show_context_menu(hwnd: HWND) {
                 IDM_HELP_ANTIGRAVITY_SETUP as usize,
                 PCWSTR::from_raw(antigravity_setup_label.as_ptr()),
             );
-            let verify_label = if strings.antigravity_setup_title == "Antigravityのセットアップ" {
+            let verify_label = if strings.antigravity_setup_title == "Antigravityのセットアップ"
+            {
                 "Antigravityの接続を確認..."
             } else {
                 "Check Antigravity connection..."
@@ -10474,7 +10595,9 @@ mod tests {
                 QuotaFamilyId::VercelAiGateway,
                 CellState::CredentialsUnavailable
             ),
-            Some(AuthAction::ProviderDiagnosis(QuotaFamilyId::VercelAiGateway))
+            Some(AuthAction::ProviderDiagnosis(
+                QuotaFamilyId::VercelAiGateway
+            ))
         );
     }
 
@@ -10610,20 +10733,49 @@ mod tests {
             CellState::Disabled,
             CellState::NotAvailable,
         ] {
-            let expected_claude = if state == CellState::FetchFailed { Some(AuthAction::ProviderDiagnosis(QuotaFamilyId::Claude)) } else { None };
-            let expected_codex = if state == CellState::FetchFailed { Some(AuthAction::ProviderDiagnosis(QuotaFamilyId::Codex)) } else { None };
-            assert_eq!(provider_auth_action(QuotaFamilyId::Claude, state), expected_claude);
-            assert_eq!(provider_auth_action(QuotaFamilyId::Codex, state), expected_codex);
+            let expected_claude = if state == CellState::FetchFailed {
+                Some(AuthAction::ProviderDiagnosis(QuotaFamilyId::Claude))
+            } else {
+                None
+            };
+            let expected_codex = if state == CellState::FetchFailed {
+                Some(AuthAction::ProviderDiagnosis(QuotaFamilyId::Codex))
+            } else {
+                None
+            };
+            assert_eq!(
+                provider_auth_action(QuotaFamilyId::Claude, state),
+                expected_claude
+            );
+            assert_eq!(
+                provider_auth_action(QuotaFamilyId::Codex, state),
+                expected_codex
+            );
         }
     }
 
     #[test]
     fn github_copilot_is_never_cta_eligible() {
-        for state in [CellState::Ok, CellState::Loading, CellState::Disabled, CellState::NotAvailable] {
-            assert_eq!(provider_auth_action(QuotaFamilyId::GithubCopilot, state), None);
+        for state in [
+            CellState::Ok,
+            CellState::Loading,
+            CellState::Disabled,
+            CellState::NotAvailable,
+        ] {
+            assert_eq!(
+                provider_auth_action(QuotaFamilyId::GithubCopilot, state),
+                None
+            );
         }
-        for state in [CellState::FetchFailed, CellState::AuthenticationProblem, CellState::CredentialsUnavailable] {
-            assert_eq!(provider_auth_action(QuotaFamilyId::GithubCopilot, state), Some(AuthAction::ProviderDiagnosis(QuotaFamilyId::GithubCopilot)));
+        for state in [
+            CellState::FetchFailed,
+            CellState::AuthenticationProblem,
+            CellState::CredentialsUnavailable,
+        ] {
+            assert_eq!(
+                provider_auth_action(QuotaFamilyId::GithubCopilot, state),
+                Some(AuthAction::ProviderDiagnosis(QuotaFamilyId::GithubCopilot))
+            );
         }
     }
 
@@ -10651,7 +10803,10 @@ mod tests {
             (QuotaFamilyId::Claude, CellState::FetchFailed),
             (QuotaFamilyId::Codex, CellState::FetchFailed),
             (QuotaFamilyId::GithubCopilot, CellState::FetchFailed),
-            (QuotaFamilyId::VercelAiGateway, CellState::CredentialsUnavailable),
+            (
+                QuotaFamilyId::VercelAiGateway,
+                CellState::CredentialsUnavailable,
+            ),
             (QuotaFamilyId::Antigravity, CellState::FetchFailed),
         ];
         let ja = build_provider_diagnosis(true, &rows);
@@ -10668,13 +10823,23 @@ mod tests {
     #[test]
     fn antigravity_connection_states_distinguish_readiness_and_stale_data() {
         use crate::antigravity_statusline::{
-            CacheReadResult, SanitizedCache, SanitizedQuotaEntry, CACHE_SCHEMA_VERSION, CACHE_SOURCE,
+            CacheReadResult, SanitizedCache, SanitizedQuotaEntry, CACHE_SCHEMA_VERSION,
+            CACHE_SOURCE,
         };
         use std::collections::BTreeMap;
         let now = UNIX_EPOCH + Duration::from_secs(10_000);
-        assert_eq!(antigravity_connection_state(&CacheReadResult::Missing, now), AntigravityConnectionState::NoCache);
-        assert_eq!(antigravity_connection_state(&CacheReadResult::Malformed("bad".into()), now), AntigravityConnectionState::UnreadableCache);
-        assert_eq!(antigravity_connection_state(&CacheReadResult::UnsupportedSchema(999), now), AntigravityConnectionState::UnsupportedSchema);
+        assert_eq!(
+            antigravity_connection_state(&CacheReadResult::Missing, now),
+            AntigravityConnectionState::NoCache
+        );
+        assert_eq!(
+            antigravity_connection_state(&CacheReadResult::Malformed("bad".into()), now),
+            AntigravityConnectionState::UnreadableCache
+        );
+        assert_eq!(
+            antigravity_connection_state(&CacheReadResult::UnsupportedSchema(999), now),
+            AntigravityConnectionState::UnsupportedSchema
+        );
         let mut cache = SanitizedCache {
             schema_version: CACHE_SCHEMA_VERSION,
             source: CACHE_SOURCE.to_string(),
@@ -10683,26 +10848,47 @@ mod tests {
             plan_tier: None,
             quota: BTreeMap::new(),
         };
-        assert_eq!(antigravity_connection_state(&CacheReadResult::Valid(cache.clone()), now), AntigravityConnectionState::EmptyQuota);
-        cache.quota.insert("gemini-weekly".into(), SanitizedQuotaEntry {
-            remaining_fraction: 0.4,
-            reset_time_unix: 9_999,
-            reset_in_seconds: None,
-        });
-        assert_eq!(antigravity_connection_state(&CacheReadResult::Valid(cache.clone()), now), AntigravityConnectionState::AwaitingFreshReading);
-        cache.quota.insert("3p-weekly".into(), SanitizedQuotaEntry {
-            remaining_fraction: 0.7,
-            reset_time_unix: 10_001,
-            reset_in_seconds: None,
-        });
-        assert_eq!(antigravity_connection_state(&CacheReadResult::Valid(cache), now), AntigravityConnectionState::CurrentQuota { active: 1, total: 2 });
+        assert_eq!(
+            antigravity_connection_state(&CacheReadResult::Valid(cache.clone()), now),
+            AntigravityConnectionState::EmptyQuota
+        );
+        cache.quota.insert(
+            "gemini-weekly".into(),
+            SanitizedQuotaEntry {
+                remaining_fraction: 0.4,
+                reset_time_unix: 9_999,
+                reset_in_seconds: None,
+            },
+        );
+        assert_eq!(
+            antigravity_connection_state(&CacheReadResult::Valid(cache.clone()), now),
+            AntigravityConnectionState::AwaitingFreshReading
+        );
+        cache.quota.insert(
+            "3p-weekly".into(),
+            SanitizedQuotaEntry {
+                remaining_fraction: 0.7,
+                reset_time_unix: 10_001,
+                reset_in_seconds: None,
+            },
+        );
+        assert_eq!(
+            antigravity_connection_state(&CacheReadResult::Valid(cache), now),
+            AntigravityConnectionState::CurrentQuota {
+                active: 1,
+                total: 2
+            }
+        );
     }
 
     #[test]
     fn antigravity_connection_status_is_explicitly_not_live_auth_verification() {
         let msg = antigravity_connection_result_text(
             LanguageId::Japanese.strings(),
-            &AntigravityConnectionState::CurrentQuota { active: 1, total: 2 },
+            &AntigravityConnectionState::CurrentQuota {
+                active: 1,
+                total: 2,
+            },
         );
         assert!(msg.contains("1/2"));
         assert!(msg.contains("保証するものではありません"));
@@ -10710,11 +10896,27 @@ mod tests {
 
     #[test]
     fn antigravity_failure_opens_setup_not_login() {
-        for state in [CellState::FetchFailed, CellState::CredentialsUnavailable, CellState::AuthenticationProblem] {
-            assert_eq!(provider_auth_action(QuotaFamilyId::Antigravity, state), Some(AuthAction::AntigravitySetup));
+        for state in [
+            CellState::FetchFailed,
+            CellState::CredentialsUnavailable,
+            CellState::AuthenticationProblem,
+        ] {
+            assert_eq!(
+                provider_auth_action(QuotaFamilyId::Antigravity, state),
+                Some(AuthAction::AntigravitySetup)
+            );
         }
-        for state in [CellState::Ok, CellState::Loading, CellState::Disabled, CellState::NotAvailable, CellState::AuthenticationExpired] {
-            assert_eq!(provider_auth_action(QuotaFamilyId::Antigravity, state), None);
+        for state in [
+            CellState::Ok,
+            CellState::Loading,
+            CellState::Disabled,
+            CellState::NotAvailable,
+            CellState::AuthenticationExpired,
+        ] {
+            assert_eq!(
+                provider_auth_action(QuotaFamilyId::Antigravity, state),
+                None
+            );
         }
     }
 
@@ -11171,9 +11373,18 @@ mod tests {
 
     #[test]
     fn actionable_status_marked_only_when_there_is_a_recovery_action() {
-        assert_eq!(actionable_status_label("取得失敗", Some(AuthAction::ProviderDiagnosis(QuotaFamilyId::Claude))), "› 取得失敗");
+        assert_eq!(
+            actionable_status_label(
+                "取得失敗",
+                Some(AuthAction::ProviderDiagnosis(QuotaFamilyId::Claude))
+            ),
+            "› 取得失敗"
+        );
         assert_eq!(actionable_status_label("取得失敗", None), "取得失敗");
-        assert_eq!(actionable_status_label("", Some(AuthAction::ClaudeLogin)), "");
+        assert_eq!(
+            actionable_status_label("", Some(AuthAction::ClaudeLogin)),
+            ""
+        );
     }
 
     #[test]
