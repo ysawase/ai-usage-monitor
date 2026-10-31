@@ -22,7 +22,11 @@ pub fn read_observation(path: &Path, now_unix: u64) -> MuseReading {
 /// Format the exact message the GUI presents. `formatted_reset` is the
 /// caller's locale/time-zone-aware rendering of an optional reset instant.
 /// Never guess the reset date or turn missing/stale usage into a 0% value.
-pub fn status_message(reading: &MuseReading, japanese: bool, formatted_reset: Option<&str>) -> String {
+pub fn status_message(
+    reading: &MuseReading,
+    japanese: bool,
+    formatted_reset: Option<&str>,
+) -> String {
     match reading.state {
         MuseConnectionState::NotConnected => {
             if japanese {
@@ -35,20 +39,29 @@ pub fn status_message(reading: &MuseReading, japanese: bool, formatted_reset: Op
             if japanese {
                 "Museの連携データを確認できません。使用率0%ではありません。".to_string()
             } else {
-                "Muse connection data could not be validated. This does not mean 0% usage.".to_string()
+                "Muse connection data could not be validated. This does not mean 0% usage."
+                    .to_string()
             }
         }
         MuseConnectionState::Stale => {
             if japanese {
                 "Museの取得データは古くなっています。現在の利用率として表示しません。".to_string()
             } else {
-                "The Muse observation is stale and cannot be displayed as current usage.".to_string()
+                "The Muse observation is stale and cannot be displayed as current usage."
+                    .to_string()
             }
         }
         MuseConnectionState::Current => {
-            let used = reading.weekly_used_percent
+            let used = reading
+                .weekly_used_percent
                 .map(|value| format!("{value:.0}%"))
-                .unwrap_or_else(|| if japanese { "取得不可".to_string() } else { "Unavailable".to_string() });
+                .unwrap_or_else(|| {
+                    if japanese {
+                        "取得不可".to_string()
+                    } else {
+                        "Unavailable".to_string()
+                    }
+                });
             let plan = reading.plan.as_deref().unwrap_or("Unknown");
             let reset = formatted_reset.unwrap_or(if japanese { "不明" } else { "Unknown" });
             if japanese {
@@ -71,7 +84,8 @@ mod tests {
     impl TempObservation {
         fn new() -> Self {
             let id = NEXT.fetch_add(1, Ordering::Relaxed);
-            let path = std::env::temp_dir().join(format!("aum-muse-test-{}-{id}.json", std::process::id()));
+            let path = std::env::temp_dir()
+                .join(format!("aum-muse-test-{}-{id}.json", std::process::id()));
             Self(path)
         }
         fn write(&self, body: &str) {
@@ -79,10 +93,14 @@ mod tests {
         }
     }
     impl Drop for TempObservation {
-        fn drop(&mut self) { let _ = fs::remove_file(&self.0); }
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+        }
     }
     fn observation(seen: u64, percentage: i32, reset: &str) -> String {
-        format!(r#"{{"schema_version":1,"source":"muse_browser_bridge","observed_at_unix":{seen},"plan":"Muse Free","weekly_used_percent":{percentage},"weekly_resets_at_unix":{reset}}}"#)
+        format!(
+            r#"{{"schema_version":1,"source":"muse_browser_bridge","observed_at_unix":{seen},"plan":"Muse Free","weekly_used_percent":{percentage},"weekly_resets_at_unix":{reset}}}"#
+        )
     }
 
     #[test]
@@ -133,7 +151,10 @@ mod tests {
     fn oversized_cache_is_invalid() {
         let fixture = TempObservation::new();
         fixture.write(&"A".repeat(4097));
-        assert_eq!(read_observation(&fixture.0, 1010).state, MuseConnectionState::Invalid);
+        assert_eq!(
+            read_observation(&fixture.0, 1010).state,
+            MuseConnectionState::Invalid
+        );
     }
     #[test]
     fn directory_is_not_misrepresented_as_disconnected() {
