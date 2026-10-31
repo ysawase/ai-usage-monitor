@@ -7994,16 +7994,25 @@ unsafe extern "system" fn wnd_proc(
                     if !open_muse_site(hwnd) {
                         let ja = {
                             let state = lock_state();
-                            state.as_ref().is_some_and(|s| s.language == LanguageId::Japanese)
+                            state
+                                .as_ref()
+                                .is_some_and(|s| s.language == LanguageId::Japanese)
                         };
                         show_info_message(
                             hwnd,
-                            if ja { "Museを開けませんでした" } else { "Could not open Muse" },
-                            if ja { "ブラウザで https://muse.ai/ を開いてください。自動接続機能はまだ試験段階です。" }
-                            else { "Open https://muse.ai/ in your browser. Automatic connection is still experimental." },
+                            if ja {
+                                "Museを開けませんでした"
+                            } else {
+                                "Could not open Muse"
+                            },
+                            if ja {
+                                "ブラウザで https://muse.ai/ を開いてください。自動接続機能はまだ試験段階です。"
+                            } else {
+                                "Open https://muse.ai/ in your browser. Automatic connection is still experimental."
+                            },
                         );
                     }
-                },
+                }
                 IDM_HELP_README => {
                     if !open_readme(hwnd) {
                         let strings = current_strings();
