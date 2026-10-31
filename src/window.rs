@@ -2053,6 +2053,7 @@ const IDM_HELP_ANTIGRAVITY_SETUP: u16 = 104;
 const IDM_HELP_ANTIGRAVITY_CONNECTION_CHECK: u16 = 105;
 const IDM_HELP_PROVIDER_DIAGNOSIS: u16 = 106;
 const IDM_HELP_MUSE_STATUS: u16 = 107;
+const IDM_HELP_MUSE_OPEN: u16 = 108;
 const IDM_LANG_SYSTEM: u16 = 40;
 const IDM_LANG_ENGLISH: u16 = 41;
 const IDM_LANG_DUTCH: u16 = 42;
@@ -2099,7 +2100,7 @@ const IDM_GITHUB_COPILOT_PLAN_PRO_PLUS: u16 = 96;
 const IDM_GITHUB_COPILOT_PLAN_MAX: u16 = 97;
 const IDM_RESET_DISPLAY_RELATIVE: u16 = 98;
 const IDM_RESET_DISPLAY_ABSOLUTE: u16 = 99;
-// 104-109 intentionally left free (100-103 are the Help submenu above).
+// 109 intentionally left free (100-108 are Help command IDs above).
 const IDM_VIRTUAL_DESKTOP_SCOPE_ALL: u16 = 110;
 const IDM_VIRTUAL_DESKTOP_SCOPE_CURRENT_ONLY: u16 = 111;
 
@@ -3399,6 +3400,7 @@ fn show_info_message(hwnd: HWND, title: &str, message: &str) {
 }
 
 const README_URL: &str = "https://github.com/ysawase/ai-usage-monitor#readme";
+const MUSE_OFFICIAL_URL: &str = "https://muse.ai/";
 const ANTIGRAVITY_CLI_GUIDE_URL: &str = "https://www.antigravity.google/docs/cli/install/";
 
 /// The exact `/statusline <command>` this app's own packaged App Execution
@@ -3935,6 +3937,24 @@ fn show_version_information(hwnd: HWND) {
         strings.help_version_information,
         &version_information_text(strings),
     );
+}
+
+/// Opens only the public Muse site in the default browser. No quota request,
+/// browser credentials, or experimental companion extension is involved.
+fn open_muse_site(hwnd: HWND) -> bool {
+    unsafe {
+        let operation = native_interop::wide_str("open");
+        let url = native_interop::wide_str(MUSE_OFFICIAL_URL);
+        let result = ShellExecuteW(
+            hwnd,
+            PCWSTR::from_raw(operation.as_ptr()),
+            PCWSTR::from_raw(url.as_ptr()),
+            PCWSTR::null(),
+            PCWSTR::null(),
+            SW_SHOWNORMAL,
+        );
+        result.0 as isize > 32
+    }
 }
 
 fn open_readme(hwnd: HWND) -> bool {
@@ -7970,6 +7990,20 @@ unsafe extern "system" fn wnd_proc(
                 IDM_HELP_AI_QUOTAS => show_ai_quota_help(hwnd),
                 IDM_HELP_PROVIDER_DIAGNOSIS => show_provider_diagnosis(hwnd),
                 IDM_HELP_MUSE_STATUS => show_muse_status(hwnd),
+                IDM_HELP_MUSE_OPEN => {
+                    if !open_muse_site(hwnd) {
+                        let ja = {
+                            let state = lock_state();
+                            state.as_ref().is_some_and(|s| s.language == LanguageId::Japanese)
+                        };
+                        show_info_message(
+                            hwnd,
+                            if ja { "Museを開けませんでした" } else { "Could not open Muse" },
+                            if ja { "ブラウザで https://muse.ai/ を開いてください。自動接続機能はまだ試験段階です。" }
+                            else { "Open https://muse.ai/ in your browser. Automatic connection is still experimental." },
+                        );
+                    }
+                },
                 IDM_HELP_README => {
                     if !open_readme(hwnd) {
                         let strings = current_strings();
@@ -9248,6 +9282,14 @@ fn show_context_menu(hwnd: HWND) {
                     "Museの接続状況（試験版）..."
                 } else {
                     "Muse connection (experimental)..."
+                },
+            ),
+            (
+                IDM_HELP_MUSE_OPEN,
+                if strings.antigravity_setup_title == "Antigravityのセットアップ" {
+                    "Museの公式サイトを開く..."
+                } else {
+                    "Open Muse website..."
                 },
             ),
         ] {
@@ -13478,6 +13520,7 @@ mod tests {
             IDM_HELP_AI_QUOTAS,
             IDM_HELP_PROVIDER_DIAGNOSIS,
             IDM_HELP_MUSE_STATUS,
+            IDM_HELP_MUSE_OPEN,
             IDM_HELP_README,
             IDM_HELP_VERSION_INFORMATION,
             IDM_VIRTUAL_DESKTOP_SCOPE_ALL,
