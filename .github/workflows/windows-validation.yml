@@ -5,6 +5,7 @@ on:
   pull_request:
     branches:
       - feat/muse-easy-onboarding-poc-20261031
+      - feature/muse-windows-validation-20261031
   push:
     branches:
       - main
