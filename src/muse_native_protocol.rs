@@ -49,7 +49,9 @@ enum Command {
 /// arbitrary extension origin is trusted by this PoC.
 pub fn is_trusted_extension_origin(origin: &str, trusted_extension_id: &str) -> bool {
     if trusted_extension_id.len() != 32
-        || !trusted_extension_id.bytes().all(|byte| (b'a'..=b'p').contains(&byte))
+        || !trusted_extension_id
+            .bytes()
+            .all(|byte| (b'a'..=b'p').contains(&byte))
     {
         return false;
     }
@@ -105,7 +107,10 @@ pub fn read_native_frame<R: Read>(input: &mut R) -> io::Result<Option<Vec<u8>>> 
     input.read_exact(&mut prefix[1..])?;
     let size = u32::from_ne_bytes(prefix) as usize;
     if size == 0 || size > MUSE_NATIVE_FRAME_LIMIT {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid native frame size"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid native frame size",
+        ));
     }
     let mut bytes = vec![0_u8; size];
     input.read_exact(&mut bytes)?;
@@ -116,7 +121,10 @@ pub fn read_native_frame<R: Read>(input: &mut R) -> io::Result<Option<Vec<u8>>> 
 /// Writing a raw Muse response or other user data to stdout is prohibited.
 pub fn write_native_frame<W: Write>(output: &mut W, message: &[u8]) -> io::Result<()> {
     if message.is_empty() || message.len() > MUSE_NATIVE_FRAME_LIMIT {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid native frame size"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid native frame size",
+        ));
     }
     output.write_all(&(message.len() as u32).to_ne_bytes())?;
     output.write_all(message)?;
@@ -188,28 +196,30 @@ mod tests {
             );
         }
         assert!(!is_trusted_extension_origin(&origin(), "invalid"));
-        assert!(!is_trusted_extension_origin(&origin(), "ABCDEFGHIJKLMNOPABCDEFGHIJKLMNOP"));
+        assert!(!is_trusted_extension_origin(
+            &origin(),
+            "ABCDEFGHIJKLMNOPABCDEFGHIJKLMNOP"
+        ));
         assert!(is_trusted_extension_origin(&origin(), TRUSTED_ID));
-        assert!(is_trusted_extension_origin(&format!("{}/", origin()), TRUSTED_ID));
+        assert!(is_trusted_extension_origin(
+            &format!("{}/", origin()),
+            TRUSTED_ID
+        ));
     }
 
     #[test]
     fn ping_disconnect_and_observation_are_distinct() {
         for (type_name, expected) in [("ping", "ping"), ("disconnect", "disconnect")] {
-            let message = format!(
-                r#"{{"protocol_version":1,"command":{{"type":"{type_name}"}}}}"#
-            );
-            let result = validate_request(message.as_bytes(), &origin(), Some(TRUSTED_ID), 1010)
-                .unwrap();
+            let message = format!(r#"{{"protocol_version":1,"command":{{"type":"{type_name}"}}}}"#);
+            let result =
+                validate_request(message.as_bytes(), &origin(), Some(TRUSTED_ID), 1010).unwrap();
             match (result, expected) {
                 (MuseNativeRequest::Ping, "ping") => {}
                 (MuseNativeRequest::Disconnect, "disconnect") => {}
                 _ => panic!("incorrect command"),
             }
         }
-        match validate_request(quota("0").as_bytes(), &origin(), Some(TRUSTED_ID), 1010)
-            .unwrap()
-        {
+        match validate_request(quota("0").as_bytes(), &origin(), Some(TRUSTED_ID), 1010).unwrap() {
             MuseNativeRequest::Observation(reading) => {
                 assert_eq!(reading.state, MuseConnectionState::Current);
                 assert_eq!(reading.weekly_used_percent, Some(0.0));
@@ -226,8 +236,8 @@ mod tests {
             r#"{"protocol_version":1,"command":{"type":"ping"},"cookie":"SECRET"}"#,
         ];
         for (i, data) in bad.iter().enumerate() {
-            let err = validate_request(data.as_bytes(), &origin(), Some(TRUSTED_ID), 1010)
-                .unwrap_err();
+            let err =
+                validate_request(data.as_bytes(), &origin(), Some(TRUSTED_ID), 1010).unwrap_err();
             if i == 0 {
                 assert_eq!(err, MuseNativeError::UnsupportedVersion);
             } else {
@@ -237,7 +247,10 @@ mod tests {
         for content in [
             quota("101"),
             quota("-1"),
-            quota("35").replace(r#""plan":"Muse Test""#, r#""plan":"Muse Test","cookie":"SECRET""#),
+            quota("35").replace(
+                r#""plan":"Muse Test""#,
+                r#""plan":"Muse Test","cookie":"SECRET""#,
+            ),
             quota("35").replace(r#""source":"muse_browser_bridge""#, r#""source":"spoofed""#),
         ] {
             assert_eq!(
