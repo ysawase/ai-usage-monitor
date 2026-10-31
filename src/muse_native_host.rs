@@ -129,11 +129,7 @@ mod tests {
         Cursor::new(bytes)
     }
 
-    fn execute(
-        content: &str,
-        origin: &str,
-        auth: HostAuthorization<'_>,
-    ) -> (HostOutcome, String) {
+    fn execute(content: &str, origin: &str, auth: HostAuthorization<'_>) -> (HostOutcome, String) {
         let mut incoming = input_frame(content);
         let mut outgoing = Vec::new();
         let result = serve_one(&mut incoming, &mut outgoing, origin, auth, 1010).unwrap();
