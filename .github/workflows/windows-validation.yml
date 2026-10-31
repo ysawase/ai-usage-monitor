@@ -74,6 +74,7 @@ jobs:
           TEST_ANTIGRAVITY_OUTCOME: ${{ steps.tests_antigravity.outcome }}
           BUILD_ANTIGRAVITY_OUTCOME: ${{ steps.build_antigravity.outcome }}
           LOCKFILE_OUTCOME: ${{ steps.lockfile.outcome }}
+          MUSE_GUI_OUTCOME: ${{ steps.muse_gui.outcome }}
         run: |
           $failed = @()
 
