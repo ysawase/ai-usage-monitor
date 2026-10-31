@@ -1,0 +1,44 @@
+name: Muse WebView2 Login Shell (experimental)
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'tools/muse-login-shell-poc/**'
+      - '.github/workflows/muse-webview2-poc.yml'
+  push:
+    branches:
+      - feature/muse-webview2-login-shell-20261031
+    paths:
+      - 'tools/muse-login-shell-poc/**'
+      - '.github/workflows/muse-webview2-poc.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  windows-build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install .NET 8 SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+      - name: Restore separate login-only PoC
+        run: dotnet restore tools/muse-login-shell-poc/MuseLoginShellPoc.csproj
+      - name: Build separate login-only PoC
+        run: dotnet build tools/muse-login-shell-poc/MuseLoginShellPoc.csproj --configuration Release --no-restore
+      - name: Ensure tracked Rust product files remain unchanged
+        shell: pwsh
+        run: |
+          git diff --exit-code HEAD^ HEAD -- src Cargo.toml Cargo.lock
+      - name: Check forbidden integrations are absent
+        shell: pwsh
+        run: |
+          $content = Get-Content tools/muse-login-shell-poc/*.cs -Raw
+          $forbidden = @('GetCookiesAsync', 'ExecuteScriptAsync', 'AddHostObjectToScript', 'WebResourceRequested', 'fetchSubscriptionAction', 'GetDevToolsProtocolEventReceiver')
+          foreach ($token in $forbidden) {
+            if ($content.Contains($token)) { throw "Forbidden integration: $token" }
+          }
