@@ -2046,6 +2046,7 @@ const IDM_HELP_ANTIGRAVITY_SETUP: u16 = 104;
 #[cfg(feature = "antigravity")]
 const IDM_HELP_ANTIGRAVITY_CONNECTION_CHECK: u16 = 105;
 const IDM_HELP_PROVIDER_DIAGNOSIS: u16 = 106;
+const IDM_HELP_MUSE_STATUS: u16 = 107;
 const IDM_LANG_SYSTEM: u16 = 40;
 const IDM_LANG_ENGLISH: u16 = 41;
 const IDM_LANG_DUTCH: u16 = 42;
@@ -3562,6 +3563,62 @@ fn show_single_provider_diagnosis(hwnd: HWND, family: QuotaFamilyId) {
     };
     let title = if ja { "AIサービスの接続診断" } else { "AI provider connection diagnosis" };
     show_info_message(hwnd, title, &build_provider_diagnosis(ja, &[(family, state)]));
+}
+
+/// Read-only status view for personal muse.ai. Does not query a private endpoint,
+/// handle browser credentials, or expose unavailable data as 0%.
+fn show_muse_status(hwnd: HWND) {
+    use crate::muse_bridge::{MuseConnectionState, MuseReading};
+    let ja = {
+        let guard = lock_state();
+        guard.as_ref().map_or(false, |s| s.language == LanguageId::Japanese)
+    };
+    let reading = dirs::data_local_dir()
+        .map(|dir| dir.join("Solidaily").join("AIUsageMonitor").join("muse-observation-v1.json"))
+        .and_then(|path| {
+            // Bound file size before reading; a malformed or secret-bearing file
+            // must never be shown as a valid quota.
+            match std::fs::metadata(&path) {
+                Ok(metadata) if metadata.len() <= 4096 => std::fs::read_to_string(&path).ok(),
+                Ok(_) => Some(String::new()),
+                Err(_) => None,
+            }
+        })
+        .map(|raw| {
+            let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
+            MuseReading::from_json(&raw, now)
+        })
+        .unwrap_or_else(MuseReading::not_connected);
+    let body = match reading.state {
+        MuseConnectionState::NotConnected => {
+            if ja { "Museは未接続です。ブラウザとの連携はまだ試験段階で、この画面からログインや接続はできません。".to_string() }
+            else { "Muse is not connected. The browser companion is experimental; sign-in and connection are not available from this screen.".to_string() }
+        }
+        MuseConnectionState::Invalid => {
+            if ja { "Museの連携データを確認できません。使用率0%ではありません。".to_string() }
+            else { "Muse connection data could not be validated. This does not mean 0% usage.".to_string() }
+        }
+        MuseConnectionState::Stale => {
+            if ja { "Museの取得データは古くなっています。現在の利用率として表示しません。".to_string() }
+            else { "The Muse observation is stale and cannot be displayed as current usage.".to_string() }
+        }
+        MuseConnectionState::Current => {
+            let used = reading.weekly_used_percent.unwrap_or(0.0);
+            let plan = reading.plan.as_deref().unwrap_or("Unknown");
+            let reset = reading.weekly_resets_at_unix
+                .and_then(|secs| format_absolute_reset_time(
+                    Some(UNIX_EPOCH + Duration::from_secs(secs)),
+                    SystemTime::now(),
+                    current_strings()))
+                .unwrap_or_else(|| if ja { "不明".to_string() } else { "Unknown".to_string() });
+            if ja {
+                format!("プラン: {plan}\n週間使用率: {used:.0}%\nリセット日時: {reset}\n\nこれはローカル連携データです。Metaの公式API取得を意味しません。")
+            } else {
+                format!("Plan: {plan}\nWeekly used: {used:.0}%\nReset: {reset}\n\nLocal companion data; not an official Meta API integration.")
+            }
+        }
+    };
+    show_info_message(hwnd, if ja { "Muse（試験的な接続状態）" } else { "Muse (experimental connection)" }, &body);
 }
 
 fn show_provider_diagnosis(hwnd: HWND) {
@@ -7855,6 +7912,7 @@ unsafe extern "system" fn wnd_proc(
                 IDM_HELP_DISPLAY_GUIDE => show_display_guide(hwnd),
                 IDM_HELP_AI_QUOTAS => show_ai_quota_help(hwnd),
                 IDM_HELP_PROVIDER_DIAGNOSIS => show_provider_diagnosis(hwnd),
+                IDM_HELP_MUSE_STATUS => show_muse_status(hwnd),
                 IDM_HELP_README => {
                     if !open_readme(hwnd) {
                         let strings = current_strings();
@@ -9129,6 +9187,7 @@ fn show_context_menu(hwnd: HWND) {
             (IDM_HELP_DISPLAY_GUIDE, strings.help_display_guide),
             (IDM_HELP_AI_QUOTAS, strings.help_ai_quotas),
             (IDM_HELP_PROVIDER_DIAGNOSIS, if strings.antigravity_setup_title == "Antigravityのセットアップ" { "AIサービスの接続診断..." } else { "Diagnose AI connections..." }),
+            (IDM_HELP_MUSE_STATUS, if strings.antigravity_setup_title == "Antigravityのセットアップ" { "Museの接続状況（試験版）..." } else { "Muse connection (experimental)..." }),
         ] {
             let label_str = native_interop::wide_str(label);
             let _ = AppendMenuW(
@@ -13265,6 +13324,7 @@ mod tests {
             IDM_HELP_DISPLAY_GUIDE,
             IDM_HELP_AI_QUOTAS,
             IDM_HELP_PROVIDER_DIAGNOSIS,
+            IDM_HELP_MUSE_STATUS,
             IDM_HELP_README,
             IDM_HELP_VERSION_INFORMATION,
             IDM_VIRTUAL_DESKTOP_SCOPE_ALL,
