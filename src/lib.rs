@@ -29,3 +29,4 @@ pub mod vercel_ai_gateway;
 pub mod dispatcher;
 pub mod quota_health;
 pub mod quota_report;
+pub mod muse_bridge;
