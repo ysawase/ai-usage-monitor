@@ -32,6 +32,20 @@ jobs:
         run: dotnet restore tools/muse-login-shell-poc/MuseLoginShellPoc.csproj
       - name: Build separate login-only PoC
         run: dotnet build tools/muse-login-shell-poc/MuseLoginShellPoc.csproj --configuration Release --no-restore
+      - name: Publish standalone Windows test executable
+        run: dotnet publish tools/muse-login-shell-poc/MuseLoginShellPoc.csproj --configuration Release --runtime win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true --output artifacts/muse-login-shell-win-x64
+      - name: Confirm test package contains executable
+        shell: pwsh
+        run: |
+          if (!(Test-Path artifacts/muse-login-shell-win-x64/MuseLoginShellPoc.exe)) { throw "Missing test executable" }
+          if (Test-Path artifacts/muse-login-shell-win-x64/claude-code-usage-monitor.exe) { throw "Production executable must never be bundled" }
+      - name: Upload short-lived test artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: muse-login-shell-win-x64-TEST-ONLY
+          path: artifacts/muse-login-shell-win-x64/
+          retention-days: 3
+          if-no-files-found: error
       - name: Ensure tracked Rust product files remain unchanged
         shell: pwsh
         run: |
