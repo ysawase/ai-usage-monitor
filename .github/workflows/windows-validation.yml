@@ -2,6 +2,9 @@ name: Windows Validation
 
 on:
   workflow_dispatch:
+  pull_request:
+    branches:
+      - feat/muse-easy-onboarding-poc-20261031
   push:
     branches:
       - main
@@ -50,6 +53,12 @@ jobs:
         continue-on-error: true
         run: cargo build --release --locked --no-default-features --features antigravity
 
+      - name: Muse Windows GUI smoke (synthetic data)
+        id: muse_gui
+        continue-on-error: true
+        shell: pwsh
+        run: ./scripts/ci/muse-gui-smoke.ps1
+
       - name: Verify Cargo.lock unchanged
         id: lockfile
         continue-on-error: true
@@ -65,6 +74,7 @@ jobs:
           TEST_ANTIGRAVITY_OUTCOME: ${{ steps.tests_antigravity.outcome }}
           BUILD_ANTIGRAVITY_OUTCOME: ${{ steps.build_antigravity.outcome }}
           LOCKFILE_OUTCOME: ${{ steps.lockfile.outcome }}
+          MUSE_GUI_OUTCOME: ${{ steps.muse_gui.outcome }}
         run: |
           $failed = @()
 
@@ -90,6 +100,10 @@ jobs:
 
           if ($env:LOCKFILE_OUTCOME -ne 'success') {
             $failed += 'Cargo.lock'
+          }
+
+          if ($env:MUSE_GUI_OUTCOME -ne 'success') {
+            $failed += 'muse GUI smoke'
           }
 
           if ($failed.Count -gt 0) {
