@@ -48,8 +48,8 @@ New-Item -ItemType Directory -Force -Path $cacheDir | Out-Null
 $cache = Join-Path $cacheDir "muse-observation-v1.json"
 $process = $null
 
-function Observe-Dialog([int]$pid, [string]$expected, [string]$case) {
-  $main = [MuseWin32Smoke]::Find($pid,"ClaudeCodeUsageMonitor")
+function Observe-Dialog([int]$targetProcessId, [string]$expected, [string]$case) {
+  $main = [MuseWin32Smoke]::Find($targetProcessId,"ClaudeCodeUsageMonitor")
   if($main -eq [IntPtr]::Zero){throw "$case : application window missing"}
   if(-not [MuseWin32Smoke]::PostMessageW($main,0x111,[IntPtr]107,[IntPtr]::Zero)){
     throw "$case : WM_COMMAND dispatch failed"
@@ -58,7 +58,7 @@ function Observe-Dialog([int]$pid, [string]$expected, [string]$case) {
   $text=""
   for($i=0;$i -lt 100;$i++){
     Start-Sleep -Milliseconds 200
-    $dialog=[MuseWin32Smoke]::Find($pid,"#32770")
+    $dialog=[MuseWin32Smoke]::Find($targetProcessId,"#32770")
     $text=[MuseWin32Smoke]::DialogText($dialog)
     if($text.Contains($expected)){break}
   }
@@ -68,7 +68,7 @@ function Observe-Dialog([int]$pid, [string]$expected, [string]$case) {
   Write-Output "MUSE_GUI_SMOKE PASS $case : matched UI dialog text"
   [MuseWin32Smoke]::PostMessageW($dialog,0x0010,[IntPtr]::Zero,[IntPtr]::Zero) | Out-Null
   for($i=0;$i -lt 30;$i++){
-    if([MuseWin32Smoke]::Find($pid,"#32770") -eq [IntPtr]::Zero){break}
+    if([MuseWin32Smoke]::Find($targetProcessId,"#32770") -eq [IntPtr]::Zero){break}
     Start-Sleep -Milliseconds 100
   }
 }
