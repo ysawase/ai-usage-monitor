@@ -3592,88 +3592,23 @@ fn show_muse_status(hwnd: HWND) {
             .as_ref()
             .map_or(false, |s| s.language == LanguageId::Japanese)
     };
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
     let reading = dirs::data_local_dir()
-        .map(|dir| {
-            dir.join("Solidaily")
-                .join("AIUsageMonitor")
-                .join("muse-observation-v1.json")
-        })
-        .and_then(|path| {
-            // Bound file size before reading; a malformed or secret-bearing file
-            // must never be shown as a valid quota.
-            match std::fs::metadata(&path) {
-                Ok(metadata) if metadata.len() <= 4096 => std::fs::read_to_string(&path).ok(),
-                Ok(_) => Some(String::new()),
-                Err(_) => None,
-            }
-        })
-        .map(|raw| {
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_or(0, |d| d.as_secs());
-            MuseReading::from_json(&raw, now)
-        })
+        .map(|dir| dir.join("Solidaily").join("AIUsageMonitor").join("muse-observation-v1.json"))
+        .map(|path| crate::muse_status_view::read_observation(&path, now))
         .unwrap_or_else(MuseReading::not_connected);
-    let body = match reading.state {
-        MuseConnectionState::NotConnected => {
-            if ja {
-                "Museは未接続です。ブラウザとの連携はまだ試験段階で、この画面からログインや接続はできません。".to_string()
-            } else {
-                "Muse is not connected. The browser companion is experimental; sign-in and connection are not available from this screen.".to_string()
-            }
-        }
-        MuseConnectionState::Invalid => {
-            if ja {
-                "Museの連携データを確認できません。使用率0%ではありません。".to_string()
-            } else {
-                "Muse connection data could not be validated. This does not mean 0% usage."
-                    .to_string()
-            }
-        }
-        MuseConnectionState::Stale => {
-            if ja {
-                "Museの取得データは古くなっています。現在の利用率として表示しません。".to_string()
-            } else {
-                "The Muse observation is stale and cannot be displayed as current usage."
-                    .to_string()
-            }
-        }
-        MuseConnectionState::Current => {
-            let used = reading
-                .weekly_used_percent
-                .map(|value| format!("{value:.0}%"))
-                .unwrap_or_else(|| {
-                    if ja {
-                        "取得不可".to_string()
-                    } else {
-                        "Unavailable".to_string()
-                    }
-                });
-            let plan = reading.plan.as_deref().unwrap_or("Unknown");
-            let reset = reading
-                .weekly_resets_at_unix
-                .and_then(|secs| UNIX_EPOCH.checked_add(Duration::from_secs(secs)))
-                .and_then(|reset_time| {
-                    format_absolute_reset_time(
-                        Some(reset_time),
-                        SystemTime::now(),
-                        current_strings(),
-                    )
-                })
-                .unwrap_or_else(|| {
-                    if ja {
-                        "不明".to_string()
-                    } else {
-                        "Unknown".to_string()
-                    }
-                });
-            if ja {
-                format!("プラン: {plan}\n週間使用率: {used}\nリセット日時: {reset}\n\nこれはローカル連携データです。Metaの公式API取得を意味しません。")
-            } else {
-                format!("Plan: {plan}\nWeekly used: {used}\nReset: {reset}\n\nLocal companion data; not an official Meta API integration.")
-            }
-        }
+    let reset = if reading.state == MuseConnectionState::Current {
+        reading.weekly_resets_at_unix
+            .and_then(|secs| UNIX_EPOCH.checked_add(Duration::from_secs(secs)))
+            .and_then(|reset_time| {
+                format_absolute_reset_time(Some(reset_time), SystemTime::now(), current_strings())
+            })
+    } else {
+        None
     };
+    let body = crate::muse_status_view::status_message(&reading, ja, reset.as_deref());
     show_info_message(
         hwnd,
         if ja {
