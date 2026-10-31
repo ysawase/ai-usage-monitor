@@ -3596,11 +3596,16 @@ fn show_muse_status(hwnd: HWND) {
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
     let reading = dirs::data_local_dir()
-        .map(|dir| dir.join("Solidaily").join("AIUsageMonitor").join("muse-observation-v1.json"))
+        .map(|dir| {
+            dir.join("Solidaily")
+                .join("AIUsageMonitor")
+                .join("muse-observation-v1.json")
+        })
         .map(|path| crate::muse_status_view::read_observation(&path, now))
         .unwrap_or_else(MuseReading::not_connected);
     let reset = if reading.state == MuseConnectionState::Current {
-        reading.weekly_resets_at_unix
+        reading
+            .weekly_resets_at_unix
             .and_then(|secs| UNIX_EPOCH.checked_add(Duration::from_secs(secs)))
             .and_then(|reset_time| {
                 format_absolute_reset_time(Some(reset_time), SystemTime::now(), current_strings())
