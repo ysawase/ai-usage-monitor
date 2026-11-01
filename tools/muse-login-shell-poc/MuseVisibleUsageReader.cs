@@ -1,4 +1,5 @@
 using System.Windows.Automation;
+using System.Windows.Automation.Text;
 
 namespace MuseLoginShellPoc;
 
