@@ -112,7 +112,7 @@ internal sealed class SyntheticWebView2Window : Form
             // This never touches an authenticated Muse origin.
             // Simulate a long chat preceding the settings overlay without
             // using any actual user's chat history.
-            string longSyntheticPrefix = "<div>" + new string('架', 12000) + "</div>";
+            string longSyntheticPrefix = "<div style='height:36px;overflow:auto'><div>" + new string('架', 12000) + "</div></div>";
             fixtureBrowser.NavigateToString(
                 FixtureHtml.Replace("<main aria-label=", longSyntheticPrefix + "<main aria-label="));
         }
