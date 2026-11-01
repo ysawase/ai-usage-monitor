@@ -76,6 +76,8 @@ jobs:
             if (-not $p.WaitForExit(35000)) { throw 'Synthetic response timed out' }
             if ($p.ExitCode -ne 0) { throw "Synthetic response failed: $($p.ExitCode)" }
           } finally {
+            $diag = Join-Path $env:TEMP 'MusePassiveSyntheticStage.txt'
+            if (Test-Path $diag) { Write-Host ('SYNTHETIC_RESPONSE_STAGE: ' + (Get-Content $diag -Raw)) }
             if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }
           }
       - name: Upload short-lived test artifact
