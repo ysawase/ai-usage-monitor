@@ -13,7 +13,7 @@ internal enum MuseVisibleProbeStatus
 }
 
 internal sealed record MuseVisibleProbeResult(
-    MuseVisibleProbeStatus Status, SyntheticUsageReading? Reading);
+    MuseVisibleProbeStatus Status, SyntheticUsageReading? Reading, MuseUsageParseStatus? ParseStatus = null);
 
 /// <summary>
 /// User-initiated, single-shot, local UI Automation. Never navigates Muse,
@@ -46,8 +46,8 @@ internal static class MuseVisibleUsageReader
             string visibleText = textPattern.DocumentRange.GetText(8192);
             // The full document text exists only briefly in this method.
             // No raw document text, account detail, or chat content is logged.
-            if (!MuseVisibleUsageParser.TryParse(visibleText, out var reading))
-                return new(MuseVisibleProbeStatus.SettingsNotRecognized, null);
+            if (!MuseVisibleUsageParser.TryParse(visibleText, out var reading, out var parseStatus))
+                return new(MuseVisibleProbeStatus.SettingsNotRecognized, null, parseStatus);
             return new(MuseVisibleProbeStatus.Success, reading);
         }
         catch (Exception)
