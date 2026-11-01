@@ -32,6 +32,8 @@ public static class MuseOriginPolicy
                 url.Host.Equals("www.facebook.com", StringComparison.OrdinalIgnoreCase) ||
                 // Observed second blocked origin on the same Muse login flow.
                 // Only this first-party Instagram hostname is permitted.
-                url.Host.Equals("www.instagram.com", StringComparison.OrdinalIgnoreCase));
+                url.Host.Equals("www.instagram.com", StringComparison.OrdinalIgnoreCase) ||
+                // Confirmed Meta Account sign-in host; allow exact hostname only.
+                url.Host.Equals("auth.meta.com", StringComparison.OrdinalIgnoreCase));
     }
 }
