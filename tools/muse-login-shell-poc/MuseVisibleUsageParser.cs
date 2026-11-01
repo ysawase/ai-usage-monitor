@@ -3,15 +3,26 @@ using System.Text.RegularExpressions;
 
 namespace MuseLoginShellPoc;
 
+internal enum MuseUsageParseStatus
+{
+    Success,
+    MissingUsageSection,
+    MissingPlan,
+    MissingPercent,
+    MissingReset,
+    AmbiguousOrInvalid
+}
+
 /// <summary>
-/// Parses only the visible Muse Settings > General > Usage text in memory.
-/// A valid result requires the Settings heading, the free-plan marker, one
-/// usage percentage and one weekly-reset date. It never persists page text.
+/// In-memory parsing of visible Muse Settings > General > Usage labels.
+/// TextPattern can join adjacent HTML nodes without newline boundaries.
+/// Restrict matching to a short span after the Usage heading, never the full
+/// chat/background, and fail closed on ambiguity or invalid values.
 /// </summary>
 internal static class MuseVisibleUsageParser
 {
     private static readonly Regex Percent = new(
-        @"(?<![0-9])(?<used>100|[0-9]{1,2})\s*%\s*使用済み(?![\p{L}])",
+        @"(?<![0-9])(?<used>100|[0-9]{1,2})\s*[%％]\s*使用済み",
         RegexOptions.CultureInvariant | RegexOptions.Compiled,
         TimeSpan.FromMilliseconds(150));
     private static readonly Regex Reset = new(
@@ -19,39 +30,74 @@ internal static class MuseVisibleUsageParser
         RegexOptions.CultureInvariant | RegexOptions.Compiled,
         TimeSpan.FromMilliseconds(150));
 
-    internal static bool TryParse(string? pageText, out SyntheticUsageReading? reading)
+    internal static bool TryParse(string? text, out SyntheticUsageReading? reading) =>
+        TryParse(text, out reading, out _);
+
+    internal static bool TryParse(
+        string? text, out SyntheticUsageReading? reading, out MuseUsageParseStatus status)
     {
         reading = null;
-        if (string.IsNullOrWhiteSpace(pageText) || pageText.Length > 8192)
+        status = MuseUsageParseStatus.AmbiguousOrInvalid;
+        if (string.IsNullOrWhiteSpace(text) || text.Length > 8192)
             return false;
 
-        // Do not treat a similar-looking string from a normal chat as usage.
-        // These are necessary, not sufficient, markers of the settings view.
-        var lines = pageText.Replace('\u00A0', ' ').Split(
-            new[] { '\r', '\n' },
-            StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
-        if (!lines.Any(line => line == "利用状況")
-            || lines.Count(line => line == "無料プラン") != 1)
+        // The real Muse modal can appear after the chat content. Do not log
+        // the original or normalized document, even for failed parsing.
+        string normalized = text.Replace('\u00a0', ' ').Replace("\u200b", "");
+        const string heading = "利用状況";
+        int start = normalized.LastIndexOf(heading, StringComparison.Ordinal);
+        if (start < 0)
+        {
+            status = MuseUsageParseStatus.MissingUsageSection;
+            return false;
+        }
+        // Usage panel content in the UI is compact. Never parse values
+        // elsewhere in the document, such as from a chat containing "2%".
+        int end = Math.Min(normalized.Length, start + 512);
+        string usageArea = normalized.Substring(start + heading.Length, end - start - heading.Length);
+
+        int planCount = Regex.Matches(
+            usageArea, "無料\\s*プラン", RegexOptions.CultureInvariant,
+            TimeSpan.FromMilliseconds(150)).Count;
+        if (planCount == 0)
+        {
+            status = MuseUsageParseStatus.MissingPlan;
+            return false;
+        }
+        if (planCount != 1)
             return false;
 
-        var percentages = Percent.Matches(pageText);
-        var resets = Reset.Matches(pageText);
-        if (percentages.Count != 1 || resets.Count != 1)
+        var usages = Percent.Matches(usageArea);
+        if (usages.Count == 0)
+        {
+            status = MuseUsageParseStatus.MissingPercent;
+            return false;
+        }
+        if (usages.Count != 1)
             return false;
 
-        if (!int.TryParse(percentages[0].Groups["used"].Value,
-                NumberStyles.None, CultureInfo.InvariantCulture, out int used))
+        var resets = Reset.Matches(usageArea);
+        if (resets.Count == 0)
+        {
+            status = MuseUsageParseStatus.MissingReset;
             return false;
-        if (!int.TryParse(resets[0].Groups["month"].Value,
+        }
+        if (resets.Count != 1)
+            return false;
+
+        if (!int.TryParse(usages[0].Groups["used"].Value,
+                NumberStyles.None, CultureInfo.InvariantCulture, out int used)
+            || used is < 0 or > 100
+            || !int.TryParse(resets[0].Groups["month"].Value,
                 NumberStyles.None, CultureInfo.InvariantCulture, out int month)
             || !int.TryParse(resets[0].Groups["day"].Value,
                 NumberStyles.None, CultureInfo.InvariantCulture, out int day)
-            || month < 1 || month > 12 || day < 1
-            // Leap year allows February 29, because the UI omits the year.
+            || month is < 1 or > 12 || day < 1
             || day > DateTime.DaysInMonth(2024, month))
             return false;
 
         reading = new SyntheticUsageReading("無料プラン", used, 100-used, month, day);
+        status = MuseUsageParseStatus.Success;
         return true;
     }
 }
