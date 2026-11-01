@@ -11,6 +11,9 @@ namespace MuseLoginShellPoc;
 // Tests specific WebView2 response stages. Never uses real Muse or cookies.
 internal sealed class PassiveResponseDiagnostic : Form
 {
+    private const string SyntheticFixture = """
+        1:{"success":true,"subscription":{"tier":{"name":"Muse Free"},"usage":{"percentUsed":2,"resetsAt":1790634838}}}
+        """;
     private readonly WebView2 view = new() { Dock = DockStyle.Fill };
     private readonly System.Windows.Forms.Timer timeout = new() { Interval = 18000 };
     private TcpListener? listener;
@@ -75,7 +78,7 @@ internal sealed class PassiveResponseDiagnostic : Form
                 }
                 string line = Encoding.ASCII.GetString(buf, 0, count).Split("\r\n")[0];
                 bool usage = line.StartsWith("GET /test ", StringComparison.Ordinal);
-                string body = usage ? "1:{\\"success\\":true,\\"subscription\\":{\\"tier\\":{\\"name\\":\\"Muse Free\\"},\\"usage\\":{\\"percentUsed\\":2,\\"resetsAt\\":1790634838}}}" :
+                string body = usage ? SyntheticFixture :
                     "<!doctype html><html><body><script>fetch('/test')</script></body></html>";
                 byte[] bytes = Encoding.UTF8.GetBytes(body);
                 byte[] head = Encoding.ASCII.GetBytes(
@@ -111,7 +114,7 @@ internal sealed class PassiveResponseDiagnostic : Form
             byte[] b = new byte[512];
             int n = await Task.Run(() => body.Read(b, 0, b.Length));
             stage = "after_read";
-            bool valid = Encoding.UTF8.GetString(b, 0, n) == "1:{\\"success\\":true,\\"subscription\\":";
+            bool valid = Encoding.UTF8.GetString(b, 0, n) == SyntheticFixture;
             // Disposal is separately classified: some COM wrappers may not
             // support methods commonly expected from managed streams.
             try { body.Dispose(); }
