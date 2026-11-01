@@ -40,6 +40,8 @@ internal sealed class SyntheticPassiveResponseWindow : Form
     private bool finished;
     private int acceptedResponses;
     private int port;
+    private string stage = "init";
+    private static readonly string DiagnosticFile = Path.Combine(Path.GetTempPath(), "MusePassiveSyntheticStage.txt");
 
     internal SyntheticPassiveResponseWindow()
     {
@@ -48,7 +50,7 @@ internal sealed class SyntheticPassiveResponseWindow : Form
         Height = 410;
         Controls.Add(browser);
         Shown += async (_, _) => await StartAsync();
-        timeout.Tick += (_, _) => Finish(false);
+        timeout.Tick += (_, _) => { stage = "timeout"; Finish(false); };
         timeout.Start();
         FormClosed += (_, _) => server?.Stop();
     }
@@ -57,6 +59,7 @@ internal sealed class SyntheticPassiveResponseWindow : Form
     {
         try
         {
+            stage = "server";
             server = new TcpListener(IPAddress.Loopback, 0);
             server.Start();
             port = ((IPEndPoint)server.LocalEndpoint).Port;
@@ -72,6 +75,7 @@ internal sealed class SyntheticPassiveResponseWindow : Form
             core.Settings.AreHostObjectsAllowed = false;
             core.Settings.IsWebMessageEnabled = false;
             core.WebResourceResponseReceived += OnResponse;
+            stage = "navigate";
             core.Navigate("http://127.0.0.1:" + port + "/");
         }
         catch (Exception)
@@ -155,6 +159,7 @@ internal sealed class SyntheticPassiveResponseWindow : Form
             return;
 
         acceptedResponses++;
+        stage = "matched_response";
         try
         {
             using Stream? content = await e.Response.GetContentAsync();
@@ -173,6 +178,7 @@ internal sealed class SyntheticPassiveResponseWindow : Form
                 }
                 return count;
             });
+            stage = "body_read_count_" + result;
             if (result < 1 || result > 4096) { Finish(false); return; }
             string response = Encoding.UTF8.GetString(buffer, 0, result);
             int colon = response.IndexOf(':');
@@ -185,10 +191,12 @@ internal sealed class SyntheticPassiveResponseWindow : Form
                 && sub.GetProperty("usage").GetProperty("percentUsed").GetInt32() == 2
                 && sub.GetProperty("usage").GetProperty("resetsAt").GetInt64()
                     == 1790634838;
+            stage = pass ? "verified" : "wrong_fields";
             Finish(pass);
         }
-        catch (Exception)
+        catch (Exception ex)
         {
+            stage = "response_exception_" + ex.GetType().Name;
             Finish(false);
         }
     }
@@ -198,6 +206,7 @@ internal sealed class SyntheticPassiveResponseWindow : Form
         if (finished) return;
         finished = true;
         timeout.Stop();
+        try { File.WriteAllText(DiagnosticFile, stage + "; accepted=" + acceptedResponses); } catch { }
         Environment.ExitCode = pass && acceptedResponses == 1 ? 0 : 1;
         server?.Stop();
         Close();
