@@ -19,8 +19,7 @@ internal sealed class SyntheticWebView2Window : Form
           <main aria-label="架空の利用状況">
             <h1>利用状況</h1>
             <section aria-label="週間利用枠">
-              <div>無料プラン</div>
-              <div>2%使用済み</div>
+              <div><span>無料プラン</span><span>2%使用済み</span></div>
               <div>1週間の上限は11月6日にリセットされます</div>
             </section>
           </main>
