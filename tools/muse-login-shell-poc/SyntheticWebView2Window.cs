@@ -64,8 +64,15 @@ internal sealed class SyntheticWebView2Window : Form
     {
         try
         {
+            // Test fixture only. Microsoft documents this flag for development
+            // diagnostics, not production usage. The real Muse WebView2 never
+            // receives any such browser flags.
+            var options = new CoreWebView2EnvironmentOptions
+            {
+                AdditionalBrowserArguments = "--force-renderer-accessibility"
+            };
             var environment = await CoreWebView2Environment.CreateAsync(
-                userDataFolder: profileDir);
+                userDataFolder: profileDir, options: options);
             await fixtureBrowser.EnsureCoreWebView2Async(environment);
             fixtureBrowser.CoreWebView2.Settings.IsWebMessageEnabled = false;
             fixtureBrowser.CoreWebView2.Settings.AreDevToolsEnabled = false;
@@ -84,22 +91,44 @@ internal sealed class SyntheticWebView2Window : Form
                     // only this entirely synthetic test window's HWND (including WebView2).
                     await Task.Delay(400);
                     IntPtr controlHandle = Handle;
-                    var texts = await Task.Run(() =>
+                    var read = await Task.Run(() =>
                     {
                         var root = AutomationElement.FromHandle(controlHandle);
-                        var condition = new PropertyCondition(
-                            AutomationElement.ControlTypeProperty, ControlType.Text);
-                        var nodes = root.FindAll(TreeScope.Descendants, condition);
-                        var labels = new List<string>(Math.Min(nodes.Count, 64));
-                        for (int i = 0; i < nodes.Count && i < 64; i++)
-                            labels.Add(nodes[i].Current.Name);
-                        return labels.ToArray();
+                        var nodes = root.FindAll(TreeScope.Descendants, Condition.TrueCondition);
+                        var labels = new List<string>();
+                        int documents = 0;
+                        int textPatterns = 0;
+                        // This bounded test window contains only synthetic content.
+                        // Prefer document-wide TextPattern to ControlType.Text leaves.
+                        for (int i = -1; i < nodes.Count && i < 127; i++)
+                        {
+                            var node = i < 0 ? root : nodes[i];
+                            if (node.Current.ControlType == ControlType.Document)
+                                documents++;
+                            if (node.TryGetCurrentPattern(TextPattern.Pattern, out object pattern)
+                                && pattern is TextPattern textPattern)
+                            {
+                                textPatterns++;
+                                string content = textPattern.DocumentRange.GetText(2048);
+                                labels.AddRange(content.Split(
+                                    new[] { '\r', '\n' },
+                                    StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
+                            }
+                        }
+                        return (Labels: labels.ToArray(), Nodes: nodes.Count,
+                            Documents: documents, Patterns: textPatterns);
                     });
 
-                    Diagnose("text_nodes=" + texts.Length.ToString(System.Globalization.CultureInfo.InvariantCulture)
+                    string[] texts = read.Labels;
+                    // Diagnostics describe only synthetic test outcomes; never dump
+                    // any text from WebView2 or any first-party Muse page.
+                    Diagnose("nodes=" + read.Nodes
+                        + "; documents=" + read.Documents
+                        + "; text_patterns=" + read.Patterns
+                        + "; labels=" + texts.Length
                         + "; plan=" + texts.Count(t => t == "無料プラン")
-                        + "; percent=" + texts.Count(t => t.Contains("使用済み"))
-                        + "; reset=" + texts.Count(t => t.Contains("リセットされます")));
+                        + "; percent=" + texts.Count(t => t == "2%使用済み")
+                        + "; reset=" + texts.Count(t => t == "1週間の上限は11月6日にリセットされます"));
                     bool pass = SyntheticUsageParser.TryParse(texts, out var reading)
                         && reading is not null
                         && reading.UsedPercent == 2
