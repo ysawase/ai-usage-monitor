@@ -1,8 +1,8 @@
-pub mod session_contract;
-
 //! Mock-only Muse weekly-usage contract. No HTTP client, cookies, secrets,
 //! browser sessions, Next.js action discovery, or filesystem writes.
 //! This is intentionally NOT linked into the shipped monitor.
+
+pub mod session_contract;
 
 use serde_json::Value;
 
