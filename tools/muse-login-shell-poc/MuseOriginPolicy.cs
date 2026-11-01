@@ -26,6 +26,9 @@ public static class MuseOriginPolicy
                url.Port == 443 &&
                string.IsNullOrEmpty(url.UserInfo) &&
                (url.Host.Equals("muse.ai", StringComparison.OrdinalIgnoreCase) ||
-                url.Host.Equals("auth.muse.ai", StringComparison.OrdinalIgnoreCase));
+                url.Host.Equals("auth.muse.ai", StringComparison.OrdinalIgnoreCase) ||
+                // The Muse login PoC attempted a redirect to the exact Facebook login host.
+                // Never allow *.facebook.com or accept non-HTTPS origins.
+                url.Host.Equals("www.facebook.com", StringComparison.OrdinalIgnoreCase));
     }
 }
