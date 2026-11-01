@@ -22,7 +22,7 @@ jobs:
           cargo --version
       - name: Validate isolated mock contract (no real account or network calls)
         working-directory: tools/muse-offline-quota-poc
-        run: cargo test --locked
+        run: cargo test
       - name: Verify no executable HTTP or real session dependencies
         shell: bash
         run: |
