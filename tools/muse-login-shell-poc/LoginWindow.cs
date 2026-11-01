@@ -151,6 +151,7 @@ internal sealed class LoginWindow : Form
             if (result.Status != MuseVisibleProbeStatus.Success || result.Reading is null)
             {
                 status.Text = "取得不可：" + result.Status
+                    + (result.ParseStatus is null ? "" : " / " + result.ParseStatus)
                     + "。設定 → 一般 → 利用状況を表示してください。";
                 return;
             }
