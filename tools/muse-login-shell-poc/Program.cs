@@ -14,6 +14,13 @@ internal static class Program
     {
         try
         {
+            if (args.Contains("--synthetic-response-self-test", StringComparer.Ordinal))
+            {
+                ApplicationConfiguration.Initialize();
+                using var responseTest = new SyntheticPassiveResponseWindow();
+                Application.Run(responseTest);
+                return;
+            }
             if (args.Contains("--synthetic-webview2-self-test", StringComparer.Ordinal))
             {
                 ApplicationConfiguration.Initialize();
