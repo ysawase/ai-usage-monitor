@@ -39,6 +39,21 @@ jobs:
         run: |
           if (!(Test-Path artifacts/muse-login-shell-win-x64/MuseLoginShellPoc.exe)) { throw "Missing test executable" }
           if (Test-Path artifacts/muse-login-shell-win-x64/claude-code-usage-monitor.exe) { throw "Production executable must never be bundled" }
+      - name: Verify synthetic UI Automation without Muse access
+        shell: pwsh
+        run: |
+          $exe = (Resolve-Path 'artifacts/muse-login-shell-win-x64/MuseLoginShellPoc.exe').Path
+          $p = Start-Process -FilePath $exe -ArgumentList '--synthetic-self-test' -PassThru
+          try {
+            if (-not $p.WaitForExit(30000)) {
+              throw 'Synthetic UIA self-test timed out'
+            }
+            if ($p.ExitCode -ne 0) {
+              throw "Synthetic UIA self-test failed with exit code $($p.ExitCode)"
+            }
+          } finally {
+            if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }
+          }
       - name: Upload short-lived test artifact
         uses: actions/upload-artifact@v4
         with:
