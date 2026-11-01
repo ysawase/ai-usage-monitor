@@ -75,7 +75,7 @@ internal sealed class PassiveResponseDiagnostic : Form
                 }
                 string line = Encoding.ASCII.GetString(buf, 0, count).Split("\r\n")[0];
                 bool usage = line.StartsWith("GET /test ", StringComparison.Ordinal);
-                string body = usage ? "fixture-payload" :
+                string body = usage ? "1:{\\"success\\":true,\\"subscription\\":{\\"tier\\":{\\"name\\":\\"Muse Free\\"},\\"usage\\":{\\"percentUsed\\":2,\\"resetsAt\\":1790634838}}}" :
                     "<!doctype html><html><body><script>fetch('/test')</script></body></html>";
                 byte[] bytes = Encoding.UTF8.GetBytes(body);
                 byte[] head = Encoding.ASCII.GetBytes(
@@ -108,10 +108,10 @@ internal sealed class PassiveResponseDiagnostic : Form
             if (body is null) { Finish(false, "null_stream"); return; }
             // Check the stream's declared capabilities before attempting Read.
             stage = body.CanRead ? "readable" : "unreadable";
-            byte[] b = new byte[32];
+            byte[] b = new byte[512];
             int n = await Task.Run(() => body.Read(b, 0, b.Length));
             stage = "after_read";
-            bool valid = Encoding.UTF8.GetString(b, 0, n) == "fixture-payload";
+            bool valid = Encoding.UTF8.GetString(b, 0, n) == "1:{\\"success\\":true,\\"subscription\\":";
             // Disposal is separately classified: some COM wrappers may not
             // support methods commonly expected from managed streams.
             try { body.Dispose(); }
