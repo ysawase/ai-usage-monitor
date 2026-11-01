@@ -79,7 +79,7 @@ internal sealed class PassiveResponseDiagnostic : Form
                     "<!doctype html><html><body><script>fetch('/test')</script></body></html>";
                 byte[] bytes = Encoding.UTF8.GetBytes(body);
                 byte[] head = Encoding.ASCII.GetBytes(
-                    $"HTTP/1.1 200 OK\r\nContent-Type: {(usage ? "text/plain" : "text/html")}; charset=utf-8\r\nContent-Length: {bytes.Length}\r\nConnection: close\r\n\r\n");
+                    $"HTTP/1.1 200 OK\r\nContent-Type: {(usage ? "text/x-component" : "text/html")}; charset=utf-8\r\nContent-Length: {bytes.Length}\r\nConnection: close\r\n\r\n");
                 await stream.WriteAsync(head, cts.Token);
                 await stream.WriteAsync(bytes, cts.Token);
                 }
