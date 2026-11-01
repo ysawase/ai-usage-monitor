@@ -14,6 +14,13 @@ internal static class Program
     {
         try
         {
+            if (args.Contains("--passive-response-diagnostic", StringComparer.Ordinal))
+            {
+                ApplicationConfiguration.Initialize();
+                using var diagnostic = new PassiveResponseDiagnostic();
+                Application.Run(diagnostic);
+                return;
+            }
             if (args.Contains("--synthetic-webview2-self-test", StringComparer.Ordinal))
             {
                 ApplicationConfiguration.Initialize();
