@@ -9,6 +9,7 @@ on:
   push:
     branches:
       - feature/muse-webview2-login-shell-20261031
+      - feature/muse-passive-response-diag-20261102
     paths:
       - 'tools/muse-login-shell-poc/**'
       - '.github/workflows/muse-webview2-poc.yml'
@@ -65,6 +66,19 @@ jobs:
           } finally {
             $diagnostic = Join-Path $env:TEMP 'MuseSyntheticWebView2-UiaResult.txt'
             if (Test-Path $diagnostic) { Write-Host ('SYNTHETIC_WEBVIEW2_DIAGNOSTIC: ' + (Get-Content $diagnostic -Raw)) }
+            if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }
+          }
+      - name: Classify synthetic passive WebView2 response stages
+        shell: pwsh
+        run: |
+          $exe = (Resolve-Path 'artifacts/muse-login-shell-win-x64/MuseLoginShellPoc.exe').Path
+          $p = Start-Process -FilePath $exe -ArgumentList '--passive-response-diagnostic' -PassThru
+          try {
+            if (-not $p.WaitForExit(25000)) { throw 'Diagnostic timed out' }
+            if ($p.ExitCode -ne 0) { throw "Passive response diagnostic exited with $($p.ExitCode)" }
+          } finally {
+            $file = Join-Path $env:TEMP 'MusePassiveResponseStage.txt'
+            if (Test-Path $file) { Write-Host ('PASSIVE_RESPONSE_STAGE: ' + (Get-Content $file -Raw)) }
             if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }
           }
       - name: Upload short-lived test artifact
