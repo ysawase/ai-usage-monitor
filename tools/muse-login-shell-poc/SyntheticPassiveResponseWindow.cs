@@ -172,7 +172,7 @@ internal sealed class SyntheticPassiveResponseWindow : Form
             {
                 while (count < buffer.Length)
                 {
-                    int n = await content.ReadAsync(buffer.AsMemory(count));
+                    int n = content.Read(buffer, count, buffer.Length - count);
                     if (n == 0) break;
                     count += n;
                 }
