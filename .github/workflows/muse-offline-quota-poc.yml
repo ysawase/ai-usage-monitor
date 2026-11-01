@@ -1,0 +1,37 @@
+name: Muse offline mock quota contract (isolated)
+
+on:
+  pull_request:
+    paths:
+      - 'tools/muse-offline-quota-poc/**'
+      - '.github/workflows/muse-offline-quota-poc.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  offline-contract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust toolchain
+        run: |
+          rustc --version
+          cargo --version
+      - name: Validate isolated mock contract (no real account or network calls)
+        working-directory: tools/muse-offline-quota-poc
+        run: cargo test
+      - name: Verify no executable HTTP or real session dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          if grep -nE 'reqwest|ureq|hyper|CookieManager|WebView2|fetchSubscriptionAction|hatch_sess|https://muse.ai' tools/muse-offline-quota-poc/src/lib.rs; then
+            echo 'Unexpected live-service reference in offline-only crate'
+            exit 1
+          fi
+          if git diff --name-only origin/main...HEAD | grep -E '^(src/|Cargo.toml$|Cargo.lock$|assets/|installer/|packaging/)'; then
+            echo 'Product code changed by mock-only PR'
+            exit 1
+          fi

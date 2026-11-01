@@ -1,0 +1,10 @@
+[package]
+name = "muse-offline-quota-contract"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "MIT"
+
+# Isolated mock-only crate: never add this crate to the product workspace.
+[dependencies]
+serde_json = "1"
