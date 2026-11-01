@@ -10,10 +10,17 @@ internal static class Program
         "Solidaily", "MuseLoginShellPoc", "startup-diagnostic.txt");
 
     [STAThread]
-    private static void Main()
+    private static void Main(string[] args)
     {
         try
         {
+            if (args.Contains("--synthetic-self-test", StringComparer.Ordinal))
+            {
+                ApplicationConfiguration.Initialize();
+                using var synthetic = new SyntheticUsageWindow(runAutomaticSelfTest: true);
+                Application.Run(synthetic);
+                return;
+            }
             Record("Process entered managed Main");
             ApplicationConfiguration.Initialize();
             Record("Windows Forms initialized");
