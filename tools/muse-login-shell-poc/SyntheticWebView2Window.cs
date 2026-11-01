@@ -41,6 +41,12 @@ internal sealed class SyntheticWebView2Window : Form
     private readonly string profileDir = Path.Combine(
         Path.GetTempPath(), "MuseSyntheticWebView2-" + Guid.NewGuid().ToString("N"));
     private bool finished;
+    private static readonly string DiagnosticFile = Path.Combine(
+        Path.GetTempPath(), "MuseSyntheticWebView2-UiaResult.txt");
+    private static void Diagnose(string category)
+    {
+        try { File.WriteAllText(DiagnosticFile, category); } catch { }
+    }
 
     internal SyntheticWebView2Window()
     {
@@ -50,7 +56,7 @@ internal sealed class SyntheticWebView2Window : Form
         Controls.Add(fixtureBrowser);
         Controls.Add(verdict);
         Shown += async (_, _) => await StartAsync();
-        timeout.Tick += (_, _) => Complete(false);
+        timeout.Tick += (_, _) => { Diagnose("timeout"); Complete(false); };
         timeout.Start();
     }
 
@@ -68,6 +74,7 @@ internal sealed class SyntheticWebView2Window : Form
             {
                 if (!navigation.IsSuccess)
                 {
+                    Diagnose("navigation_failed");
                     Complete(false);
                     return;
                 }
@@ -89,6 +96,10 @@ internal sealed class SyntheticWebView2Window : Form
                         return labels.ToArray();
                     });
 
+                    Diagnose("text_nodes=" + texts.Length.ToString(System.Globalization.CultureInfo.InvariantCulture)
+                        + "; plan=" + texts.Count(t => t == "無料プラン")
+                        + "; percent=" + texts.Count(t => t.Contains("使用済み"))
+                        + "; reset=" + texts.Count(t => t.Contains("リセットされます")));
                     bool pass = SyntheticUsageParser.TryParse(texts, out var reading)
                         && reading is not null
                         && reading.UsedPercent == 2
@@ -97,8 +108,9 @@ internal sealed class SyntheticWebView2Window : Form
                         && reading.ResetDay == 6;
                     Complete(pass);
                 }
-                catch (Exception)
+                catch (Exception ex)
                 {
+                    Diagnose("uia_exception=" + ex.GetType().Name);
                     Complete(false);
                 }
             };
@@ -107,8 +119,9 @@ internal sealed class SyntheticWebView2Window : Form
             // This never touches an authenticated Muse origin.
             fixtureBrowser.NavigateToString(FixtureHtml);
         }
-        catch (Exception)
+        catch (Exception ex)
         {
+            Diagnose("webview_initialization_exception=" + ex.GetType().Name);
             Complete(false);
         }
     }
