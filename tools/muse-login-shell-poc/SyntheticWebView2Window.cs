@@ -1,7 +1,6 @@
 using Microsoft.Web.WebView2.Core;
 using Microsoft.Web.WebView2.WinForms;
 using System.Drawing;
-using System.Windows.Automation;
 using System.Windows.Forms;
 
 namespace MuseLoginShellPoc;
@@ -18,7 +17,7 @@ internal sealed class SyntheticWebView2Window : Form
         <head><meta charset="utf-8"><title>架空の利用状況</title></head>
         <body>
           <main aria-label="架空の利用状況">
-            <h1>利用状況（合成データ）</h1>
+            <h1>利用状況</h1>
             <section aria-label="週間利用枠">
               <div>無料プラン</div>
               <div>2%使用済み</div>
@@ -90,52 +89,17 @@ internal sealed class SyntheticWebView2Window : Form
                     // Allow the browser accessibility tree to settle. Read
                     // only this entirely synthetic test window's HWND (including WebView2).
                     await Task.Delay(400);
+                    // Run the EXACT reader and parser used by the real
+                    // user-click-only PoC; no independent synthetic shortcut.
+                    // This window contains only synthetic HTML in a fresh
+                    // profile, and is never connected to Muse.
                     IntPtr controlHandle = Handle;
-                    var read = await Task.Run(() =>
-                    {
-                        var root = AutomationElement.FromHandle(controlHandle);
-                        var nodes = root.FindAll(TreeScope.Descendants, Condition.TrueCondition);
-                        var labels = new List<string>();
-                        int documents = 0;
-                        int textPatterns = 0;
-                        // This bounded test window contains only synthetic content.
-                        // Prefer document-wide TextPattern to ControlType.Text leaves.
-                        for (int i = -1; i < nodes.Count && i < 127; i++)
-                        {
-                            var node = i < 0 ? root : nodes[i];
-                            if (node.Current.ControlType != ControlType.Document)
-                                continue;
-                            documents++;
-                            if (node.TryGetCurrentPattern(TextPattern.Pattern, out object pattern)
-                                && pattern is TextPattern textPattern)
-                            {
-                                textPatterns++;
-                                string content = textPattern.DocumentRange.GetText(2048);
-                                labels.AddRange(content.Split(
-                                    new[] { '\r', '\n' },
-                                    StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
-                            }
-                        }
-                        return (Labels: labels.ToArray(), Nodes: nodes.Count,
-                            Documents: documents, Patterns: textPatterns);
-                    });
-
-                    string[] texts = read.Labels;
-                    // Diagnostics describe only synthetic test outcomes; never dump
-                    // any text from WebView2 or any first-party Muse page.
-                    Diagnose("nodes=" + read.Nodes
-                        + "; documents=" + read.Documents
-                        + "; text_patterns=" + read.Patterns
-                        + "; labels=" + texts.Length
-                        + "; plan=" + texts.Count(t => t == "無料プラン")
-                        + "; percent=" + texts.Count(t => t == "2%使用済み")
-                        + "; reset=" + texts.Count(t => t == "1週間の上限は11月6日にリセットされます"));
-                    bool pass = SyntheticUsageParser.TryParse(texts, out var reading)
-                        && reading is not null
-                        && reading.UsedPercent == 2
-                        && reading.RemainingPercent == 98
-                        && reading.ResetMonth == 11
-                        && reading.ResetDay == 6;
+                    var read = await Task.Run(
+                        () => MuseVisibleUsageReader.ReadOnce(controlHandle));
+                    Diagnose("real_reader_status=" + read.Status);
+                    bool pass = read.Status == MuseVisibleProbeStatus.Success
+                        && read.Reading is { Plan: "無料プラン", UsedPercent: 2,
+                            RemainingPercent: 98, ResetMonth: 11, ResetDay: 6 };
                     Complete(pass);
                 }
                 catch (Exception ex)
