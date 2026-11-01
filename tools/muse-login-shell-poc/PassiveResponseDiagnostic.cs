@@ -59,6 +59,8 @@ internal sealed class PassiveResponseDiagnostic : Form
             while (!done)
             {
                 using var client = await server.AcceptTcpClientAsync();
+                try
+                {
                 using var stream = client.GetStream();
                 using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
                 byte[] buf = new byte[4096];
@@ -80,6 +82,9 @@ internal sealed class PassiveResponseDiagnostic : Form
                     $"HTTP/1.1 200 OK\r\nContent-Type: {(usage ? "text/plain" : "text/html")}; charset=utf-8\r\nContent-Length: {bytes.Length}\r\nConnection: close\r\n\r\n");
                 await stream.WriteAsync(head, cts.Token);
                 await stream.WriteAsync(bytes, cts.Token);
+                }
+                catch (IOException) { /* Ignore closed synthetic connections. */ }
+                catch (OperationCanceledException) { /* Per-connection bound. */ }
             }
         }
         catch (Exception) when (done) { }
