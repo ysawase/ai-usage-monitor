@@ -103,8 +103,9 @@ internal sealed class SyntheticWebView2Window : Form
                         for (int i = -1; i < nodes.Count && i < 127; i++)
                         {
                             var node = i < 0 ? root : nodes[i];
-                            if (node.Current.ControlType == ControlType.Document)
-                                documents++;
+                            if (node.Current.ControlType != ControlType.Document)
+                                continue;
+                            documents++;
                             if (node.TryGetCurrentPattern(TextPattern.Pattern, out object pattern)
                                 && pattern is TextPattern textPattern)
                             {
