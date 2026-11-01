@@ -14,6 +14,13 @@ internal static class Program
     {
         try
         {
+            if (args.Contains("--synthetic-webview2-self-test", StringComparer.Ordinal))
+            {
+                ApplicationConfiguration.Initialize();
+                using var syntheticWeb = new SyntheticWebView2Window();
+                Application.Run(syntheticWeb);
+                return;
+            }
             if (args.Contains("--synthetic-self-test", StringComparer.Ordinal))
             {
                 ApplicationConfiguration.Initialize();
