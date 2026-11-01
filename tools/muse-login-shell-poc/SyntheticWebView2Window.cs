@@ -95,7 +95,7 @@ internal sealed class SyntheticWebView2Window : Form
                     IntPtr controlHandle = Handle;
                     var read = await Task.Run(
                         () => MuseVisibleUsageReader.ReadOnce(controlHandle));
-                    Diagnose("real_reader_status=" + read.Status);
+                    Diagnose("real_reader_status=" + read.Status + "; parse=" + read.ParseStatus);
                     bool pass = read.Status == MuseVisibleProbeStatus.Success
                         && read.Reading is { Plan: "無料プラン", UsedPercent: 2,
                             RemainingPercent: 98, ResetMonth: 11, ResetDay: 6 };
