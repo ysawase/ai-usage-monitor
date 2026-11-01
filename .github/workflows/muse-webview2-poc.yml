@@ -63,6 +63,8 @@ jobs:
             if (-not $p.WaitForExit(35000)) { throw 'Synthetic WebView2 accessibility timed out' }
             if ($p.ExitCode -ne 0) { throw "Synthetic WebView2 accessibility failed: $($p.ExitCode)" }
           } finally {
+            $diagnostic = Join-Path $env:TEMP 'MuseSyntheticWebView2-UiaResult.txt'
+            if (Test-Path $diagnostic) { Write-Host ('SYNTHETIC_WEBVIEW2_DIAGNOSTIC: ' + (Get-Content $diagnostic -Raw)) }
             if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }
           }
       - name: Upload short-lived test artifact
