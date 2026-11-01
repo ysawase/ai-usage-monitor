@@ -55,7 +55,7 @@ internal static class MuseVisibleUsageReader
             TextPatternRange usageRange = heading.Clone();
             usageRange.MoveEndpointByRange(TextPatternRangeEndpoint.End,
                 document, TextPatternRangeEndpoint.End);
-            string usageSnippet = usageRange.GetText(768);
+            string usageSnippet = "利用状況" + usageRange.GetText(768);
             // Only the bounded snippet is materialized, never logged or saved.
             if (!MuseVisibleUsageParser.TryParse(
                     usageSnippet, out var reading, out var parseStatus))
