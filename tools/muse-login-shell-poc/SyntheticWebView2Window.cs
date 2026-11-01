@@ -81,9 +81,9 @@ internal sealed class SyntheticWebView2Window : Form
                 try
                 {
                     // Allow the browser accessibility tree to settle. Read
-                    // only this entirely synthetic WebView2 control's HWND.
+                    // only this entirely synthetic test window's HWND (including WebView2).
                     await Task.Delay(400);
-                    IntPtr controlHandle = fixtureBrowser.Handle;
+                    IntPtr controlHandle = Handle;
                     var texts = await Task.Run(() =>
                     {
                         var root = AutomationElement.FromHandle(controlHandle);
