@@ -54,6 +54,17 @@ jobs:
           } finally {
             if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }
           }
+      - name: Verify isolated synthetic WebView2 accessibility
+        shell: pwsh
+        run: |
+          $exe = (Resolve-Path 'artifacts/muse-login-shell-win-x64/MuseLoginShellPoc.exe').Path
+          $p = Start-Process -FilePath $exe -ArgumentList '--synthetic-webview2-self-test' -PassThru
+          try {
+            if (-not $p.WaitForExit(35000)) { throw 'Synthetic WebView2 accessibility timed out' }
+            if ($p.ExitCode -ne 0) { throw "Synthetic WebView2 accessibility failed: $($p.ExitCode)" }
+          } finally {
+            if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }
+          }
       - name: Upload short-lived test artifact
         uses: actions/upload-artifact@v4
         with:
