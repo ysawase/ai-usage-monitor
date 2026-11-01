@@ -29,6 +29,9 @@ public static class MuseOriginPolicy
                 url.Host.Equals("auth.muse.ai", StringComparison.OrdinalIgnoreCase) ||
                 // The Muse login PoC attempted a redirect to the exact Facebook login host.
                 // Never allow *.facebook.com or accept non-HTTPS origins.
-                url.Host.Equals("www.facebook.com", StringComparison.OrdinalIgnoreCase));
+                url.Host.Equals("www.facebook.com", StringComparison.OrdinalIgnoreCase) ||
+                // Observed second blocked origin on the same Muse login flow.
+                // Only this first-party Instagram hostname is permitted.
+                url.Host.Equals("www.instagram.com", StringComparison.OrdinalIgnoreCase));
     }
 }
