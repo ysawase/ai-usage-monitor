@@ -69,7 +69,15 @@ internal sealed class LoginWindow : Form
                 if (!MuseOriginPolicy.IsAllowed(e.Uri))
                 {
                     e.Cancel = true;
-                    status.Text = "Muse以外への画面遷移を停止しました。";
+                    // Display only the hostname; never display or log authentication paths or query values.
+                    string hostname = "確認できない接続先";
+                    if (Uri.TryCreate(e.Uri, UriKind.Absolute, out var target) &&
+                        (target.Scheme == Uri.UriSchemeHttps || target.Scheme == Uri.UriSchemeHttp) &&
+                        target.IdnHost.Length is > 0 and <= 120)
+                    {
+                        hostname = target.IdnHost;
+                    }
+                    status.Text = "許可されていない接続先を停止: " + hostname;
                 }
             };
             core.NewWindowRequested += (_, e) =>
