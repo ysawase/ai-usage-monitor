@@ -110,7 +110,11 @@ internal sealed class SyntheticWebView2Window : Form
 
             // about:blank document from an in-memory synthetic fixture.
             // This never touches an authenticated Muse origin.
-            fixtureBrowser.NavigateToString(FixtureHtml);
+            // Simulate a long chat preceding the settings overlay without
+            // using any actual user's chat history.
+            string longSyntheticPrefix = "<div>" + new string('架', 12000) + "</div>";
+            fixtureBrowser.NavigateToString(
+                FixtureHtml.Replace("<main aria-label=", longSyntheticPrefix + "<main aria-label="));
         }
         catch (Exception ex)
         {
