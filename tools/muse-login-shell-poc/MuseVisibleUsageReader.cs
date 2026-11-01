@@ -43,10 +43,21 @@ internal static class MuseVisibleUsageReader
                 || pattern is not TextPattern textPattern)
                 return new(MuseVisibleProbeStatus.NoTextPattern, null);
 
-            string visibleText = textPattern.DocumentRange.GetText(8192);
-            // The full document text exists only briefly in this method.
-            // No raw document text, account detail, or chat content is logged.
-            if (!MuseVisibleUsageParser.TryParse(visibleText, out var reading, out var parseStatus))
+            // Search the text provider directly: a long background chat can
+            // place the Settings sheet beyond the first 8192 characters.
+            TextPatternRange document = textPattern.DocumentRange;
+            TextPatternRange? heading = document.FindText(
+                "利用状況", backward: true, ignoreCase: false);
+            if (heading is null)
+                return new(MuseVisibleProbeStatus.SettingsNotRecognized, null,
+                    MuseUsageParseStatus.MissingUsageSection);
+            TextPatternRange usageRange = heading.Clone();
+            usageRange.MoveEndpointByRange(TextPatternRangeEndpoint.End,
+                document, TextPatternRangeEndpoint.End);
+            string usageSnippet = usageRange.GetText(768);
+            // Only the bounded snippet is materialized, never logged or saved.
+            if (!MuseVisibleUsageParser.TryParse(
+                    usageSnippet, out var reading, out var parseStatus))
                 return new(MuseVisibleProbeStatus.SettingsNotRecognized, null, parseStatus);
             return new(MuseVisibleProbeStatus.Success, reading);
         }
