@@ -22,6 +22,7 @@ internal sealed class LoginWindow : Form
     };
     private readonly Button open = new() { Text = "Museを開く", AutoSize = true };
     private readonly Button erase = new() { Text = "この試作のログイン情報を消去", AutoSize = true };
+    private readonly Button synthetic = new() { Text = "合成データ検証", AutoSize = true };
     private bool resetting;
 
     internal LoginWindow()
@@ -31,17 +32,20 @@ internal sealed class LoginWindow : Form
         Height = 720;
         MinimumSize = new Size(550, 400);
 
-        var bar = new TableLayoutPanel { Dock = DockStyle.Top, Height = 64, ColumnCount = 3 };
+        var bar = new TableLayoutPanel { Dock = DockStyle.Top, Height = 64, ColumnCount = 4 };
+        bar.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
         bar.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
         bar.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
         bar.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         bar.Controls.Add(open, 0, 0);
         bar.Controls.Add(erase, 1, 0);
-        bar.Controls.Add(status, 2, 0);
+        bar.Controls.Add(synthetic, 2, 0);
+        bar.Controls.Add(status, 3, 0);
         Controls.Add(browser);
         Controls.Add(bar);
         open.Click += (_, _) => browser.CoreWebView2?.Navigate(MuseUrl);
         erase.Click += async (_, _) => await ClearSessionAsync();
+        synthetic.Click += (_, _) => new SyntheticUsageWindow().Show(this);
         Shown += async (_, _) => await InitializeBrowserAsync();
     }
 
