@@ -63,8 +63,18 @@ internal sealed class LoginWindow : Form
             string directory = Path.Combine(
                 Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
                 "Solidaily", "MuseLoginShellPoc", "WebView2Profile");
+            // Dedicated personal-only PoC: permit Windows UI Automation to
+            // expose visible web content after the user's explicit read click.
+            // This diagnostic flag is used only in this isolated experimental
+            // profile. It must NOT be carried into the public Store product
+            // without a separate provider-policy and performance review.
+            var options = new CoreWebView2EnvironmentOptions
+            {
+                AdditionalBrowserArguments = "--force-renderer-accessibility"
+            };
             var environment = await CoreWebView2Environment.CreateAsync(
-                browserExecutableFolder: null, userDataFolder: directory);
+                browserExecutableFolder: null, userDataFolder: directory,
+                options: options);
             await browser.EnsureCoreWebView2Async(environment);
             var core = browser.CoreWebView2;
             core.Settings.IsWebMessageEnabled = false;
