@@ -87,3 +87,17 @@
 - Muse Code provider/既存本番provider/Storeバイナリに変更なし
 
 **現Taskの終了条件:** 競合ソースの現物確認・UX最短設計・許諾Gateの明確化とDraft内への記録。mockアダプタ新規実装、実Museへのprivate actionアクセス、本番releaseはこの研究Taskだけでは実行許可しない。
+
+
+## 5. 追補：第三者API経由の取得方式（2026-11-02）
+
+**調査結果: 技術的な取得経路は存在するが、現方針では不採用。** 既存のPR #10/#11/#12、main、Store版への実装変更を指示するものではない。
+
+- 非Metaの有料サービス **useapi.net** は、個人向けMuseを対象に `GET /v1/muse/accounts/{email}` を提供し、`quota.tier` / `percentUsed` / `resetsAt` / `quotaStatus` / `readAt` を返すと説明している。公開仕様：https://useapi.net/docs/api-muse-v1/get-muse-accounts-email
+- そのAPIを使うには **月額15 USD** のuseapi.net契約が必要。Muse側の契約とは別の継続費用であり、年換算では **180 USD**（為替・税等除く）。公式料金：https://useapi.net/docs/subscription
+- アカウント登録時に、Museの**メールアドレスとパスワードをuseapi.netへ提供**し、同社がログインセッションを管理すると明記。技術上は「パスワードを第三者へ預けない」「一度アプリ内でMuseにログインするだけで動作」の既定UX・セキュリティ境界を満たさない。https://useapi.net/docs/start-here/setup-muse
+- useapi.netの商用提供実績は、**Metaが外部アプリによる第三者取得・再表示を許可した証拠ではない**。公開されたAPIがMeta公式でもない。Meta公式のMuse Connector Platform（https://platform.muse.ai/）は、外部サービスをMuseへ接続する方向の制度で、Museのquotaをモニターへ開示する公認APIではない。
+- **現時点の判定: 現方針では見送り候補（正式なProject判断状態は変更しない）**。ユーザーが追加課金と第三者Credential預託の両方を明示的に許容し、かつprovider規約・配布条件の評価が成立した場合だけ再検討可能。
+- 比較の起点となる隔離CIは、PR #11 `ff30028` とPR #12 `e8302e4` で**合成データの検証に成功**。実Muse quota取得の実証や公式許可ではない。保留を自動解除しない。
+
+**維持する推奨経路:** 2026-10-30に送信済みのMeta本人向け問い合わせに対する回答、または公式の利用枠読取経路が公表された場合のみ取得方式の妥当性を再評価する。回答がないまま同じmock試験を反復しない。
