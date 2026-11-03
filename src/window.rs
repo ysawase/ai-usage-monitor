@@ -97,7 +97,7 @@ enum AuthAction {
     ClaudeLogin,
     CodexLogin,
     AntigravitySetup,
-    ProviderDiagnosis(QuotaFamilyId),
+    ProviderDiagnosis(QuotaFamilyId, CellState),
 }
 
 impl AuthAction {
@@ -109,7 +109,7 @@ impl AuthAction {
             Self::ClaudeLogin => ("claude", &["auth", "login"]),
             Self::CodexLogin => ("codex", &["login"]),
             Self::AntigravitySetup => ("", &[]),
-            Self::ProviderDiagnosis(_) => ("", &[]),
+            Self::ProviderDiagnosis(_, _) => ("", &[]),
         }
     }
 
@@ -119,8 +119,8 @@ impl AuthAction {
                 show_antigravity_setup(hwnd);
                 return;
             }
-            Self::ProviderDiagnosis(family) => {
-                show_single_provider_diagnosis(hwnd, family);
+            Self::ProviderDiagnosis(family, state) => {
+                show_single_provider_diagnosis(hwnd, family, state);
                 return;
             }
             _ => {}
@@ -222,7 +222,7 @@ fn provider_auth_action(family: QuotaFamilyId, state: CellState) -> Option<AuthA
     );
     if !is_auth_state {
         return if state == CellState::FetchFailed {
-            Some(AuthAction::ProviderDiagnosis(family))
+            Some(AuthAction::ProviderDiagnosis(family, state))
         } else {
             None
         };
@@ -232,7 +232,7 @@ fn provider_auth_action(family: QuotaFamilyId, state: CellState) -> Option<AuthA
         QuotaFamilyId::Codex => Some(AuthAction::CodexLogin),
         QuotaFamilyId::Antigravity => Some(AuthAction::AntigravitySetup),
         QuotaFamilyId::GithubCopilot | QuotaFamilyId::VercelAiGateway => {
-            Some(AuthAction::ProviderDiagnosis(family))
+            Some(AuthAction::ProviderDiagnosis(family, state))
         }
     }
 }
@@ -3608,20 +3608,15 @@ fn build_provider_diagnosis(ja: bool, rows: &[(QuotaFamilyId, CellState)]) -> St
     body
 }
 
-fn show_single_provider_diagnosis(hwnd: HWND, family: QuotaFamilyId) {
-    let (ja, state) = {
+fn show_single_provider_diagnosis(hwnd: HWND, family: QuotaFamilyId, state: CellState) {
+    // Diagnose the specific cell that was clicked (session, weekly, or monthly),
+    // not a different window's latest state.
+    let ja = {
         let guard = lock_state();
         let Some(s) = guard.as_ref() else {
             return;
         };
-        let state = match family {
-            QuotaFamilyId::Claude => s.weekly_state,
-            QuotaFamilyId::Codex => s.codex_weekly_state,
-            QuotaFamilyId::Antigravity => s.antigravity_weekly_state,
-            QuotaFamilyId::GithubCopilot => s.github_copilot_state,
-            QuotaFamilyId::VercelAiGateway => s.vercel_ai_gateway_state,
-        };
-        (s.language == LanguageId::Japanese, state)
+        s.language == LanguageId::Japanese
     };
     let title = if ja {
         "AIサービスの接続診断"
@@ -6641,7 +6636,7 @@ fn paint_content(
                     accent: &vercel_ai_gateway_accent,
                     provider_text_color: vercel_ai_gateway_accent,
                     is_warning: false,
-                    auth_action: if vercel_ai_gateway_percent.is_none() && matches!(vercel_ai_gateway_text, t if t == strings.fetch_failed || t == strings.credentials_unavailable) { Some(AuthAction::ProviderDiagnosis(QuotaFamilyId::VercelAiGateway)) } else { None },
+                    auth_action: if vercel_ai_gateway_percent.is_none() && matches!(vercel_ai_gateway_text, t if t == strings.fetch_failed || t == strings.credentials_unavailable) { Some(AuthAction::ProviderDiagnosis(QuotaFamilyId::VercelAiGateway, if vercel_ai_gateway_text == strings.credentials_unavailable { CellState::CredentialsUnavailable } else { CellState::FetchFailed })) } else { None },
                 });
             }
             draw_row(
@@ -10557,7 +10552,8 @@ mod tests {
                 CellState::CredentialsUnavailable
             ),
             Some(AuthAction::ProviderDiagnosis(
-                QuotaFamilyId::VercelAiGateway
+                QuotaFamilyId::VercelAiGateway,
+                CellState::CredentialsUnavailable
             ))
         );
     }
@@ -10698,6 +10694,33 @@ mod tests {
     }
 
     #[test]
+    fn provider_diagnosis_action_keeps_the_clicked_cell_state() {
+        // The session cell can fail while the weekly cell has a valid value.
+        // Diagnosis must use the clicked session cell, not a weekly snapshot.
+        for family in [QuotaFamilyId::Claude, QuotaFamilyId::Codex] {
+            let session_action = provider_auth_action(family, CellState::FetchFailed);
+            let weekly_action = provider_auth_action(family, CellState::Ok);
+            assert_eq!(
+                session_action,
+                Some(AuthAction::ProviderDiagnosis(
+                    family,
+                    CellState::FetchFailed
+                ))
+            );
+            assert_eq!(weekly_action, None);
+        }
+        for state in [CellState::FetchFailed, CellState::CredentialsUnavailable] {
+            let action = provider_auth_action(QuotaFamilyId::GithubCopilot, state);
+            assert_eq!(
+                action,
+                Some(AuthAction::ProviderDiagnosis(
+                    QuotaFamilyId::GithubCopilot,
+                    state
+                ))
+            );
+        }
+    }
+    #[test]
     fn non_auth_states_are_never_cta_eligible_for_claude_or_codex() {
         for state in [
             CellState::Loading,
@@ -10707,12 +10730,18 @@ mod tests {
             CellState::NotAvailable,
         ] {
             let expected_claude = if state == CellState::FetchFailed {
-                Some(AuthAction::ProviderDiagnosis(QuotaFamilyId::Claude))
+                Some(AuthAction::ProviderDiagnosis(
+                    QuotaFamilyId::Claude,
+                    CellState::FetchFailed,
+                ))
             } else {
                 None
             };
             let expected_codex = if state == CellState::FetchFailed {
-                Some(AuthAction::ProviderDiagnosis(QuotaFamilyId::Codex))
+                Some(AuthAction::ProviderDiagnosis(
+                    QuotaFamilyId::Codex,
+                    CellState::FetchFailed,
+                ))
             } else {
                 None
             };
@@ -10747,7 +10776,10 @@ mod tests {
         ] {
             assert_eq!(
                 provider_auth_action(QuotaFamilyId::GithubCopilot, state),
-                Some(AuthAction::ProviderDiagnosis(QuotaFamilyId::GithubCopilot))
+                Some(AuthAction::ProviderDiagnosis(
+                    QuotaFamilyId::GithubCopilot,
+                    state
+                ))
             );
         }
     }
@@ -11349,7 +11381,10 @@ mod tests {
         assert_eq!(
             actionable_status_label(
                 "取得失敗",
-                Some(AuthAction::ProviderDiagnosis(QuotaFamilyId::Claude))
+                Some(AuthAction::ProviderDiagnosis(
+                    QuotaFamilyId::Claude,
+                    CellState::FetchFailed
+                ))
             ),
             "› 取得失敗"
         );
