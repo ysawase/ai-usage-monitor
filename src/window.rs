@@ -1,3 +1,4 @@
+use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, MutexGuard};
@@ -110,9 +111,51 @@ impl AuthAction {
 
     fn launch(self, hwnd: HWND) {
         let (program, args) = self.command();
+        // Codex currently requires a Windows CLI. Avoid opening a console
+        // that can only report "command not found". Claude is deliberately
+        // excluded: it may be installed only inside WSL, which requires a
+        // separate environment-aware recovery path.
+        if self == Self::CodexLogin && !windows_cli_on_path("codex") {
+            diagnose::log("Codex CLI was not found on Windows PATH; opening official setup");
+            if !open_external_auth_setup(hwnd, CODEX_CLI_SETUP_URL) {
+                diagnose::log("unable to open official Codex CLI setup");
+            }
+            return;
+        }
         if !launch_visible_auth_command(hwnd, program, args) {
             diagnose::log(format!("unable to launch auth command for {program}"));
         }
+    }
+}
+
+const CODEX_CLI_SETUP_URL: &str = "https://developers.openai.com/codex/cli";
+const CREATE_NO_WINDOW_FLAG: u32 = 0x0800_0000;
+
+fn windows_cli_on_path(name: &str) -> bool {
+    // Only call with a fixed program name, not user-controlled text.
+    std::process::Command::new("where.exe")
+        .arg(name)
+        .creation_flags(CREATE_NO_WINDOW_FLAG)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn open_external_auth_setup(hwnd: HWND, url: &str) -> bool {
+    unsafe {
+        let operation = native_interop::wide_str("open");
+        let destination = native_interop::wide_str(url);
+        let result = ShellExecuteW(
+            hwnd,
+            PCWSTR::from_raw(operation.as_ptr()),
+            PCWSTR::from_raw(destination.as_ptr()),
+            PCWSTR::null(),
+            PCWSTR::null(),
+            SW_SHOWNORMAL,
+        );
+        result.0 as isize > 32
     }
 }
 
