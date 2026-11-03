@@ -201,38 +201,31 @@ struct AuthCtaHitTarget {
 /// normally and simply prints its own "not recognized" error inside that
 /// visible console — this app does not attempt to detect that case, and
 /// does not fall back to reading any credential file if it happens.
-fn launch_visible_auth_command(hwnd: HWND, program: &str, args: &[&str]) -> bool {
+const CLAUDE_AUTH_TROUBLESHOOTING_URL: &str = "https://code.claude.com/docs/en/troubleshooting";
+
+/// Fixed first-party login commands only. On failure, show official recovery
+/// instructions instead of copying or running a pinned historic executable.
+fn auth_command_line(program: &str, args: &[&str]) -> String {
     let mut command_line = String::from("/k ");
     command_line.push_str(program);
     for arg in args {
         command_line.push(' ');
         command_line.push_str(arg);
     }
-    // Use the first-party login flow normally.  If it fails, allow an
-    // explicit, opt-in recovery using a known locally installed older binary.
-    // The native installer's cached binary has no .exe suffix, so Windows
-    // needs a temporary .exe copy.  This app never handles OAuth credentials.
     if program == "claude" && args == ["auth", "login"] {
         command_line.push_str(" & if errorlevel 1 (");
         command_line.push_str("echo. & echo Claude Code login failed.");
-        command_line
-            .push_str(" & echo An older installed Claude Code 2.1.308 can be tried if present.");
-        command_line
-            .push_str(" & choice /c YN /n /m \"Try installed Claude Code 2.1.308? [Y/N] \"");
-        command_line.push_str(" & if errorlevel 2 (echo Recovery cancelled.) else (");
-        command_line.push_str("powershell.exe -NoProfile -ExecutionPolicy Bypass -Command ");
-        command_line.push_str(
-            "\"$source=Join-Path $env:USERPROFILE '.local\\share\\claude\\versions\\2.1.308'; ",
-        );
-        command_line.push_str("if (!(Test-Path -LiteralPath $source -PathType Leaf)) { Write-Host 'Claude Code 2.1.308 is not installed.'; exit 1 }; ");
-        command_line.push_str("$exe=Join-Path $env:TEMP 'claude-auth-recovery-2.1.308.exe'; ");
-        command_line.push_str(
-            "Copy-Item -LiteralPath $source -Destination $exe -Force -ErrorAction Stop; ",
-        );
-        command_line.push_str("& $exe auth login\"");
-        command_line.push_str(" )");
+        command_line.push_str(" & echo For official login troubleshooting, see:");
+        command_line.push_str(" & echo ");
+        command_line.push_str(CLAUDE_AUTH_TROUBLESHOOTING_URL);
+        command_line.push_str(" & echo Run claude doctor separately to check your installation.");
         command_line.push_str(" )");
     }
+    command_line
+}
+
+fn launch_visible_auth_command(hwnd: HWND, program: &str, args: &[&str]) -> bool {
+    let command_line = auth_command_line(program, args);
     unsafe {
         let operation = native_interop::wide_str("open");
         let target = native_interop::wide_str("cmd.exe");
@@ -10201,6 +10194,26 @@ fn draw_rounded_rect(hdc: HDC, rect: &RECT, color: &Color, radius: i32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn claude_auth_failure_offers_official_guidance_without_legacy_binary() {
+        let command = auth_command_line("claude", &["auth", "login"]);
+        assert!(command.starts_with("/k claude auth login"));
+        assert!(command.contains("if errorlevel 1"));
+        assert!(command.contains(CLAUDE_AUTH_TROUBLESHOOTING_URL));
+        assert!(command.contains("claude doctor"));
+        assert!(!command.contains("2.1.308"));
+        assert!(!command.contains("Copy-Item"));
+        assert!(!command.contains("ExecutionPolicy"));
+    }
+
+    #[test]
+    fn other_auth_commands_do_not_gain_claude_failure_actions() {
+        assert_eq!(auth_command_line("codex", &["login"]), "/k codex login");
+        assert_eq!(
+            auth_command_line("claude", &["auth", "status"]),
+            "/k claude auth status"
+        );
+    }
 
     #[test]
     fn custom_window_message_ids_are_unique() {
