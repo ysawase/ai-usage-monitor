@@ -1,4 +1,6 @@
+use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
+use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -109,9 +111,17 @@ impl AuthAction {
     }
 
     fn launch(self, hwnd: HWND) {
-        let (program, args) = self.command();
-        if !launch_visible_auth_command(hwnd, program, args) {
-            diagnose::log(format!("unable to launch auth command for {program}"));
+        match self {
+            Self::ClaudeLogin => {
+                if !launch_claude_auth_command(hwnd) {
+                    diagnose::log("unable to launch Claude auth recovery");
+                }
+            }
+            Self::CodexLogin => {
+                if !launch_codex_auth_command(hwnd) {
+                    diagnose::log("unable to launch Codex auth recovery");
+                }
+            }
         }
     }
 }
@@ -152,6 +162,131 @@ fn provider_auth_action(family: QuotaFamilyId, state: CellState) -> Option<AuthA
 struct AuthCtaHitTarget {
     rect: RECT,
     action: AuthAction,
+}
+
+const CREATE_NEW_CONSOLE_FLAG: u32 = 0x00000010;
+const CLAUDE_CODE_SETUP_URL: &str = "https://code.claude.com/docs/en/setup";
+const CODEX_CLI_SETUP_URL: &str = "https://developers.openai.com/codex/cli";
+
+fn launch_claude_auth_command(hwnd: HWND) -> bool {
+    match poller::claude_auth_launch_target() {
+        Some(poller::ClaudeAuthLaunchTarget::Windows(program)) => {
+            launch_visible_process(&program, &["auth", "login"])
+        }
+        Some(poller::ClaudeAuthLaunchTarget::Wsl { distro }) => {
+            launch_visible_wsl_claude_auth(&distro)
+        }
+        None => {
+            diagnose::log(
+                "Claude auth recovery found no usable Claude CLI; opening the official setup page",
+            );
+            open_claude_code_setup(hwnd)
+        }
+    }
+}
+
+fn launch_codex_auth_command(hwnd: HWND) -> bool {
+    match poller::resolve_windows_codex_path() {
+        Some(program) => launch_visible_process(&program, &["login"]),
+        None => {
+            diagnose::log(
+                "Codex auth recovery found no usable Codex CLI; opening the official setup page",
+            );
+            open_external_url(hwnd, CODEX_CLI_SETUP_URL)
+        }
+    }
+}
+
+fn launch_visible_process(program: &str, args: &[&str]) -> bool {
+    let lower = program.to_ascii_lowercase();
+    let mut command = if lower.ends_with(".cmd") || lower.ends_with(".bat") {
+        let mut command = Command::new("cmd.exe");
+        command.arg("/d").arg("/k").arg(program);
+        command
+    } else if lower.ends_with(".ps1") {
+        let mut command = Command::new("powershell.exe");
+        command
+            .arg("-NoProfile")
+            .arg("-NoExit")
+            .arg("-ExecutionPolicy")
+            .arg("Bypass")
+            .arg("-File")
+            .arg(program);
+        command
+    } else {
+        Command::new(program)
+    };
+
+    command
+        .args(args)
+        .env_remove("CLAUDECODE")
+        .env_remove("CLAUDE_CODE_ENTRYPOINT")
+        .creation_flags(CREATE_NEW_CONSOLE_FLAG);
+
+    command.spawn().is_ok()
+}
+
+fn launch_visible_wsl_claude_auth(distro: &str) -> bool {
+    const SCRIPT: &str = r#"if command -v claude >/dev/null 2>&1; then
+    claude_cmd=(claude)
+elif [ -x "$HOME/.local/bin/claude" ]; then
+    claude_cmd=("$HOME/.local/bin/claude")
+else
+    echo "Claude Code CLI not found in this WSL distribution."
+    exit 127
+fi
+
+# Claude Code currently has a Windows/WSL regression where `auth login`
+# can print the OAuth URL without opening the Windows default browser.
+# Keep Claude CLI as the OAuth owner, but bridge its generated URL to
+# Windows. If Claude begins honoring BROWSER in a future release, /bin/true
+# suppresses a duplicate native browser launch while this bridge remains.
+export BROWSER=/bin/true
+opened=0
+while IFS= read -r line; do
+    printf '%s\n' "$line"
+    if [ "$opened" -eq 0 ]; then
+        clean=${line//$'\033'/ }
+        url=$(printf '%s\n' "$clean" | sed -nE 's#.*(https://(claude\.com|claude\.ai)/[^[:space:]]*).*#\1#p')
+        if [ -n "$url" ] && command -v explorer.exe >/dev/null 2>&1; then
+            explorer.exe "$url" >/dev/null 2>&1 &
+            opened=1
+        fi
+    fi
+done < <("${claude_cmd[@]}" auth login 2>&1)"#;
+
+    Command::new("wsl.exe")
+        .arg("-d")
+        .arg(distro)
+        .arg("--")
+        .arg("bash")
+        .arg("-lic")
+        .arg(SCRIPT)
+        .env_remove("CLAUDECODE")
+        .env_remove("CLAUDE_CODE_ENTRYPOINT")
+        .creation_flags(CREATE_NEW_CONSOLE_FLAG)
+        .spawn()
+        .is_ok()
+}
+
+fn open_claude_code_setup(hwnd: HWND) -> bool {
+    open_external_url(hwnd, CLAUDE_CODE_SETUP_URL)
+}
+
+fn open_external_url(hwnd: HWND, url: &str) -> bool {
+    unsafe {
+        let operation = native_interop::wide_str("open");
+        let url = native_interop::wide_str(url);
+        let result = ShellExecuteW(
+            hwnd,
+            PCWSTR::from_raw(operation.as_ptr()),
+            PCWSTR::from_raw(url.as_ptr()),
+            PCWSTR::null(),
+            PCWSTR::null(),
+            SW_SHOWNORMAL,
+        );
+        result.0 as isize > 32
+    }
 }
 
 /// Launches `program args...` in a new, visible `cmd.exe` console via
