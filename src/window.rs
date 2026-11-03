@@ -208,6 +208,31 @@ fn launch_visible_auth_command(hwnd: HWND, program: &str, args: &[&str]) -> bool
         command_line.push(' ');
         command_line.push_str(arg);
     }
+    // Use the first-party login flow normally.  If it fails, allow an
+    // explicit, opt-in recovery using a known locally installed older binary.
+    // The native installer's cached binary has no .exe suffix, so Windows
+    // needs a temporary .exe copy.  This app never handles OAuth credentials.
+    if program == "claude" && args == ["auth", "login"] {
+        command_line.push_str(" & if errorlevel 1 (");
+        command_line.push_str("echo. & echo Claude Code login failed.");
+        command_line
+            .push_str(" & echo An older installed Claude Code 2.1.308 can be tried if present.");
+        command_line
+            .push_str(" & choice /c YN /n /m \"Try installed Claude Code 2.1.308? [Y/N] \"");
+        command_line.push_str(" & if errorlevel 2 (echo Recovery cancelled.) else (");
+        command_line.push_str("powershell.exe -NoProfile -ExecutionPolicy Bypass -Command ");
+        command_line.push_str(
+            "\"$source=Join-Path $env:USERPROFILE '.local\\share\\claude\\versions\\2.1.308'; ",
+        );
+        command_line.push_str("if (!(Test-Path -LiteralPath $source -PathType Leaf)) { Write-Host 'Claude Code 2.1.308 is not installed.'; exit 1 }; ");
+        command_line.push_str("$exe=Join-Path $env:TEMP 'claude-auth-recovery-2.1.308.exe'; ");
+        command_line.push_str(
+            "Copy-Item -LiteralPath $source -Destination $exe -Force -ErrorAction Stop; ",
+        );
+        command_line.push_str("& $exe auth login\"");
+        command_line.push_str(" )");
+        command_line.push_str(" )");
+    }
     unsafe {
         let operation = native_interop::wide_str("open");
         let target = native_interop::wide_str("cmd.exe");
