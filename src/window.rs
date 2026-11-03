@@ -115,7 +115,10 @@ impl AuthAction {
         // that can only report "command not found". Claude is deliberately
         // excluded: it may be installed only inside WSL, which requires a
         // separate environment-aware recovery path.
-        if self == Self::CodexLogin && !windows_cli_on_path("codex") {
+        if self == Self::CodexLogin
+            && codex_recovery_destination(windows_cli_on_path("codex"))
+                == CodexRecoveryDestination::OfficialSetup
+        {
             diagnose::log("Codex CLI was not found on Windows PATH; opening official setup");
             if !open_external_auth_setup(hwnd, CODEX_CLI_SETUP_URL) {
                 diagnose::log("unable to open official Codex CLI setup");
@@ -125,6 +128,21 @@ impl AuthAction {
         if !launch_visible_auth_command(hwnd, program, args) {
             diagnose::log(format!("unable to launch auth command for {program}"));
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CodexRecoveryDestination {
+    OfficialCli,
+    OfficialSetup,
+}
+
+// Pure routing decision: the CLI is only attempted when Windows can resolve it.
+fn codex_recovery_destination(cli_available: bool) -> CodexRecoveryDestination {
+    if cli_available {
+        CodexRecoveryDestination::OfficialCli
+    } else {
+        CodexRecoveryDestination::OfficialSetup
     }
 }
 
@@ -9951,6 +9969,18 @@ mod tests {
     // ── AUTH-RECOVERY-CTA-IMPLEMENT-01: only a high-confidence auth state,
     // for a provider with a safe official CLI login entry point, is ever
     // CTA-eligible. ──────────────────────────────────────────────────────
+
+    #[test]
+    fn codex_recovery_routes_to_setup_only_when_windows_cli_is_missing() {
+        assert_eq!(
+            codex_recovery_destination(false),
+            CodexRecoveryDestination::OfficialSetup
+        );
+        assert_eq!(
+            codex_recovery_destination(true),
+            CodexRecoveryDestination::OfficialCli
+        );
+    }
 
     #[test]
     fn claude_and_codex_auth_states_are_cta_eligible() {
