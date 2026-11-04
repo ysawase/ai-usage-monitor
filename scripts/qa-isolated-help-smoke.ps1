@@ -50,6 +50,19 @@ public static class AumQaWin32 {
     public static extern bool GetWindowRect(IntPtr h,out RECT r);
     [DllImport("user32.dll",SetLastError=true)]
     public static extern bool SetWindowPos(IntPtr h,IntPtr after,int x,int y,int width,int height,uint flags);
+    [DllImport("user32.dll",CharSet=CharSet.Unicode,SetLastError=true)]
+    private static extern IntPtr FindWindowW(string name,string title);
+    [DllImport("user32.dll",CharSet=CharSet.Unicode,SetLastError=true)]
+    private static extern IntPtr FindWindowExW(IntPtr parent,IntPtr after,string name,string title);
+    public static IntPtr FindTrayNotify() {
+        IntPtr taskbar=FindWindowW("Shell_TrayWnd",null);
+        return taskbar==IntPtr.Zero ? IntPtr.Zero : FindWindowExW(taskbar,IntPtr.Zero,"TrayNotifyWnd",null);
+    }
+    public static uint OwnerPid(IntPtr h) {
+        uint pid;
+        GetWindowThreadProcessId(h,out pid);
+        return pid;
+    }
     [StructLayout(LayoutKind.Sequential)]
     public struct MONITORINFO {
         public int cbSize;
@@ -434,7 +447,88 @@ try {
         real_taskbar_moved=$false
         natural_winevent_tested=$false
     }
-    $evidence.status='pass_help_diagnostics_antigravity_reposition'
+    # Exercise actual OS EVENT_OBJECT_LOCATIONCHANGE in a disposable VM.
+    # Only Explorer's TrayNotifyWnd child is temporarily moved; the desktop
+    # taskbar configuration, global display settings and other apps are not.
+    $trayNotify=[AumQaWin32]::FindTrayNotify()
+    if($trayNotify -eq [IntPtr]::Zero) {
+        throw 'No Explorer TrayNotifyWnd; real WinEvent test unavailable'
+    }
+    $trayOwner=[AumQaWin32]::OwnerPid($trayNotify)
+    if($trayOwner -eq 0 -or $trayOwner -eq $proc.Id) {
+        throw 'Unexpected tray window ownership'
+    }
+    $trayOriginal=New-Object AumQaWin32+RECT
+    if(-not [AumQaWin32]::GetWindowRect($trayNotify,[ref]$trayOriginal)){
+        throw 'Explorer TrayNotifyWnd coordinates unavailable'
+    }
+    if($trayOriginal.Right -le $trayOriginal.Left -or $trayOriginal.Bottom -le $trayOriginal.Top){
+        throw 'Invalid Explorer tray region'
+    }
+    $trayShift=4
+    $trayRestored=$false
+    $winEventReanchored=$false
+    try {
+        # Control: without an event the deliberately displaced QA popup
+        # should remain displaced; avoid attributing an unrelated timer.
+        if(-not [AumQaWin32]::SetWindowPos(
+            $main,[IntPtr]::Zero,
+            $displayRestored.Left-$shiftX,$displayRestored.Top-$shiftY,
+            0,0,$swpFlags)){
+            throw 'Unable to displace QA popup before real tray WinEvent'
+        }
+        $null=WaitQaPosition ($displayRestored.Left-$shiftX) ($displayRestored.Top-$shiftY) 'pre-WinEvent displacement'
+        Start-Sleep -Milliseconds 950
+        $control=GetQaRect
+        if([Math]::Abs($control.Left-($displayRestored.Left-$shiftX)) -gt 3 -or
+           [Math]::Abs($control.Top-($displayRestored.Top-$shiftY)) -gt 3){
+            throw 'Unexpected popup movement before WinEvent: causality not established'
+        }
+        # A real, reversible Win32 change to the monitored Explorer HWND.
+        # No synthetic NotifyWinEvent or WM_APP_TRAY_REPOSITION is sent.
+        if(-not [AumQaWin32]::SetWindowPos(
+            $trayNotify,[IntPtr]::Zero,$trayOriginal.Left-$trayShift,$trayOriginal.Top,
+            0,0,$swpFlags)){
+            throw 'Unable to reposition tray child window by 4px'
+        }
+        $trayMoved=New-Object AumQaWin32+RECT
+        if(-not [AumQaWin32]::GetWindowRect($trayNotify,[ref]$trayMoved) -or
+           [Math]::Abs($trayMoved.Left-($trayOriginal.Left-$trayShift)) -gt 1){
+            throw 'TrayNotifyWnd did not move; WinEvent source invalid'
+        }
+        $observed=WaitQaAnchor 'OS-originated Explorer TrayNotifyWnd position change'
+        $winEventReanchored=$true
+    } finally {
+        # Guaranteed restoration even if event observation fails.
+        if(-not [AumQaWin32]::SetWindowPos(
+            $trayNotify,[IntPtr]::Zero,$trayOriginal.Left,$trayOriginal.Top,
+            0,0,$swpFlags)){
+            throw 'CRITICAL: unable to restore Explorer tray coordinates'
+        }
+        for($i=0;$i -lt 25;$i++){
+            $trayAfter=New-Object AumQaWin32+RECT
+            if([AumQaWin32]::GetWindowRect($trayNotify,[ref]$trayAfter) -and
+               $trayAfter.Left -eq $trayOriginal.Left -and
+               $trayAfter.Top -eq $trayOriginal.Top -and
+               $trayAfter.Right -eq $trayOriginal.Right -and
+               $trayAfter.Bottom -eq $trayOriginal.Bottom){
+                $trayRestored=$true
+                break
+            }
+            Start-Sleep -Milliseconds 40
+        }
+        if(-not $trayRestored){
+            throw 'CRITICAL: Explorer tray original geometry was not restored'
+        }
+    }
+    if(-not $winEventReanchored){throw 'OS tray event did not cause QA popup re-anchor'}
+    $evidence.popup_position.natural_winevent_tested=$true
+    $evidence.popup_position.event_source='controlled real Explorer TrayNotifyWnd movement'
+    $evidence.popup_position.event_reanchor_status='pass'
+    $evidence.popup_position.explorer_tray_restored=$trayRestored
+    $evidence.popup_position.explorer_tray_shift_pixels=$trayShift
+    $evidence.popup_position.real_user_taskbar_drag_tested=$false
+    $evidence.status='pass_help_diagnostics_antigravity_reposition_winevent'
 } catch {
     $evidence.status='fail'
     $evidence.note=$_.Exception.Message
@@ -451,7 +545,7 @@ try {
         } catch {$evidence.process_exited=$false}
         $proc.Dispose()
     }
-    if($evidence.status -eq 'pass_help_diagnostics_antigravity_reposition' -and
+    if($evidence.status -eq 'pass_help_diagnostics_antigravity_reposition_winevent' -and
        (-not $evidence.process_exited -or -not $evidence.env_scrubbed -or -not $evidence.dialog_owner_verified)) {
         $evidence.status='fail'
         $evidence.note='Cleanup or isolation not verified.'
