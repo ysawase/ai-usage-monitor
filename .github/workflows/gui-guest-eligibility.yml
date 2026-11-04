@@ -1,0 +1,34 @@
+name: Windows guest GUI eligibility probe
+
+on:
+  push:
+    branches:
+      - qa/gui-guest-probe-20261104
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: windows-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check whether hosted VM permits isolated GUI smoke
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $cs = Get-CimInstance Win32_ComputerSystem
+          $model = [string]$cs.Model
+          $session = [Diagnostics.Process]::GetCurrentProcess().SessionId
+          $interactive = [Environment]::UserInteractive
+          $identity = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+          $vm = $model -match '(?i)virtual machine|vmware|virtualbox|kvm|qemu|parallels|bhyve|hvm domu|virtual platform'
+          $eligible = $vm -and $interactive -and $session -ne 0 -and $identity -ne 'NT AUTHORITY\SYSTEM'
+          Write-Output ('GUI_GUEST_VM_MODEL=' + $model)
+          Write-Output ('GUI_GUEST_SESSION_ID=' + $session)
+          Write-Output ('GUI_GUEST_USER_INTERACTIVE=' + $interactive)
+          Write-Output ('GUI_GUEST_VM_MODEL_ACCEPTED=' + $vm)
+          Write-Output ('GUI_GUEST_ELIGIBLE=' + $eligible)
+          if (-not $eligible) { Write-Output 'GUI_SMOKE_STATUS=SKIPPED_PRECONDITIONS' }
+          else { Write-Output 'GUI_SMOKE_STATUS=ELIGIBLE_NOT_EXECUTED' }
+          # This workflow never launches an app or injects UI input.
