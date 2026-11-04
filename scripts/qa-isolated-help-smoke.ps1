@@ -28,6 +28,7 @@ if (Test-Path -LiteralPath $EvidencePath) { throw 'Evidence file already exists.
 Add-Type -TypeDefinition @'
 using System;
 using System.Text;
+using System.Collections.Generic;
 using System.Runtime.InteropServices;
 public static class AumQaWin32 {
     [StructLayout(LayoutKind.Sequential)]
@@ -66,6 +67,25 @@ public static class AumQaWin32 {
         var sb=new StringBuilder(256);
         GetWindowTextW(h,sb,sb.Capacity);
         return sb.ToString();
+    }
+    [DllImport("user32.dll",SetLastError=true)]
+    private static extern bool EnumChildWindows(IntPtr parent,EnumProc callback,IntPtr arg);
+    [DllImport("user32.dll",CharSet=CharSet.Unicode,SetLastError=true)]
+    private static extern IntPtr SendMessageTimeoutW(IntPtr hwnd,uint msg,IntPtr w,StringBuilder text,uint flags,uint timeout,out IntPtr result);
+    public static string DialogText(IntPtr dialog) {
+        var parts=new List<string>();
+        EnumChildWindows(dialog,delegate(IntPtr child,IntPtr unused) {
+            var cls=new StringBuilder(128);
+            GetClassNameW(child,cls,cls.Capacity);
+            if(cls.ToString()=="Static") {
+                var sb=new StringBuilder(8192);
+                IntPtr result;
+                IntPtr ok=SendMessageTimeoutW(child,0x000D,(IntPtr)sb.Capacity,sb,2,500,out result);
+                if(ok!=IntPtr.Zero && sb.Length>0)parts.Add(sb.ToString());
+            }
+            return true;
+        },IntPtr.Zero);
+        return String.Join("\n",parts.ToArray());
     }
 }
 '@
@@ -112,6 +132,8 @@ try {
     $psi.EnvironmentVariables['USERPROFILE']=$profileDir
     $psi.EnvironmentVariables['HOME']=$profileDir
     $psi.EnvironmentVariables['CODEX_HOME']=Join-Path $profileDir '.codex'
+    $psi.EnvironmentVariables['GITHUB_ACTIONS']='true'
+    $psi.EnvironmentVariables['AUM_QA_DIAG']='isolated-fixture-v1'
     foreach($k in @('ANTHROPIC_API_KEY','OPENAI_API_KEY','GH_TOKEN','GITHUB_TOKEN','AI_GATEWAY_API_KEY','VERCEL_TOKEN')) {
         if($psi.EnvironmentVariables.ContainsKey($k)){throw 'Credential environment inherited.'}
     }
@@ -157,6 +179,56 @@ try {
     $evidence.dialog_title=$title
     $evidence.dialog_owner_verified=$true
     $evidence.status='pass_help_click_opens_dialog'
+    if(-not [AumQaWin32]::PostMessageW($dialog,0x0010,[IntPtr]::Zero,[IntPtr]::Zero)){throw 'Initial help dialog close rejected.'}
+    for($i=0;$i -lt 50;$i++) {
+        if([AumQaWin32]::Find($proc.Id,'#32770') -eq [IntPtr]::Zero){break}
+        Start-Sleep -Milliseconds 100
+    }
+    if([AumQaWin32]::Find($proc.Id,'#32770') -ne [IntPtr]::Zero){throw 'Initial help dialog did not close.'}
+    $dialog=[IntPtr]::Zero
+    $cases=@(
+        @{id=1; label='visible_session_failure'; mustInclude=@('Claude Code (session):','Codex (weekly):'); mustExclude=@('Claude Code (weekly):')},
+        @{id=2; label='weekly_failure'; mustInclude=@('Claude Code (weekly):','Codex (weekly):'); mustExclude=@('Claude Code (session):')},
+        @{id=3; label='disabled_codex_excluded'; mustInclude=@('Claude Code (weekly):'); mustExclude=@('Codex (','GitHub Copilot','Vercel AI Gateway')},
+        @{id=4; label='hidden_session_failure'; mustInclude=@('Claude Code (weekly):'); mustExclude=@('Claude Code (session):')},
+        @{id=5; label='both_fail_weekly_priority'; mustInclude=@('Claude Code (weekly):'); mustExclude=@('Claude Code (session):')}
+    )
+    $evidence.fixture_cases=@()
+    foreach($fixture in $cases) {
+        if(-not [AumQaWin32]::PostMessageW($main,0x805A,[IntPtr]([int]$fixture['id']),[IntPtr]::Zero)) {
+            throw ('Fixture message rejected: '+$fixture['label'])
+        }
+        $dialog=[IntPtr]::Zero
+        for($i=0;$i -lt 100;$i++) {
+            if($proc.HasExited){throw ('Process exited during '+$fixture['label'])}
+            $dialog=[AumQaWin32]::Find($proc.Id,'#32770')
+            if($dialog -ne [IntPtr]::Zero){break}
+            Start-Sleep -Milliseconds 100
+        }
+        if($dialog -eq [IntPtr]::Zero){throw ('Diagnosis dialog not observed: '+$fixture['label'])}
+        $title=[AumQaWin32]::Title($dialog)
+        if($title -ne 'AI provider connection diagnosis'){throw ('Unexpected diagnosis title: '+$title)}
+        if([AumQaWin32]::GetWindow($dialog,4) -ne $main){throw ('Wrong dialog owner: '+$fixture['label'])}
+        $body=[AumQaWin32]::DialogText($dialog)
+        if(-not $body.Contains('Latest polling states.')){throw ('No diagnosis body: '+$fixture['label'])}
+        foreach($needle in $fixture['mustInclude']){
+            if(-not $body.Contains($needle)){throw ('Expected phrase missing: '+$fixture['label']+' '+$needle)}
+        }
+        foreach($needle in $fixture['mustExclude']){
+            if($body.Contains($needle)){throw ('Unexpected phrase: '+$fixture['label']+' '+$needle)}
+        }
+        $evidence.fixture_cases+=@{ id=$fixture['id']; label=$fixture['label']; status='pass'; title=$title; owner_verified=$true }
+        if(-not [AumQaWin32]::PostMessageW($dialog,0x0010,[IntPtr]::Zero,[IntPtr]::Zero)) {
+            throw ('Diagnosis close rejected: '+$fixture['label'])
+        }
+        for($i=0;$i -lt 50;$i++) {
+            if([AumQaWin32]::Find($proc.Id,'#32770') -eq [IntPtr]::Zero){break}
+            Start-Sleep -Milliseconds 100
+        }
+        if([AumQaWin32]::Find($proc.Id,'#32770') -ne [IntPtr]::Zero){throw ('Diagnosis did not close: '+$fixture['label'])}
+        $dialog=[IntPtr]::Zero
+    }
+    $evidence.status='pass_help_and_diagnostic_fixtures'
 } catch {
     $evidence.status='fail'
     $evidence.note=$_.Exception.Message
@@ -173,7 +245,7 @@ try {
         } catch {$evidence.process_exited=$false}
         $proc.Dispose()
     }
-    if($evidence.status -eq 'pass_help_click_opens_dialog' -and
+    if($evidence.status -eq 'pass_help_and_diagnostic_fixtures' -and
        (-not $evidence.process_exited -or -not $evidence.env_scrubbed -or -not $evidence.dialog_owner_verified)) {
         $evidence.status='fail'
         $evidence.note='Cleanup or isolation not verified.'
