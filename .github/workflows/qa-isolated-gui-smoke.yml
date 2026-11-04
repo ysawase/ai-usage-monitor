@@ -65,7 +65,7 @@ jobs:
       - name: Build QA EXE
         if: steps.preflight.outputs.eligible == 'true'
         shell: pwsh
-        run: cargo build --locked --no-default-features --release
+        run: cargo build --locked --no-default-features --features antigravity --release
       - name: Run synthetic help and diagnostic dialogs with clean process environment
         if: steps.preflight.outputs.eligible == 'true'
         shell: pwsh
@@ -76,7 +76,7 @@ jobs:
           & '.\scripts\qa-isolated-help-smoke.ps1' -ExePath $exe -ExpectedSha256 $sha -EvidencePath (Join-Path $env:RUNNER_TEMP 'aum-gui-smoke.json') -RunInIsolatedGuest
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $json=Get-Content (Join-Path $env:RUNNER_TEMP 'aum-gui-smoke.json') -Raw | ConvertFrom-Json
-          if ($json.status -ne 'pass_help_and_diagnostic_fixtures' -or -not $json.process_exited -or -not $json.dialog_owner_verified -or -not $json.env_scrubbed -or @($json.fixture_cases).Count -ne 5 -or @($json.fixture_cases | Where-Object { $_.status -ne 'pass' }).Count -gt 0) { throw 'GUI evidence did not satisfy acceptance checks.' }
+          if ($json.status -ne 'pass_help_diagnostics_antigravity' -or -not $json.process_exited -or -not $json.dialog_owner_verified -or -not $json.env_scrubbed -or @($json.fixture_cases).Count -ne 5 -or @($json.fixture_cases | Where-Object { $_.status -ne 'pass' }).Count -gt 0 -or $json.antigravity.setup_dialog -ne 'pass' -or $json.antigravity.connection_dialog -ne 'pass' -or -not $json.antigravity.external_guide_declined) { throw 'GUI evidence did not satisfy acceptance checks.' }
       - name: Upload preflight and scoped GUI evidence
         if: always()
         uses: actions/upload-artifact@v4

@@ -228,7 +228,88 @@ try {
         if([AumQaWin32]::Find($proc.Id,'#32770') -ne [IntPtr]::Zero){throw ('Diagnosis did not close: '+$fixture['label'])}
         $dialog=[IntPtr]::Zero
     }
-    $evidence.status='pass_help_and_diagnostic_fixtures'
+    # This is the genuine Antigravity menu path in the normal product code.
+    # Only its own disposable-VM process receives WM_COMMAND; do not install
+    # any CLI, open a browser, or use real credentials.
+    $ag=[ordered]@{
+        setup_dialog='not_run'
+        connection_dialog='not_run'
+        external_guide_declined=$false
+    }
+    if(-not [AumQaWin32]::PostMessageW($main,0x0111,[IntPtr]104,[IntPtr]::Zero)){
+        throw 'Antigravity setup WM_COMMAND rejected'
+    }
+    $dialog=[IntPtr]::Zero
+    for($i=0;$i -lt 100;$i++){
+        if($proc.HasExited){throw 'QA process exited during Antigravity setup'}
+        $dialog=[AumQaWin32]::Find($proc.Id,'#32770')
+        if($dialog -ne [IntPtr]::Zero){break}
+        Start-Sleep -Milliseconds 100
+    }
+    if($dialog -eq [IntPtr]::Zero){throw 'Antigravity setup dialog missing'}
+    if([AumQaWin32]::GetWindow($dialog,4) -ne $main){throw 'Antigravity setup dialog owner mismatch'}
+    $agTitle=[AumQaWin32]::Title($dialog)
+    $agBody=[AumQaWin32]::DialogText($dialog)
+    if($agTitle -ne 'Antigravity Setup' -or
+       -not $agBody.Contains('/statusline aum-quota.exe antigravity-statusline-bridge') -or
+       -not $agBody.Contains('/statusline delete')){
+        throw ('Antigravity setup title or safe commands not found. Title='+$agTitle)
+    }
+    $ag.setup_dialog='pass'
+    if(-not [AumQaWin32]::PostMessageW($dialog,0x0010,[IntPtr]::Zero,[IntPtr]::Zero)){
+        throw 'Antigravity setup dialog close rejected'
+    }
+    for($i=0;$i -lt 100;$i++){
+        $dialog=[AumQaWin32]::Find($proc.Id,'#32770')
+        if($dialog -ne [IntPtr]::Zero -and [AumQaWin32]::DialogText($dialog).Contains('Open the official Antigravity CLI installation guide')){break}
+        Start-Sleep -Milliseconds 100
+    }
+    if($dialog -eq [IntPtr]::Zero -or
+       -not [AumQaWin32]::DialogText($dialog).Contains('Open the official Antigravity CLI installation guide')){
+        throw 'Expected isolated-VM Antigravity guide confirmation missing'
+    }
+    # IDNO=7: specifically reject launching a browser or installing CLI.
+    if(-not [AumQaWin32]::PostMessageW($dialog,0x0111,[IntPtr]7,[IntPtr]::Zero)){
+        throw 'Failed to decline optional external documentation'
+    }
+    for($i=0;$i -lt 50;$i++){
+        if([AumQaWin32]::Find($proc.Id,'#32770') -eq [IntPtr]::Zero){break}
+        Start-Sleep -Milliseconds 100
+    }
+    if([AumQaWin32]::Find($proc.Id,'#32770') -ne [IntPtr]::Zero){
+        throw 'Antigravity guide confirmation failed to close'
+    }
+    $ag.external_guide_declined=$true
+    $dialog=[IntPtr]::Zero
+    if(-not [AumQaWin32]::PostMessageW($main,0x0111,[IntPtr]105,[IntPtr]::Zero)){
+        throw 'Antigravity connection check WM_COMMAND rejected'
+    }
+    for($i=0;$i -lt 100;$i++){
+        if($proc.HasExited){throw 'QA process exited during Antigravity connection check'}
+        $dialog=[AumQaWin32]::Find($proc.Id,'#32770')
+        if($dialog -ne [IntPtr]::Zero){break}
+        Start-Sleep -Milliseconds 100
+    }
+    if($dialog -eq [IntPtr]::Zero){throw 'Antigravity connection dialog missing'}
+    if([AumQaWin32]::GetWindow($dialog,4) -ne $main){throw 'Antigravity connection dialog owner mismatch'}
+    $connTitle=[AumQaWin32]::Title($dialog)
+    $connBody=[AumQaWin32]::DialogText($dialog)
+    if($connTitle -ne 'Antigravity connection check' -or
+       -not $connBody.Contains('No quota data has been received.')){
+        throw ('Antigravity connection result not consistent with isolated empty profile: '+$connTitle)
+    }
+    $ag.connection_dialog='pass'
+    if(-not [AumQaWin32]::PostMessageW($dialog,0x0010,[IntPtr]::Zero,[IntPtr]::Zero)){
+        throw 'Antigravity connection dialog close rejected'
+    }
+    for($i=0;$i -lt 50;$i++){
+        if([AumQaWin32]::Find($proc.Id,'#32770') -eq [IntPtr]::Zero){break}
+        Start-Sleep -Milliseconds 100
+    }
+    if([AumQaWin32]::Find($proc.Id,'#32770') -ne [IntPtr]::Zero){throw 'Antigravity connection dialog failed to close'}
+    $dialog=[IntPtr]::Zero
+    $evidence.antigravity=$ag
+    $evidence.status='pass_help_diagnostics_antigravity'
 } catch {
     $evidence.status='fail'
     $evidence.note=$_.Exception.Message
@@ -245,7 +326,7 @@ try {
         } catch {$evidence.process_exited=$false}
         $proc.Dispose()
     }
-    if($evidence.status -eq 'pass_help_and_diagnostic_fixtures' -and
+    if($evidence.status -eq 'pass_help_diagnostics_antigravity' -and
        (-not $evidence.process_exited -or -not $evidence.env_scrubbed -or -not $evidence.dialog_owner_verified)) {
         $evidence.status='fail'
         $evidence.note='Cleanup or isolation not verified.'
