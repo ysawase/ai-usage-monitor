@@ -47,6 +47,29 @@ public static class AumQaWin32 {
     [DllImport("user32.dll",SetLastError=true)]
     public static extern bool GetClientRect(IntPtr h,out RECT r);
     [DllImport("user32.dll",SetLastError=true)]
+    public static extern bool GetWindowRect(IntPtr h,out RECT r);
+    [DllImport("user32.dll",SetLastError=true)]
+    public static extern bool SetWindowPos(IntPtr h,IntPtr after,int x,int y,int width,int height,uint flags);
+    [StructLayout(LayoutKind.Sequential)]
+    public struct MONITORINFO {
+        public int cbSize;
+        public RECT rcMonitor;
+        public RECT rcWork;
+        public uint dwFlags;
+    }
+    [DllImport("user32.dll")]
+    private static extern IntPtr MonitorFromWindow(IntPtr h,uint flags);
+    [DllImport("user32.dll",CharSet=CharSet.Unicode,SetLastError=true)]
+    private static extern bool GetMonitorInfoW(IntPtr monitor,ref MONITORINFO info);
+    public static RECT WorkArea(IntPtr h) {
+        var monitor=MonitorFromWindow(h,2);
+        if(monitor==IntPtr.Zero)throw new InvalidOperationException("No monitor for own popup");
+        var mi=new MONITORINFO();
+        mi.cbSize=Marshal.SizeOf(typeof(MONITORINFO));
+        if(!GetMonitorInfoW(monitor,ref mi))throw new InvalidOperationException("GetMonitorInfo failed");
+        return mi.rcWork;
+    }
+    [DllImport("user32.dll",SetLastError=true)]
     public static extern uint GetDpiForWindow(IntPtr h);
     [DllImport("user32.dll",SetLastError=true)]
     public static extern bool PostMessageW(IntPtr h,uint m,IntPtr w,IntPtr l);
@@ -309,7 +332,82 @@ try {
     if([AumQaWin32]::Find($proc.Id,'#32770') -ne [IntPtr]::Zero){throw 'Antigravity connection dialog failed to close'}
     $dialog=[IntPtr]::Zero
     $evidence.antigravity=$ag
-    $evidence.status='pass_help_diagnostics_antigravity'
+    # The only moved window is this QA process's own popup. No taskbar,
+    # global display setting, other app, or actual user pointer is modified.
+    $baseRect=New-Object AumQaWin32+RECT
+    if(-not [AumQaWin32]::GetWindowRect($main,[ref]$baseRect)){
+        throw 'Unable to measure QA popup baseline'
+    }
+    $area=[AumQaWin32]::WorkArea($main)
+    $gapRight=[Math]::Abs($area.Right-$baseRect.Right)
+    $gapBottom=[Math]::Abs($area.Bottom-$baseRect.Bottom)
+    if($gapRight -gt 12 -or $gapBottom -gt 12){
+        throw ('Initial popup not anchored at work-area lower-right. gaps='+$gapRight+','+$gapBottom)
+    }
+    if(($baseRect.Left-$area.Left) -lt 112 -or ($baseRect.Top-$area.Top) -lt 95){
+        throw 'VM work area too small for safe own-popup displacement'
+    }
+    $swpFlags=[uint32]0x0015 # SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE
+    $shiftX=73
+    $shiftY=47
+    function GetQaRect {
+        $r=New-Object AumQaWin32+RECT
+        if(-not [AumQaWin32]::GetWindowRect($main,[ref]$r)){
+            throw 'GetWindowRect of own QA popup failed'
+        }
+        return $r
+    }
+    function WaitQaPosition([int]$x,[int]$y,[string]$label) {
+        for($i=0;$i -lt 80;$i++){
+            if($proc.HasExited){throw ('QA process exited: '+$label)}
+            $r=GetQaRect
+            if([Math]::Abs($r.Left-$x) -le 3 -and [Math]::Abs($r.Top-$y) -le 3){
+                return $r
+            }
+            Start-Sleep -Milliseconds 100
+        }
+        $r=GetQaRect
+        throw ('Popup position mismatch: '+$label+' expected='+$x+','+$y+' actual='+$r.Left+','+$r.Top)
+    }
+    if(-not [AumQaWin32]::SetWindowPos($main,[IntPtr]::Zero,$baseRect.Left-$shiftX,$baseRect.Top-$shiftY,0,0,$swpFlags)){
+        throw 'Failed to move QA popup within its own work area'
+    }
+    $null=WaitQaPosition ($baseRect.Left-$shiftX) ($baseRect.Top-$shiftY) 'displaced for tray event'
+    # 0x8005 is native_interop::WM_APP_TRAY_REPOSITION. Verify the actual
+    # app message handler returns popup to the lower-right work-area anchor.
+    if(-not [AumQaWin32]::PostMessageW($main,0x8005,[IntPtr]::Zero,[IntPtr]::Zero)){
+        throw 'App tray-reposition message rejected'
+    }
+    $restored=WaitQaPosition $baseRect.Left $baseRect.Top 'tray-reposition handler'
+    if(-not [AumQaWin32]::SetWindowPos($main,[IntPtr]::Zero,$baseRect.Left-$shiftX,$baseRect.Top-$shiftY,0,0,$swpFlags)){
+        throw 'Second QA popup displacement failed'
+    }
+    $null=WaitQaPosition ($baseRect.Left-$shiftX) ($baseRect.Top-$shiftY) 'displaced for display notification'
+    # WM_DISPLAYCHANGE=0x007E, delivered ONLY to this isolated popup. Does
+    # not change resolution or broadcast anything to the runner desktop.
+    if(-not [AumQaWin32]::PostMessageW($main,0x007E,[IntPtr]::Zero,[IntPtr]::Zero)){
+        throw 'Popup-specific display-change message rejected'
+    }
+    $displayRestored=WaitQaPosition $baseRect.Left $baseRect.Top 'display-change handler'
+    $evidence.popup_position=[ordered]@{
+        status='pass'
+        initial_anchor_work_area='lower_right'
+        tray_reposition_handler='pass'
+        displaychange_handler='pass'
+        work_area_right=$area.Right
+        work_area_bottom=$area.Bottom
+        initial_left=$baseRect.Left
+        initial_top=$baseRect.Top
+        displaced_pixels_x=$shiftX
+        displaced_pixels_y=$shiftY
+        restored_left=$restored.Left
+        restored_top=$restored.Top
+        display_restored_left=$displayRestored.Left
+        display_restored_top=$displayRestored.Top
+        real_taskbar_moved=$false
+        natural_winevent_tested=$false
+    }
+    $evidence.status='pass_help_diagnostics_antigravity_reposition'
 } catch {
     $evidence.status='fail'
     $evidence.note=$_.Exception.Message
@@ -326,7 +424,7 @@ try {
         } catch {$evidence.process_exited=$false}
         $proc.Dispose()
     }
-    if($evidence.status -eq 'pass_help_diagnostics_antigravity' -and
+    if($evidence.status -eq 'pass_help_diagnostics_antigravity_reposition' -and
        (-not $evidence.process_exited -or -not $evidence.env_scrubbed -or -not $evidence.dialog_owner_verified)) {
         $evidence.status='fail'
         $evidence.note='Cleanup or isolation not verified.'
