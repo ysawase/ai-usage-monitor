@@ -378,17 +378,39 @@ try {
     if(-not [AumQaWin32]::PostMessageW($main,0x8005,[IntPtr]::Zero,[IntPtr]::Zero)){
         throw 'App tray-reposition message rejected'
     }
-    $restored=WaitQaPosition $baseRect.Left $baseRect.Top 'tray-reposition handler'
-    if(-not [AumQaWin32]::SetWindowPos($main,[IntPtr]::Zero,$baseRect.Left-$shiftX,$baseRect.Top-$shiftY,0,0,$swpFlags)){
+    # The QA fixtures may have changed the provider count and row height.
+    # position_at_taskbar() intentionally resolves the CURRENT widget size.
+    # Reusing the initial top-left coordinate is invalid whenever width or
+    # height changes; validate the work-area anchor instead.
+    function WaitQaAnchor([string]$label) {
+        for($i=0;$i -lt 80;$i++) {
+            if($proc.HasExited){throw ('QA process exited: '+$label)}
+            $r=GetQaRect
+            if([Math]::Abs($r.Right-$area.Right) -le 12 -and
+               [Math]::Abs($r.Bottom-$area.Bottom) -le 12) {
+                return $r
+            }
+            Start-Sleep -Milliseconds 100
+        }
+        $r=GetQaRect
+        throw ('Popup not anchored: '+$label+' expectedRightBottom='+$area.Right+','+$area.Bottom+
+            ' observedRect='+$r.Left+','+$r.Top+','+$r.Right+','+$r.Bottom)
+    }
+    $restored=WaitQaAnchor 'tray-reposition handler'
+    if(($restored.Left-$area.Left) -lt ($shiftX+5) -or
+       ($restored.Top-$area.Top) -lt ($shiftY+5)){
+        throw 'QA popup too close to upper-left for second displacement'
+    }
+    if(-not [AumQaWin32]::SetWindowPos($main,[IntPtr]::Zero,$restored.Left-$shiftX,$restored.Top-$shiftY,0,0,$swpFlags)){
         throw 'Second QA popup displacement failed'
     }
-    $null=WaitQaPosition ($baseRect.Left-$shiftX) ($baseRect.Top-$shiftY) 'displaced for display notification'
+    $null=WaitQaPosition ($restored.Left-$shiftX) ($restored.Top-$shiftY) 'displaced for display notification'
     # WM_DISPLAYCHANGE=0x007E, delivered ONLY to this isolated popup. Does
     # not change resolution or broadcast anything to the runner desktop.
     if(-not [AumQaWin32]::PostMessageW($main,0x007E,[IntPtr]::Zero,[IntPtr]::Zero)){
         throw 'Popup-specific display-change message rejected'
     }
-    $displayRestored=WaitQaPosition $baseRect.Left $baseRect.Top 'display-change handler'
+    $displayRestored=WaitQaAnchor 'display-change handler'
     $evidence.popup_position=[ordered]@{
         status='pass'
         initial_anchor_work_area='lower_right'
@@ -402,6 +424,11 @@ try {
         displaced_pixels_y=$shiftY
         restored_left=$restored.Left
         restored_top=$restored.Top
+        initial_width=$baseRect.Right-$baseRect.Left
+        initial_height=$baseRect.Bottom-$baseRect.Top
+        restored_width=$restored.Right-$restored.Left
+        restored_height=$restored.Bottom-$restored.Top
+        initial_position_changed_with_geometry=(($restored.Left -ne $baseRect.Left) -or ($restored.Top -ne $baseRect.Top))
         display_restored_left=$displayRestored.Left
         display_restored_top=$displayRestored.Top
         real_taskbar_moved=$false
