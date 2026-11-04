@@ -1,0 +1,66 @@
+name: Isolated Windows GUI smoke QA
+
+on:
+  push:
+    branches:
+      - qa/isolated-gui-smoke-20261104
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout QA source without persisting credentials
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Preflight disposable interactive Windows VM
+        id: preflight
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $cs = Get-CimInstance Win32_ComputerSystem
+          $model = [string]$cs.Model
+          $sid = [Diagnostics.Process]::GetCurrentProcess().SessionId
+          $interactive = [Environment]::UserInteractive
+          $identity = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+          $vm = $model -match '(?i)virtual machine|vmware|virtualbox|kvm|qemu|parallels|virtual platform'
+          $eligible = $vm -and $interactive -and $sid -ne 0 -and $identity -ne 'NT AUTHORITY\SYSTEM'
+          $obj = [ordered]@{ source_sha = $env:GITHUB_SHA; model = $model; session = $sid; interactive = $interactive; vm = $vm; eligible = $eligible; status = 'probe_only' }
+          $obj | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $env:RUNNER_TEMP 'aum-gui-preflight.json') -Encoding UTF8
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value ('eligible=' + $eligible.ToString().ToLowerInvariant()) -Encoding ASCII
+          Write-Output ('GUI_PREFLIGHT_ELIGIBLE=' + $eligible)
+      - name: Install Rust toolchain
+        if: steps.preflight.outputs.eligible == 'true'
+        shell: pwsh
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - name: Build QA EXE
+        if: steps.preflight.outputs.eligible == 'true'
+        shell: pwsh
+        run: cargo build --locked --no-default-features --release
+      - name: Run synthetic help-button GUI smoke with clean process environment
+        if: steps.preflight.outputs.eligible == 'true'
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe=(Resolve-Path '.\target\release\claude-code-usage-monitor.exe').Path
+          $sha=(Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash
+          & '.\scripts\qa-isolated-help-smoke.ps1' -ExePath $exe -ExpectedSha256 $sha -EvidencePath (Join-Path $env:RUNNER_TEMP 'aum-gui-smoke.json') -RunInIsolatedGuest
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $json=Get-Content (Join-Path $env:RUNNER_TEMP 'aum-gui-smoke.json') -Raw | ConvertFrom-Json
+          if ($json.status -ne 'pass_help_click_opens_dialog' -or -not $json.process_exited -or -not $json.dialog_owner_verified -or -not $json.env_scrubbed) { throw 'GUI evidence did not satisfy acceptance checks.' }
+      - name: Upload preflight and scoped GUI evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: aum-isolated-gui-smoke-evidence
+          path: |
+            ${{ runner.temp }}/aum-gui-preflight.json
+            ${{ runner.temp }}/aum-gui-smoke.json
+          if-no-files-found: warn
+          retention-days: 7
