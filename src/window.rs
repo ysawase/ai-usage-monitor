@@ -3581,18 +3581,32 @@ fn session_row_currently_visible(s: &AppState) -> bool {
 
 /// Prefer an actionable weekly failure; otherwise show a visible session
 /// failure instead of incorrectly claiming that this provider is healthy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DiagnosisWindow {
+    Session,
+    Weekly,
+}
+
+fn diagnosis_window_state_with_source(
+    weekly: CellState,
+    session: CellState,
+    session_visible: bool,
+) -> (CellState, DiagnosisWindow) {
+    if is_connection_issue_state(weekly) {
+        (weekly, DiagnosisWindow::Weekly)
+    } else if session_visible && is_connection_issue_state(session) {
+        (session, DiagnosisWindow::Session)
+    } else {
+        (weekly, DiagnosisWindow::Weekly)
+    }
+}
+
 fn diagnosis_window_state(
     weekly: CellState,
     session: CellState,
     session_visible: bool,
 ) -> CellState {
-    if is_connection_issue_state(weekly) {
-        weekly
-    } else if session_visible && is_connection_issue_state(session) {
-        session
-    } else {
-        weekly
-    }
+    diagnosis_window_state_with_source(weekly, session, session_visible).0
 }
 
 fn widget_needs_connection_attention(s: &AppState) -> bool {
@@ -3620,14 +3634,17 @@ fn connection_attention_now() -> bool {
         .unwrap_or(false)
 }
 
-fn build_provider_diagnosis(ja: bool, rows: &[(QuotaFamilyId, CellState)]) -> String {
+fn build_provider_diagnosis_with_sources(
+    ja: bool,
+    rows: &[(QuotaFamilyId, CellState, Option<DiagnosisWindow>)],
+) -> String {
     let mut body = if ja {
         "各サービスの直近の取得状態です。原因が確認できない場合は推測していません。\n"
     } else {
         "Latest polling states. Unconfirmed causes are not treated as facts.\n"
     }
     .to_string();
-    for &(family, state) in rows {
+    for &(family, state, window) in rows {
         let label = match family {
             QuotaFamilyId::Claude => "Claude Code",
             QuotaFamilyId::Codex => "Codex",
@@ -3637,11 +3654,30 @@ fn build_provider_diagnosis(ja: bool, rows: &[(QuotaFamilyId, CellState)]) -> St
         };
         body.push_str("\n");
         body.push_str(label);
+        if let Some(window) = window {
+            let window_label = match (window, ja) {
+                (DiagnosisWindow::Session, true) => "セッション枠",
+                (DiagnosisWindow::Session, false) => "session",
+                (DiagnosisWindow::Weekly, true) => "週間枠",
+                (DiagnosisWindow::Weekly, false) => "weekly",
+            };
+            body.push_str(" (");
+            body.push_str(window_label);
+            body.push(')');
+        }
         body.push_str(": ");
         body.push_str(provider_recovery_guidance(family, state, ja));
         body.push_str("\n");
     }
     body
+}
+
+fn build_provider_diagnosis(ja: bool, rows: &[(QuotaFamilyId, CellState)]) -> String {
+    let rows_with_sources: Vec<_> = rows
+        .iter()
+        .map(|&(family, state)| (family, state, None))
+        .collect();
+    build_provider_diagnosis_with_sources(ja, &rows_with_sources)
 }
 
 fn show_single_provider_diagnosis(hwnd: HWND, family: QuotaFamilyId, state: CellState) {
@@ -3670,10 +3706,10 @@ fn show_single_provider_diagnosis(hwnd: HWND, family: QuotaFamilyId, state: Cell
 /// is also gated by those same toggles. A disabled provider's cached status
 /// must not appear as an actionable problem in the global diagnosis.
 fn enabled_provider_diagnosis_rows(
-    rows: &[(bool, QuotaFamilyId, CellState)],
-) -> Vec<(QuotaFamilyId, CellState)> {
+    rows: &[(bool, QuotaFamilyId, CellState, Option<DiagnosisWindow>)],
+) -> Vec<(QuotaFamilyId, CellState, Option<DiagnosisWindow>)> {
     rows.iter()
-        .filter_map(|&(enabled, family, state)| enabled.then_some((family, state)))
+        .filter_map(|&(enabled, family, state, window)| enabled.then_some((family, state, window)))
         .collect()
 }
 
@@ -3684,41 +3720,45 @@ fn show_provider_diagnosis(hwnd: HWND) {
             return;
         };
         let session_visible = session_row_currently_visible(s);
+        let claude =
+            diagnosis_window_state_with_source(s.weekly_state, s.session_state, session_visible);
+        let codex = diagnosis_window_state_with_source(
+            s.codex_weekly_state,
+            s.codex_session_state,
+            session_visible,
+        );
+        let antigravity = diagnosis_window_state_with_source(
+            s.antigravity_weekly_state,
+            s.antigravity_session_state,
+            session_visible,
+        );
         (
             s.language == LanguageId::Japanese,
             enabled_provider_diagnosis_rows(&[
                 (
                     s.show_claude_code,
                     QuotaFamilyId::Claude,
-                    diagnosis_window_state(s.weekly_state, s.session_state, session_visible),
+                    claude.0,
+                    Some(claude.1),
                 ),
-                (
-                    s.show_codex,
-                    QuotaFamilyId::Codex,
-                    diagnosis_window_state(
-                        s.codex_weekly_state,
-                        s.codex_session_state,
-                        session_visible,
-                    ),
-                ),
+                (s.show_codex, QuotaFamilyId::Codex, codex.0, Some(codex.1)),
                 (
                     s.show_antigravity,
                     QuotaFamilyId::Antigravity,
-                    diagnosis_window_state(
-                        s.antigravity_weekly_state,
-                        s.antigravity_session_state,
-                        session_visible,
-                    ),
+                    antigravity.0,
+                    Some(antigravity.1),
                 ),
                 (
                     s.show_github_copilot,
                     QuotaFamilyId::GithubCopilot,
                     s.github_copilot_state,
+                    None,
                 ),
                 (
                     s.show_vercel_ai_gateway,
                     QuotaFamilyId::VercelAiGateway,
                     s.vercel_ai_gateway_state,
+                    None,
                 ),
             ]),
         )
@@ -3728,7 +3768,11 @@ fn show_provider_diagnosis(hwnd: HWND) {
     } else {
         "AI provider connection diagnosis"
     };
-    show_info_message(hwnd, title, &build_provider_diagnosis(ja, &rows));
+    show_info_message(
+        hwnd,
+        title,
+        &build_provider_diagnosis_with_sources(ja, &rows),
+    );
 }
 
 fn show_display_guide(hwnd: HWND) {
@@ -11517,37 +11561,94 @@ mod tests {
                 false,
                 QuotaFamilyId::Claude,
                 CellState::AuthenticationExpired,
+                Some(DiagnosisWindow::Weekly),
             ),
-            (true, QuotaFamilyId::Codex, CellState::FetchFailed),
-            (false, QuotaFamilyId::Antigravity, CellState::FetchFailed),
-            (true, QuotaFamilyId::GithubCopilot, CellState::Ok),
+            (
+                true,
+                QuotaFamilyId::Codex,
+                CellState::FetchFailed,
+                Some(DiagnosisWindow::Session),
+            ),
+            (
+                false,
+                QuotaFamilyId::Antigravity,
+                CellState::FetchFailed,
+                Some(DiagnosisWindow::Weekly),
+            ),
+            (true, QuotaFamilyId::GithubCopilot, CellState::Ok, None),
             (
                 false,
                 QuotaFamilyId::VercelAiGateway,
                 CellState::CredentialsUnavailable,
+                None,
             ),
         ];
         assert_eq!(
             enabled_provider_diagnosis_rows(&rows),
             vec![
-                (QuotaFamilyId::Codex, CellState::FetchFailed),
-                (QuotaFamilyId::GithubCopilot, CellState::Ok),
+                (
+                    QuotaFamilyId::Codex,
+                    CellState::FetchFailed,
+                    Some(DiagnosisWindow::Session)
+                ),
+                (QuotaFamilyId::GithubCopilot, CellState::Ok, None),
             ]
         );
         assert!(enabled_provider_diagnosis_rows(&[(
             false,
             QuotaFamilyId::Claude,
-            CellState::FetchFailed
+            CellState::FetchFailed,
+            None
         )])
         .is_empty());
         assert_eq!(
             enabled_provider_diagnosis_rows(&[(
                 true,
                 QuotaFamilyId::Claude,
-                CellState::FetchFailed
+                CellState::FetchFailed,
+                Some(DiagnosisWindow::Weekly)
             )]),
-            vec![(QuotaFamilyId::Claude, CellState::FetchFailed)]
+            vec![(
+                QuotaFamilyId::Claude,
+                CellState::FetchFailed,
+                Some(DiagnosisWindow::Weekly)
+            )]
         );
+    }
+
+    #[test]
+    fn diagnostic_source_uses_visible_failing_window_not_a_healthy_weekly_window() {
+        let failure = CellState::FetchFailed;
+        let ok = CellState::Ok;
+        assert_eq!(
+            diagnosis_window_state_with_source(ok, failure, true),
+            (failure, DiagnosisWindow::Session)
+        );
+        assert_eq!(
+            diagnosis_window_state_with_source(ok, failure, false),
+            (ok, DiagnosisWindow::Weekly)
+        );
+        assert_eq!(
+            diagnosis_window_state_with_source(failure, ok, true),
+            (failure, DiagnosisWindow::Weekly)
+        );
+        let rows = [
+            (
+                QuotaFamilyId::Claude,
+                failure,
+                Some(DiagnosisWindow::Session),
+            ),
+            (QuotaFamilyId::Codex, failure, Some(DiagnosisWindow::Weekly)),
+            (QuotaFamilyId::GithubCopilot, ok, None),
+        ];
+        let ja = build_provider_diagnosis_with_sources(true, &rows);
+        assert!(ja.contains("Claude Code (セッション枠):"));
+        assert!(ja.contains("Codex (週間枠):"));
+        assert!(ja.contains("GitHub Copilot:"));
+        assert!(!ja.contains("GitHub Copilot ("));
+        let en = build_provider_diagnosis_with_sources(false, &rows);
+        assert!(en.contains("Claude Code (session):"));
+        assert!(en.contains("Codex (weekly):"));
     }
     #[test]
     fn connection_attention_only_for_enabled_provider_failures() {
