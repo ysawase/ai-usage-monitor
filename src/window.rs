@@ -3666,6 +3666,17 @@ fn show_single_provider_diagnosis(hwnd: HWND, family: QuotaFamilyId, state: Cell
     );
 }
 
+/// Show only providers enabled in the widget; the connection-attention icon
+/// is also gated by those same toggles. A disabled provider's cached status
+/// must not appear as an actionable problem in the global diagnosis.
+fn enabled_provider_diagnosis_rows(
+    rows: &[(bool, QuotaFamilyId, CellState)],
+) -> Vec<(QuotaFamilyId, CellState)> {
+    rows.iter()
+        .filter_map(|&(enabled, family, state)| enabled.then_some((family, state)))
+        .collect()
+}
+
 fn show_provider_diagnosis(hwnd: HWND) {
     let (ja, rows) = {
         let state = lock_state();
@@ -3675,12 +3686,14 @@ fn show_provider_diagnosis(hwnd: HWND) {
         let session_visible = session_row_currently_visible(s);
         (
             s.language == LanguageId::Japanese,
-            vec![
+            enabled_provider_diagnosis_rows(&[
                 (
+                    s.show_claude_code,
                     QuotaFamilyId::Claude,
                     diagnosis_window_state(s.weekly_state, s.session_state, session_visible),
                 ),
                 (
+                    s.show_codex,
                     QuotaFamilyId::Codex,
                     diagnosis_window_state(
                         s.codex_weekly_state,
@@ -3689,6 +3702,7 @@ fn show_provider_diagnosis(hwnd: HWND) {
                     ),
                 ),
                 (
+                    s.show_antigravity,
                     QuotaFamilyId::Antigravity,
                     diagnosis_window_state(
                         s.antigravity_weekly_state,
@@ -3696,9 +3710,17 @@ fn show_provider_diagnosis(hwnd: HWND) {
                         session_visible,
                     ),
                 ),
-                (QuotaFamilyId::GithubCopilot, s.github_copilot_state),
-                (QuotaFamilyId::VercelAiGateway, s.vercel_ai_gateway_state),
-            ],
+                (
+                    s.show_github_copilot,
+                    QuotaFamilyId::GithubCopilot,
+                    s.github_copilot_state,
+                ),
+                (
+                    s.show_vercel_ai_gateway,
+                    QuotaFamilyId::VercelAiGateway,
+                    s.vercel_ai_gateway_state,
+                ),
+            ]),
         )
     };
     let title = if ja {
@@ -11487,6 +11509,45 @@ mod tests {
             diagnosis_window_state(ok, bad, false)
         )]));
         assert!(!any_enabled_connection_issue(&[(false, bad)]));
+    }
+    #[test]
+    fn global_diagnosis_excludes_disabled_providers_without_reordering_enabled_ones() {
+        let rows = [
+            (
+                false,
+                QuotaFamilyId::Claude,
+                CellState::AuthenticationExpired,
+            ),
+            (true, QuotaFamilyId::Codex, CellState::FetchFailed),
+            (false, QuotaFamilyId::Antigravity, CellState::FetchFailed),
+            (true, QuotaFamilyId::GithubCopilot, CellState::Ok),
+            (
+                false,
+                QuotaFamilyId::VercelAiGateway,
+                CellState::CredentialsUnavailable,
+            ),
+        ];
+        assert_eq!(
+            enabled_provider_diagnosis_rows(&rows),
+            vec![
+                (QuotaFamilyId::Codex, CellState::FetchFailed),
+                (QuotaFamilyId::GithubCopilot, CellState::Ok),
+            ]
+        );
+        assert!(enabled_provider_diagnosis_rows(&[(
+            false,
+            QuotaFamilyId::Claude,
+            CellState::FetchFailed
+        )])
+        .is_empty());
+        assert_eq!(
+            enabled_provider_diagnosis_rows(&[(
+                true,
+                QuotaFamilyId::Claude,
+                CellState::FetchFailed
+            )]),
+            vec![(QuotaFamilyId::Claude, CellState::FetchFailed)]
+        );
     }
     #[test]
     fn connection_attention_only_for_enabled_provider_failures() {
