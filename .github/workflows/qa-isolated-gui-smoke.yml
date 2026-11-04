@@ -33,6 +33,21 @@ jobs:
           $obj | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $env:RUNNER_TEMP 'aum-gui-preflight.json') -Encoding UTF8
           Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value ('eligible=' + $eligible.ToString().ToLowerInvariant()) -Encoding ASCII
           Write-Output ('GUI_PREFLIGHT_ELIGIBLE=' + $eligible)
+      - name: Parse UTF-8 smoke script before build
+        if: steps.preflight.outputs.eligible == 'true'
+        shell: pwsh
+        run: |
+          $tokens = $null
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path '.\scripts\qa-isolated-help-smoke.ps1').Path,
+            [ref]$tokens, [ref]$errors
+          ) | Out-Null
+          if ($errors.Count -gt 0) {
+            $errors | ForEach-Object { Write-Error $_ }
+            exit 1
+          }
+          Write-Output 'UTF8_POWERSHELL_PARSE_PASS'
       - name: Install Rust toolchain
         if: steps.preflight.outputs.eligible == 'true'
         shell: pwsh
@@ -45,7 +60,7 @@ jobs:
         run: cargo build --locked --no-default-features --release
       - name: Run synthetic help-button GUI smoke with clean process environment
         if: steps.preflight.outputs.eligible == 'true'
-        shell: powershell
+        shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           $exe=(Resolve-Path '.\target\release\claude-code-usage-monitor.exe').Path
