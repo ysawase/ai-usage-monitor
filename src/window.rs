@@ -3566,11 +3566,47 @@ fn any_enabled_connection_issue(rows: &[(bool, CellState)]) -> bool {
         .any(|&(enabled, state)| enabled && is_connection_issue_state(state))
 }
 
+/// Match the actual popup layout: Hidden, WarningOnly without a warning,
+/// and Compact must not create a help warning for a non-visible session row.
+fn session_row_currently_visible(s: &AppState) -> bool {
+    popup_visible_rows(
+        s.popup_layout,
+        ProviderVisibility::from_state(s),
+        0,
+        SessionRowShows::from_state(s),
+        0,
+    )
+    .session_row
+}
+
+/// Prefer an actionable weekly failure; otherwise show a visible session
+/// failure instead of incorrectly claiming that this provider is healthy.
+fn diagnosis_window_state(
+    weekly: CellState,
+    session: CellState,
+    session_visible: bool,
+) -> CellState {
+    if is_connection_issue_state(weekly) {
+        weekly
+    } else if session_visible && is_connection_issue_state(session) {
+        session
+    } else {
+        weekly
+    }
+}
+
 fn widget_needs_connection_attention(s: &AppState) -> bool {
+    let session_visible = session_row_currently_visible(s);
     any_enabled_connection_issue(&[
         (s.show_claude_code, s.weekly_state),
         (s.show_codex, s.codex_weekly_state),
         (s.show_antigravity, s.antigravity_weekly_state),
+        (s.show_claude_code && session_visible, s.session_state),
+        (s.show_codex && session_visible, s.codex_session_state),
+        (
+            s.show_antigravity && session_visible,
+            s.antigravity_session_state,
+        ),
         (s.show_github_copilot, s.github_copilot_state),
         (s.show_vercel_ai_gateway, s.vercel_ai_gateway_state),
     ])
@@ -3636,12 +3672,30 @@ fn show_provider_diagnosis(hwnd: HWND) {
         let Some(s) = state.as_ref() else {
             return;
         };
+        let session_visible = session_row_currently_visible(s);
         (
             s.language == LanguageId::Japanese,
             vec![
-                (QuotaFamilyId::Claude, s.weekly_state),
-                (QuotaFamilyId::Codex, s.codex_weekly_state),
-                (QuotaFamilyId::Antigravity, s.antigravity_weekly_state),
+                (
+                    QuotaFamilyId::Claude,
+                    diagnosis_window_state(s.weekly_state, s.session_state, session_visible),
+                ),
+                (
+                    QuotaFamilyId::Codex,
+                    diagnosis_window_state(
+                        s.codex_weekly_state,
+                        s.codex_session_state,
+                        session_visible,
+                    ),
+                ),
+                (
+                    QuotaFamilyId::Antigravity,
+                    diagnosis_window_state(
+                        s.antigravity_weekly_state,
+                        s.antigravity_session_state,
+                        session_visible,
+                    ),
+                ),
                 (QuotaFamilyId::GithubCopilot, s.github_copilot_state),
                 (QuotaFamilyId::VercelAiGateway, s.vercel_ai_gateway_state),
             ],
@@ -11395,6 +11449,45 @@ mod tests {
         );
     }
 
+    #[test]
+    fn connection_diagnosis_considers_only_visible_session_failures() {
+        let bad = CellState::FetchFailed;
+        let ok = CellState::Ok;
+        assert_eq!(diagnosis_window_state(ok, bad, true), bad);
+        assert_eq!(diagnosis_window_state(ok, bad, false), ok);
+        assert_eq!(
+            diagnosis_window_state(CellState::AuthenticationProblem, bad, true),
+            CellState::AuthenticationProblem
+        );
+        assert_eq!(
+            diagnosis_window_state(ok, CellState::NotAvailable, true),
+            ok
+        );
+
+        let providers = ProviderVisibility {
+            show_claude_code: true,
+            show_codex: false,
+            show_antigravity: false,
+            show_github_copilot: false,
+            show_vercel_ai_gateway: false,
+        };
+        let shows = SessionRowShows {
+            claude_code: true,
+            codex: false,
+            antigravity: false,
+        };
+        assert!(popup_visible_rows(PopupLayout::Standard, providers, 0, shows, 0).session_row);
+        assert!(!popup_visible_rows(PopupLayout::Compact, providers, 0, shows, 0).session_row);
+        assert!(any_enabled_connection_issue(&[(
+            true,
+            diagnosis_window_state(ok, bad, true)
+        )]));
+        assert!(!any_enabled_connection_issue(&[(
+            true,
+            diagnosis_window_state(ok, bad, false)
+        )]));
+        assert!(!any_enabled_connection_issue(&[(false, bad)]));
+    }
     #[test]
     fn connection_attention_only_for_enabled_provider_failures() {
         for state in [
