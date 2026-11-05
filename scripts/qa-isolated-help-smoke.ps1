@@ -124,6 +124,92 @@ public static class AumQaWin32 {
         return String.Join("\n",parts.ToArray());
     }
 }
+
+public static class AumOwnWindowWinEventProbe {
+    private delegate void WinEventCallback(IntPtr hook, uint eventId, IntPtr hwnd, int idObject, int idChild, uint eventThread, uint eventTime);
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+    private struct MSG {
+        public IntPtr hwnd; public uint message; public UIntPtr wParam; public IntPtr lParam;
+        public uint time; public int pointX; public int pointY; public uint lPrivate;
+    }
+    [System.Runtime.InteropServices.DllImport("user32.dll",EntryPoint="CreateWindowExW",CharSet=System.Runtime.InteropServices.CharSet.Unicode,SetLastError=true)]
+    private static extern IntPtr CreateWindowEx(uint exStyle,string className,string title,uint style,int x,int y,int w,int h,IntPtr parent,IntPtr menu,IntPtr instance,IntPtr param);
+    [System.Runtime.InteropServices.DllImport("user32.dll",SetLastError=true)]
+    private static extern bool DestroyWindow(IntPtr hwnd);
+    [System.Runtime.InteropServices.DllImport("user32.dll",SetLastError=true)]
+    private static extern uint GetWindowThreadProcessId(IntPtr hwnd,out uint processId);
+    [System.Runtime.InteropServices.DllImport("user32.dll",SetLastError=true)]
+    private static extern IntPtr SetWinEventHook(uint min,uint max,IntPtr module,WinEventCallback callback,uint process,uint thread,uint flags);
+    [System.Runtime.InteropServices.DllImport("user32.dll",SetLastError=true)]
+    private static extern bool UnhookWinEvent(IntPtr hook);
+    [System.Runtime.InteropServices.DllImport("user32.dll",SetLastError=true)]
+    private static extern bool SetWindowPos(IntPtr hwnd,IntPtr insertAfter,int x,int y,int w,int h,uint flags);
+    [System.Runtime.InteropServices.DllImport("user32.dll",SetLastError=true)]
+    private static extern bool PostMessageW(IntPtr hwnd,uint message,IntPtr wParam,IntPtr lParam);
+    [System.Runtime.InteropServices.DllImport("user32.dll",SetLastError=true)]
+    private static extern bool PeekMessageW(out MSG msg,IntPtr hwnd,uint min,uint max,uint remove);
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    private static extern bool TranslateMessage(ref MSG msg);
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    private static extern IntPtr DispatchMessageW(ref MSG msg);
+    private static IntPtr source;
+    private static IntPtr receiver;
+    private static int armed;
+    private static int callbacks;
+    private static int delivered;
+    private static WinEventCallback callbackRoot;
+    private static void OnEvent(IntPtr hook,uint eventId,IntPtr hwnd,int idObject,int idChild,uint eventThread,uint eventTime) {
+        if(eventId != 0x800B || hwnd != source || idObject != 0 || idChild != 0 ||
+           System.Threading.Volatile.Read(ref armed) != 1) return;
+        System.Threading.Interlocked.Increment(ref callbacks);
+        if(PostMessageW(receiver,0x8005,IntPtr.Zero,IntPtr.Zero))
+            System.Threading.Interlocked.Exchange(ref delivered,1);
+    }
+    public static string Run(IntPtr productWindow) {
+        receiver=productWindow;
+        source=IntPtr.Zero;
+        armed=0; callbacks=0; delivered=0;
+        IntPtr hook=IntPtr.Zero;
+        try {
+            // Standard Windows STATIC window; owned by this temporary QA process.
+            // Never move Explorer's taskbar, other apps, or display settings.
+            source=CreateWindowEx(0,"STATIC","AUM isolated WinEvent source",0x90000000,80,80,140,40,
+                                  IntPtr.Zero,IntPtr.Zero,IntPtr.Zero,IntPtr.Zero);
+            if(source==IntPtr.Zero) throw new InvalidOperationException("Cannot create own WinEvent source");
+            uint pid;
+            uint threadId=GetWindowThreadProcessId(source,out pid);
+            if(threadId==0 || pid!=(uint)System.Diagnostics.Process.GetCurrentProcess().Id)
+                throw new InvalidOperationException("Own WinEvent source thread identity invalid");
+            callbackRoot=OnEvent;
+            hook=SetWinEventHook(0x800B,0x800B,IntPtr.Zero,callbackRoot,0,threadId,0);
+            if(hook==IntPtr.Zero) throw new InvalidOperationException("Own-window WinEvent hook could not register");
+            System.Threading.Thread.Sleep(250);
+            System.Threading.Volatile.Write(ref armed,1);
+            if(!SetWindowPos(source,IntPtr.Zero,93,91,0,0,0x0015))
+                throw new InvalidOperationException("Own-window SetWindowPos failed");
+            var deadline=System.Diagnostics.Stopwatch.StartNew();
+            while(deadline.ElapsedMilliseconds<5000 && System.Threading.Volatile.Read(ref delivered)==0) {
+                MSG message;
+                while(PeekMessageW(out message,IntPtr.Zero,0,0,1)) {
+                    TranslateMessage(ref message);
+                    DispatchMessageW(ref message);
+                }
+                System.Threading.Thread.Sleep(20);
+            }
+            if(System.Threading.Volatile.Read(ref callbacks)<1)
+                throw new InvalidOperationException("No OS WinEvent callback for own-window location change");
+            if(System.Threading.Volatile.Read(ref delivered)!=1)
+                throw new InvalidOperationException("Own-window WinEvent did not post reposition message");
+            return "pass";
+        } finally {
+            if(hook!=IntPtr.Zero) UnhookWinEvent(hook);
+            if(source!=IntPtr.Zero) DestroyWindow(source);
+            callbackRoot=null;
+            source=IntPtr.Zero;
+        }
+    }
+}
+
 '@
 $runId=[guid]::NewGuid().ToString('N')
 $sandbox=Join-Path $env:RUNNER_TEMP ("aum-gui-qa-"+$runId)
@@ -447,88 +533,35 @@ try {
         real_taskbar_moved=$false
         natural_winevent_tested=$false
     }
-    # Exercise actual OS EVENT_OBJECT_LOCATIONCHANGE in a disposable VM.
-    # Only Explorer's TrayNotifyWnd child is temporarily moved; the desktop
-    # taskbar configuration, global display settings and other apps are not.
-    $trayNotify=[AumQaWin32]::FindTrayNotify()
-    if($trayNotify -eq [IntPtr]::Zero) {
-        throw 'No Explorer TrayNotifyWnd; real WinEvent test unavailable'
+    # QA-only OS WinEvent dispatch probe: move ONLY a window owned by this
+    # isolated test process. The probe callback posts WM_APP_TRAY_REPOSITION
+    # to the actual product popup, without touching Explorer's tray geometry.
+    # This verifies the OS delivery + message-handler bridge, NOT the
+    # production hook's Explorer-thread filter or natural taskbar movement.
+    if(-not [AumQaWin32]::SetWindowPos(
+        $main,[IntPtr]::Zero,
+        $displayRestored.Left-$shiftX,$displayRestored.Top-$shiftY,
+        0,0,$swpFlags)){
+        throw 'Unable to displace QA popup before own-window WinEvent'
     }
-    $trayOwner=[AumQaWin32]::OwnerPid($trayNotify)
-    if($trayOwner -eq 0 -or $trayOwner -eq $proc.Id) {
-        throw 'Unexpected tray window ownership'
+    $null=WaitQaPosition ($displayRestored.Left-$shiftX) ($displayRestored.Top-$shiftY) 'before own-window event'
+    Start-Sleep -Milliseconds 950
+    $control=GetQaRect
+    if([Math]::Abs($control.Left-($displayRestored.Left-$shiftX)) -gt 3 -or
+       [Math]::Abs($control.Top-($displayRestored.Top-$shiftY)) -gt 3){
+        throw 'Unexpected popup movement before own-window event'
     }
-    $trayOriginal=New-Object AumQaWin32+RECT
-    if(-not [AumQaWin32]::GetWindowRect($trayNotify,[ref]$trayOriginal)){
-        throw 'Explorer TrayNotifyWnd coordinates unavailable'
+    if([AumOwnWindowWinEventProbe]::Run($main) -ne 'pass'){
+        throw 'Owned-window WinEvent probe unsuccessful'
     }
-    if($trayOriginal.Right -le $trayOriginal.Left -or $trayOriginal.Bottom -le $trayOriginal.Top){
-        throw 'Invalid Explorer tray region'
-    }
-    $trayShift=4
-    $trayRestored=$false
-    $winEventReanchored=$false
-    try {
-        # Control: without an event the deliberately displaced QA popup
-        # should remain displaced; avoid attributing an unrelated timer.
-        if(-not [AumQaWin32]::SetWindowPos(
-            $main,[IntPtr]::Zero,
-            $displayRestored.Left-$shiftX,$displayRestored.Top-$shiftY,
-            0,0,$swpFlags)){
-            throw 'Unable to displace QA popup before real tray WinEvent'
-        }
-        $null=WaitQaPosition ($displayRestored.Left-$shiftX) ($displayRestored.Top-$shiftY) 'pre-WinEvent displacement'
-        Start-Sleep -Milliseconds 950
-        $control=GetQaRect
-        if([Math]::Abs($control.Left-($displayRestored.Left-$shiftX)) -gt 3 -or
-           [Math]::Abs($control.Top-($displayRestored.Top-$shiftY)) -gt 3){
-            throw 'Unexpected popup movement before WinEvent: causality not established'
-        }
-        # A real, reversible Win32 change to the monitored Explorer HWND.
-        # No synthetic NotifyWinEvent or WM_APP_TRAY_REPOSITION is sent.
-        if(-not [AumQaWin32]::SetWindowPos(
-            $trayNotify,[IntPtr]::Zero,$trayOriginal.Left-$trayShift,$trayOriginal.Top,
-            0,0,$swpFlags)){
-            throw 'Unable to reposition tray child window by 4px'
-        }
-        $trayMoved=New-Object AumQaWin32+RECT
-        if(-not [AumQaWin32]::GetWindowRect($trayNotify,[ref]$trayMoved) -or
-           [Math]::Abs($trayMoved.Left-($trayOriginal.Left-$trayShift)) -gt 1){
-            throw 'TrayNotifyWnd did not move; WinEvent source invalid'
-        }
-        $observed=WaitQaAnchor 'OS-originated Explorer TrayNotifyWnd position change'
-        $winEventReanchored=$true
-    } finally {
-        # Guaranteed restoration even if event observation fails.
-        if(-not [AumQaWin32]::SetWindowPos(
-            $trayNotify,[IntPtr]::Zero,$trayOriginal.Left,$trayOriginal.Top,
-            0,0,$swpFlags)){
-            throw 'CRITICAL: unable to restore Explorer tray coordinates'
-        }
-        for($i=0;$i -lt 25;$i++){
-            $trayAfter=New-Object AumQaWin32+RECT
-            if([AumQaWin32]::GetWindowRect($trayNotify,[ref]$trayAfter) -and
-               $trayAfter.Left -eq $trayOriginal.Left -and
-               $trayAfter.Top -eq $trayOriginal.Top -and
-               $trayAfter.Right -eq $trayOriginal.Right -and
-               $trayAfter.Bottom -eq $trayOriginal.Bottom){
-                $trayRestored=$true
-                break
-            }
-            Start-Sleep -Milliseconds 40
-        }
-        if(-not $trayRestored){
-            throw 'CRITICAL: Explorer tray original geometry was not restored'
-        }
-    }
-    if(-not $winEventReanchored){throw 'OS tray event did not cause QA popup re-anchor'}
-    $evidence.popup_position.natural_winevent_tested=$true
-    $evidence.popup_position.event_source='controlled real Explorer TrayNotifyWnd movement'
-    $evidence.popup_position.event_reanchor_status='pass'
-    $evidence.popup_position.explorer_tray_restored=$trayRestored
-    $evidence.popup_position.explorer_tray_shift_pixels=$trayShift
-    $evidence.popup_position.real_user_taskbar_drag_tested=$false
-    $evidence.status='pass_help_diagnostics_antigravity_reposition_winevent'
+    $eventRestored=WaitQaAnchor 'OS WinEvent from owned helper window to product message handler'
+    $evidence.popup_position.natural_winevent_tested=$false
+    $evidence.popup_position.own_window_winevent_tested=$true
+    $evidence.popup_position.own_window_dispatch_to_product_handler='pass'
+    $evidence.popup_position.explorer_tray_touched=$false
+    $evidence.popup_position.event_restored_left=$eventRestored.Left
+    $evidence.popup_position.event_restored_top=$eventRestored.Top
+    $evidence.status='pass_help_diagnostics_antigravity_reposition_own_window_probe'
 } catch {
     $evidence.status='fail'
     $evidence.note=$_.Exception.Message
@@ -545,7 +578,7 @@ try {
         } catch {$evidence.process_exited=$false}
         $proc.Dispose()
     }
-    if($evidence.status -eq 'pass_help_diagnostics_antigravity_reposition_winevent' -and
+    if($evidence.status -eq 'pass_help_diagnostics_antigravity_reposition_own_window_probe' -and
        (-not $evidence.process_exited -or -not $evidence.env_scrubbed -or -not $evidence.dialog_owner_verified)) {
         $evidence.status='fail'
         $evidence.note='Cleanup or isolation not verified.'
