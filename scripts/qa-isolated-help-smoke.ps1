@@ -656,6 +656,7 @@ try {
     # (ProviderDiagnosis). Click each independently using OS SendInput.
     # QA-only AuthAction interceptor prevents CLI/OAuth/browser effects.
     $evidence.cell_target_cases=@()
+    $evidence.mixed_geometry=@()
     if(-not [AumQaWin32]::PostMessageW($main,0x805A,[IntPtr]9,[IntPtr]::Zero)){
         throw 'Unable to arm dual-window mixed failure fixture'
     }
@@ -688,6 +689,20 @@ try {
         $t=[AumQaOsInput]::QueryCta($main,7+16*$idx)
         $r=[AumQaOsInput]::QueryCta($main,8+16*$idx)
         $b=[AumQaOsInput]::QueryCta($main,9+16*$idx)
+        $visibleClient=New-Object AumQaWin32+RECT
+        $visibleWindow=New-Object AumQaWin32+RECT
+        if(-not [AumQaWin32]::GetClientRect($main,[ref]$visibleClient) -or
+           -not [AumQaWin32]::GetWindowRect($main,[ref]$visibleWindow)){
+            throw 'Mixed-state window geometry unavailable'
+        }
+        $evidence.mixed_geometry+=@{
+            name=$case.name
+            target=@{left=$l;top=$t;right=$r;bottom=$b}
+            client=@{width=$visibleClient.Right;height=$visibleClient.Bottom}
+            window=@{left=$visibleWindow.Left;top=$visibleWindow.Top;right=$visibleWindow.Right;bottom=$visibleWindow.Bottom}
+            index=$idx
+            target_inside_client=(($l -ge 0) -and ($t -ge 0) -and ($r -le $visibleClient.Right) -and ($b -le $visibleClient.Bottom))
+        }
         $mode=[AumQaOsInput]::HoverClickOwnedCta(
             $main,$l,$t,$r,$b,$proc.Id,$action,$idx,2)
         $clickedDialog=[IntPtr]::Zero
