@@ -236,6 +236,60 @@ public static class AumQaOsInput {
     private static extern uint GetWindowThreadProcessId(IntPtr h,out uint pid);
     [System.Runtime.InteropServices.DllImport("user32.dll",SetLastError=true)]
     private static extern uint SendInput(uint count,INPUT[] inputs,int size);
+    [System.Runtime.InteropServices.DllImport("user32.dll",SetLastError=true)]
+    private static extern IntPtr SendMessageW(IntPtr h,uint msg,IntPtr w,IntPtr l);
+    public static int QueryCta(IntPtr main,int code) {
+        return unchecked((int)SendMessageW(main,0x805B,new IntPtr(code),IntPtr.Zero).ToInt64());
+    }
+    public static string HoverClickOwnedCta(IntPtr main,int left,int top,int right,int bottom,int expectedPid,int expectedAction) {
+        POINT origin;
+        if(!GetCursorPos(out origin)) throw new InvalidOperationException("No VM cursor origin");
+        if(left<=0||top<=0||right-left<8||bottom-top<8)
+            throw new InvalidOperationException("Invalid CTA rectangle");
+        if(QueryCta(main,1)!=1||QueryCta(main,5)!=expectedAction)
+            throw new InvalidOperationException("Wrong CTA before input");
+        try {
+            bool owned=false;
+            int mid=(top+bottom)/2;
+            int[] dy=new int[]{0,-2,2,-4,4};
+            for(int x=left+3;x<right-2&&!owned;x+=3) {
+                foreach(int offset in dy) {
+                    int y=mid+offset;
+                    if(y<=top||y>=bottom) continue;
+                    POINT px=new POINT{X=x,Y=y};
+                    if(!ClientToScreen(main,ref px)) continue;
+                    if(!SetCursorPos(px.X,px.Y)) continue;
+                    System.Threading.Thread.Sleep(35);
+                    POINT now;
+                    if(!GetCursorPos(out now)||now.X!=px.X||now.Y!=px.Y) continue;
+                    IntPtr h=WindowFromPoint(now);
+                    uint pid=0;
+                    if(h!=IntPtr.Zero&&GetWindowThreadProcessId(h,out pid)!=0
+                        &&pid==(uint)expectedPid&&GetAncestor(h,2)==main) {
+                        owned=true; break;
+                    }
+                }
+            }
+            if(!owned) throw new InvalidOperationException("No QA-owned CTA pixel, click suppressed");
+            bool hovered=false;
+            for(int i=0;i<35;i++) {
+                if(QueryCta(main,4)==1) {hovered=true;break;}
+                System.Threading.Thread.Sleep(60);
+            }
+            if(!hovered) throw new InvalidOperationException("CTA hover not observed");
+            if(QueryCta(main,5)!=expectedAction)
+                throw new InvalidOperationException("CTA action changed after hover");
+            INPUT down=new INPUT{type=0,mi=new MOUSEINPUT{dwFlags=0x0002}};
+            INPUT up=new INPUT{type=0,mi=new MOUSEINPUT{dwFlags=0x0004}};
+            int size=System.Runtime.InteropServices.Marshal.SizeOf(typeof(INPUT));
+            uint sent=SendInput(2,new INPUT[]{down,up},size);
+            if(sent!=2) {
+                if(sent==1) SendInput(1,new INPUT[]{up},size);
+                throw new InvalidOperationException("CTA SendInput incomplete");
+            }
+            return "hover_then_os_sendinput";
+        } finally { SetCursorPos(origin.X,origin.Y); }
+    }
     public static string ClickOwnedHelp(IntPtr main,int x,int y,int expectedPid) {
         POINT origin,pt;
         if(!GetCursorPos(out origin)) throw new InvalidOperationException("No original VM pointer");
@@ -523,6 +577,80 @@ try {
         throw 'OS input dialog failed to close'
     }
     $dialog=[IntPtr]::Zero
+    # QA fixtures 7/8: verify hover + OS mouse input on the product CTA.
+    # AuthAction::launch is intercepted in the ephemeral runner checkout,
+    # before any real console, browser, CLI, or OAuth action is possible.
+    $evidence.auth_cta_cases=@()
+    $authCases=@(
+        @{ id=7; action=1; name='claude'; expected='qa_claude_login_dispatch_blocked' },
+        @{ id=8; action=2; name='codex'; expected='qa_codex_login_dispatch_blocked' }
+    )
+    foreach($case in $authCases) {
+        if(-not [AumQaWin32]::PostMessageW($main,0x805A,[IntPtr]([int]$case.id),[IntPtr]::Zero)){
+            throw ('Failed to arm auth CTA state: '+$case.name)
+        }
+        $ctaReady=$false
+        for($i=0;$i -lt 70;$i++){
+            if($proc.HasExited){throw ('QA product exited before CTA: '+$case.name)}
+            $count=[AumQaOsInput]::QueryCta($main,1)
+            $action=[AumQaOsInput]::QueryCta($main,5)
+            if($count -eq 1 -and $action -eq $case.action){$ctaReady=$true;break}
+            Start-Sleep -Milliseconds 70
+        }
+        if(-not $ctaReady){throw ('Auth CTA target not painted: '+$case.name)}
+        if([AumQaWin32]::Find($proc.Id,'#32770') -ne [IntPtr]::Zero){
+            throw ('Fixture opened dialog before CTA click: '+$case.name)
+        }
+        $left=[AumQaOsInput]::QueryCta($main,6)
+        $top=[AumQaOsInput]::QueryCta($main,7)
+        $right=[AumQaOsInput]::QueryCta($main,8)
+        $bottom=[AumQaOsInput]::QueryCta($main,9)
+        if([AumQaOsInput]::QueryCta($main,4) -ne 0){
+            throw ('Unexpected initial CTA hover: '+$case.name)
+        }
+        $mode=[AumQaOsInput]::HoverClickOwnedCta(
+            $main,$left,$top,$right,$bottom,$proc.Id,[int]$case.action)
+        $authDialog=[IntPtr]::Zero
+        for($i=0;$i -lt 100;$i++){
+            if($proc.HasExited){throw ('QA app exited after CTA click: '+$case.name)}
+            $authDialog=[AumQaWin32]::Find($proc.Id,'#32770')
+            if($authDialog -ne [IntPtr]::Zero){break}
+            Start-Sleep -Milliseconds 100
+        }
+        if($authDialog -eq [IntPtr]::Zero){
+            throw ('Safe auth CTA intercept dialog missing: '+$case.name)
+        }
+        $title=[AumQaWin32]::Title($authDialog)
+        $body=[AumQaWin32]::DialogText($authDialog)
+        if($title -ne 'QA auth dispatch intercepted' -or
+           [AumQaWin32]::GetWindow($authDialog,4) -ne $main -or
+           -not $body.Contains([string]$case.expected)){
+            throw ('Unexpected auth CTA dispatch: '+$case.name)
+        }
+        $evidence.auth_cta_cases+=@{
+            name=$case.name
+            status='pass'
+            simulated_state='weekly_authentication_expired'
+            action=$case.expected
+            pointer_hover='pass'
+            input=$mode
+            owned_product_dialog=$true
+            external_auth_launch_intercepted=$true
+            physical_human_mouse_tested=$false
+            natural_auth_failure_tested=$false
+        }
+        if(-not [AumQaWin32]::PostMessageW($authDialog,0x0010,[IntPtr]::Zero,[IntPtr]::Zero)){
+            throw ('Auth CTA dialog close rejected: '+$case.name)
+        }
+        for($i=0;$i -lt 50;$i++){
+            if([AumQaWin32]::Find($proc.Id,'#32770') -eq [IntPtr]::Zero){break}
+            Start-Sleep -Milliseconds 100
+        }
+        if([AumQaWin32]::Find($proc.Id,'#32770') -ne [IntPtr]::Zero){
+            throw ('Auth CTA intercept dialog remained open: '+$case.name)
+        }
+        $dialog=[IntPtr]::Zero
+    }
     # This is the genuine Antigravity menu path in the normal product code.
     # Only its own disposable-VM process receives WM_COMMAND; do not install
     # any CLI, open a browser, or use real credentials.
