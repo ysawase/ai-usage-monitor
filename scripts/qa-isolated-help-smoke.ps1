@@ -210,6 +210,61 @@ public static class AumOwnWindowWinEventProbe {
     }
 }
 
+// OS input automation ONLY in the disposable GitHub Windows VM.
+// No real user desktop, no foreground activation, no physical input.
+public static class AumQaOsInput {
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+    private struct POINT { public int X,Y; }
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+    private struct MOUSEINPUT {
+        public int dx,dy; public uint mouseData,dwFlags,time;
+        public IntPtr dwExtraInfo;
+    }
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+    private struct INPUT { public uint type; public MOUSEINPUT mi; }
+    [System.Runtime.InteropServices.DllImport("user32.dll",SetLastError=true)]
+    private static extern bool ClientToScreen(IntPtr h,ref POINT pt);
+    [System.Runtime.InteropServices.DllImport("user32.dll",SetLastError=true)]
+    private static extern bool GetCursorPos(out POINT pt);
+    [System.Runtime.InteropServices.DllImport("user32.dll",SetLastError=true)]
+    private static extern bool SetCursorPos(int x,int y);
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    private static extern IntPtr WindowFromPoint(POINT pt);
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    private static extern IntPtr GetAncestor(IntPtr h,uint flags);
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    private static extern uint GetWindowThreadProcessId(IntPtr h,out uint pid);
+    [System.Runtime.InteropServices.DllImport("user32.dll",SetLastError=true)]
+    private static extern uint SendInput(uint count,INPUT[] inputs,int size);
+    public static string ClickOwnedHelp(IntPtr main,int x,int y,int expectedPid) {
+        POINT origin,pt;
+        if(!GetCursorPos(out origin)) throw new InvalidOperationException("No original VM pointer");
+        pt=new POINT{X=x,Y=y};
+        if(!ClientToScreen(main,ref pt)) throw new InvalidOperationException("Cannot project help position");
+        try {
+            if(!SetCursorPos(pt.X,pt.Y)) throw new InvalidOperationException("Cannot move VM mouse");
+            System.Threading.Thread.Sleep(250);
+            POINT actual;
+            if(!GetCursorPos(out actual)||actual.X!=pt.X||actual.Y!=pt.Y)
+                throw new InvalidOperationException("VM mouse failed to reach requested pixel");
+            IntPtr hit=WindowFromPoint(actual);
+            uint pid=0;
+            if(hit==IntPtr.Zero||GetWindowThreadProcessId(hit,out pid)==0||
+               pid!=(uint)expectedPid||GetAncestor(hit,2)!=main)
+                throw new InvalidOperationException("Pointer target is not QA-owned application; input suppressed");
+            INPUT down=new INPUT{type=0,mi=new MOUSEINPUT{dwFlags=0x0002}};
+            INPUT up=new INPUT{type=0,mi=new MOUSEINPUT{dwFlags=0x0004}};
+            int size=System.Runtime.InteropServices.Marshal.SizeOf(typeof(INPUT));
+            uint sent=SendInput(2,new INPUT[]{down,up},size);
+            if(sent!=2) {
+                if(sent==1) SendInput(1,new INPUT[]{up},size);
+                throw new InvalidOperationException("Mouse press/release was not fully injected");
+            }
+            return "os_sendinput_owned_mouse";
+        } finally { SetCursorPos(origin.X,origin.Y); }
+    }
+}
+
 '@
 $runId=[guid]::NewGuid().ToString('N')
 $sandbox=Join-Path $env:RUNNER_TEMP ("aum-gui-qa-"+$runId)
@@ -419,6 +474,53 @@ try {
     }
     if([AumQaWin32]::Find($proc.Id,'#32770') -ne [IntPtr]::Zero){
         throw 'Help-attention dialog failed to close'
+    }
+    $dialog=[IntPtr]::Zero
+    # Stronger QA input evidence: Windows SendInput, not PostMessage. The
+    # input helper checks the exact HWND and PID under the pointer first.
+    # The product uses WS_EX_NOACTIVATE; do not force foreground activation.
+    if(-not [AumQaWin32]::PostMessageW($main,0x805A,[IntPtr]6,[IntPtr]::Zero)){
+        throw 'OS-mouse fixture rearm failed'
+    }
+    Start-Sleep -Milliseconds 250
+    if([AumQaWin32]::Find($proc.Id,'#32770') -ne [IntPtr]::Zero){
+        throw 'OS-mouse fixture opened dialog before mouse input'
+    }
+    $osMode=[AumQaOsInput]::ClickOwnedHelp($main,$helpX,$helpY,$proc.Id)
+    $osDialog=[IntPtr]::Zero
+    for($i=0;$i -lt 100;$i++){
+        if($proc.HasExited){throw 'QA app exited after OS mouse input'}
+        $osDialog=[AumQaWin32]::Find($proc.Id,'#32770')
+        if($osDialog -ne [IntPtr]::Zero){break}
+        Start-Sleep -Milliseconds 100
+    }
+    if($osDialog -eq [IntPtr]::Zero){throw 'OS mouse input did not open a diagnosis dialog'}
+    $osTitle=[AumQaWin32]::Title($osDialog)
+    $osBody=[AumQaWin32]::DialogText($osDialog)
+    if($osTitle -ne 'AI provider connection diagnosis' -or
+       [AumQaWin32]::GetWindow($osDialog,4) -ne $main -or
+       -not $osBody.Contains('Claude Code (session):') -or
+       $osBody.Contains('Claude Code (weekly):')){
+        throw 'OS input diagnosis not owned or did not use session-failure state'
+    }
+    $evidence.os_mouse_click=[ordered]@{
+        status='pass'
+        mode=$osMode
+        own_window_target_verified=$true
+        no_foreground_activation_requested=$true
+        session_diagnosis_verified=$true
+        human_physical_mouse_tested=$false
+        real_user_desktop_tested=$false
+    }
+    if(-not [AumQaWin32]::PostMessageW($osDialog,0x0010,[IntPtr]::Zero,[IntPtr]::Zero)){
+        throw 'OS input dialog close rejected'
+    }
+    for($i=0;$i -lt 50;$i++){
+        if([AumQaWin32]::Find($proc.Id,'#32770') -eq [IntPtr]::Zero){break}
+        Start-Sleep -Milliseconds 100
+    }
+    if([AumQaWin32]::Find($proc.Id,'#32770') -ne [IntPtr]::Zero){
+        throw 'OS input dialog failed to close'
     }
     $dialog=[IntPtr]::Zero
     # This is the genuine Antigravity menu path in the normal product code.
