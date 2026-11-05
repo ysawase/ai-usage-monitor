@@ -75,7 +75,7 @@ replace_exact(
             if fixture != 6 {
                 show_provider_diagnosis(hwnd);
             } else {
-                let _ = windows::Win32::UI::WindowsAndMessaging::InvalidateRect(hwnd, None, false);
+                let _ = InvalidateRect(hwnd, None, false);
             }
             LRESULT(0)
         }
