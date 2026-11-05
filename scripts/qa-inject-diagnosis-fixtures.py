@@ -81,7 +81,12 @@ replace_exact(
                 show_provider_diagnosis(hwnd);
             } else {
                 let _ = InvalidateRect(hwnd, None, false);
-                if fixture >= 7 { render_layered(); }
+                if fixture >= 7 {
+                    // Match production's WM_APP_USAGE_UPDATED sequence:
+                    // resize the real popup before layered rendering.
+                    sync_usage_geometry_if_needed(hwnd);
+                    render_layered();
+                }
             }
             LRESULT(0)
         }
