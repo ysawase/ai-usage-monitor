@@ -350,6 +350,77 @@ try {
         if([AumQaWin32]::Find($proc.Id,'#32770') -ne [IntPtr]::Zero){throw ('Diagnosis did not close: '+$fixture['label'])}
         $dialog=[IntPtr]::Zero
     }
+    # QA-only attention path: fixture 6 sets visible session failure, but
+    # unlike fixtures 1-5 it DOES NOT directly open the diagnosis dialog.
+    # Exercise the real production WM_LBUTTONDOWN hit test at the help icon.
+    if(-not [AumQaWin32]::PostMessageW($main,0x805A,[IntPtr]6,[IntPtr]::Zero)){
+        throw 'Failed to arm help-attention fixture'
+    }
+    Start-Sleep -Milliseconds 200
+    if([AumQaWin32]::Find($proc.Id,'#32770') -ne [IntPtr]::Zero){
+        throw 'Help-attention fixture unexpectedly opened dialog without click'
+    }
+    $helpRect=New-Object AumQaWin32+RECT
+    if(-not [AumQaWin32]::GetClientRect($main,[ref]$helpRect)){
+        throw 'Help client rect not measurable after fixture'
+    }
+    $helpWidth=$helpRect.Right-$helpRect.Left
+    $helpHeight=$helpRect.Bottom-$helpRect.Top
+    $helpDpi=[AumQaWin32]::GetDpiForWindow($main)
+    if($helpDpi -le 0){$helpDpi=96}
+    $helpScale={param([int]$v) [int][Math]::Round($v*[double]$helpDpi/96.0,[MidpointRounding]::AwayFromZero)}
+    $helpSize=& $helpScale 14
+    $helpEdge=[Math]::Max((& $helpScale 6),4)
+    $helpRight=[Math]::Max(($helpWidth-$helpEdge-(& $helpScale 4)),$helpSize)
+    $helpX=$helpRight-[int][Math]::Ceiling($helpSize/2.0)
+    $helpY=(& $helpScale 3)+[int][Math]::Floor($helpSize/2.0)
+    if($helpX -le 0 -or $helpX -ge $helpWidth -or $helpY -ge $helpHeight){
+        throw 'Attention help click outside window'
+    }
+    $helpLp=[IntPtr](($helpY -shl 16) -bor ($helpX -band 0xFFFF))
+    if(-not [AumQaWin32]::PostMessageW($main,0x0201,[IntPtr]::Zero,$helpLp)){
+        throw 'Attention help WM_LBUTTONDOWN rejected'
+    }
+    if(-not [AumQaWin32]::PostMessageW($main,0x0202,[IntPtr]::Zero,$helpLp)){
+        throw 'Attention help WM_LBUTTONUP rejected'
+    }
+    $attentionDialog=[IntPtr]::Zero
+    for($i=0;$i -lt 100;$i++){
+        if($proc.HasExited){throw 'QA process exited during attention help test'}
+        $attentionDialog=[AumQaWin32]::Find($proc.Id,'#32770')
+        if($attentionDialog -ne [IntPtr]::Zero){break}
+        Start-Sleep -Milliseconds 100
+    }
+    if($attentionDialog -eq [IntPtr]::Zero){
+        throw 'Help icon failed to open connection diagnosis under visible session failure'
+    }
+    if([AumQaWin32]::Title($attentionDialog) -ne 'AI provider connection diagnosis' -or
+       [AumQaWin32]::GetWindow($attentionDialog,4) -ne $main){
+        throw 'Help-attention diagnosis title or owner mismatch'
+    }
+    $attentionText=[AumQaWin32]::DialogText($attentionDialog)
+    if(-not $attentionText.Contains('Claude Code (session):') -or
+       $attentionText.Contains('Claude Code (weekly):')){
+        throw 'Help-attention diagnosis did not label visible session failure'
+    }
+    $evidence.help_attention_click=[ordered]@{
+        status='pass'
+        fixture='visible_session_failure_without_direct_dialog'
+        path='real_product_WM_LBUTTONDOWN_help_hit_test'
+        diagnosis='Claude Code (session)'
+        physical_mouse_tested=$false
+    }
+    if(-not [AumQaWin32]::PostMessageW($attentionDialog,0x0010,[IntPtr]::Zero,[IntPtr]::Zero)){
+        throw 'Help-attention dialog close message rejected'
+    }
+    for($i=0;$i -lt 50;$i++){
+        if([AumQaWin32]::Find($proc.Id,'#32770') -eq [IntPtr]::Zero){break}
+        Start-Sleep -Milliseconds 100
+    }
+    if([AumQaWin32]::Find($proc.Id,'#32770') -ne [IntPtr]::Zero){
+        throw 'Help-attention dialog failed to close'
+    }
+    $dialog=[IntPtr]::Zero
     # This is the genuine Antigravity menu path in the normal product code.
     # Only its own disposable-VM process receives WM_COMMAND; do not install
     # any CLI, open a browser, or use real credentials.
