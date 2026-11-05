@@ -31,7 +31,7 @@ replace_exact(
                 return LRESULT(0);
             }
             let fixture = wparam.0 as u32;
-            if !(1..=8).contains(&fixture) {
+            if !(1..=9).contains(&fixture) {
                 return LRESULT(0);
             }
             {
@@ -47,17 +47,17 @@ replace_exact(
                     ShortWindowVisibility::Always
                 };
                 s.show_claude_code = fixture != 8;
-                s.show_codex = fixture != 3 && fixture != 7;
+                s.show_codex = fixture != 3 && fixture != 7 && fixture != 9;
                 s.show_antigravity = false;
                 s.show_github_copilot = false;
                 s.show_vercel_ai_gateway = false;
                 s.data = None;
-                s.session_state = if fixture == 1 || fixture == 4 || fixture == 5 || fixture == 6 {
+                s.session_state = if fixture == 1 || fixture == 4 || fixture == 5 || fixture == 6 || fixture == 9 {
                     CellState::FetchFailed
                 } else {
                     CellState::Ok
                 };
-                s.weekly_state = if fixture == 7 {
+                s.weekly_state = if fixture == 7 || fixture == 9 {
                     CellState::AuthenticationExpired
                 } else if fixture == 2 || fixture == 5 {
                     CellState::FetchFailed
@@ -118,8 +118,9 @@ replace_exact(
             }
             let guard = lock_state();
             let Some(s) = guard.as_ref() else { return LRESULT(0); };
-            let hit = s.auth_cta_hit_targets.first();
-            let value = match wparam.0 {
+            let query = wparam.0 as usize;
+            let hit = s.auth_cta_hit_targets.get(query / 16);
+            let value = match query % 16 {
                 1 => s.auth_cta_hit_targets.len() as isize,
                 2 => hit.map(|h| (h.rect.left + h.rect.right) as isize / 2).unwrap_or(0),
                 3 => hit.map(|h| (h.rect.top + h.rect.bottom) as isize / 2).unwrap_or(0),
@@ -127,6 +128,7 @@ replace_exact(
                 5 => hit.map(|h| match h.action {
                     AuthAction::ClaudeLogin => 1,
                     AuthAction::CodexLogin => 2,
+                    AuthAction::ProviderDiagnosis(QuotaFamilyId::Claude, CellState::FetchFailed) => 3,
                     _ => 0,
                 }).unwrap_or(0),
                 6 => hit.map(|h| h.rect.left as isize).unwrap_or(0),

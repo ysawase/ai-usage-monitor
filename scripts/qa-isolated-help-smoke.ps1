@@ -241,12 +241,12 @@ public static class AumQaOsInput {
     public static int QueryCta(IntPtr main,int code) {
         return unchecked((int)SendMessageW(main,0x805B,new IntPtr(code),IntPtr.Zero).ToInt64());
     }
-    public static string HoverClickOwnedCta(IntPtr main,int left,int top,int right,int bottom,int expectedPid,int expectedAction) {
+    public static string HoverClickOwnedCta(IntPtr main,int left,int top,int right,int bottom,int expectedPid,int expectedAction,int index=0,int expectedCount=1) {
         POINT origin;
         if(!GetCursorPos(out origin)) throw new InvalidOperationException("No VM cursor origin");
         if(left<=0||top<=0||right-left<8||bottom-top<8)
             throw new InvalidOperationException("Invalid CTA rectangle");
-        if(QueryCta(main,1)!=1||QueryCta(main,5)!=expectedAction)
+        if(QueryCta(main,1)!=expectedCount||QueryCta(main,5+16*index)!=expectedAction)
             throw new InvalidOperationException("Wrong CTA before input");
         try {
             bool owned=false;
@@ -273,11 +273,11 @@ public static class AumQaOsInput {
             if(!owned) throw new InvalidOperationException("No QA-owned CTA pixel, click suppressed");
             bool hovered=false;
             for(int i=0;i<35;i++) {
-                if(QueryCta(main,4)==1) {hovered=true;break;}
+                if(QueryCta(main,4+16*index)==1) {hovered=true;break;}
                 System.Threading.Thread.Sleep(60);
             }
             if(!hovered) throw new InvalidOperationException("CTA hover not observed");
-            if(QueryCta(main,5)!=expectedAction)
+            if(QueryCta(main,5+16*index)!=expectedAction)
                 throw new InvalidOperationException("CTA action changed after hover");
             INPUT down=new INPUT{type=0,mi=new MOUSEINPUT{dwFlags=0x0002}};
             INPUT up=new INPUT{type=0,mi=new MOUSEINPUT{dwFlags=0x0004}};
@@ -648,6 +648,89 @@ try {
         }
         if([AumQaWin32]::Find($proc.Id,'#32770') -ne [IntPtr]::Zero){
             throw ('Auth CTA intercept dialog remained open: '+$case.name)
+        }
+        $dialog=[IntPtr]::Zero
+    }
+    # Mixed-state row-specific dispatch: fixture 9 simultaneously exposes
+    # weekly=AuthenticationExpired (ClaudeLogin) and session=FetchFailed
+    # (ProviderDiagnosis). Click each independently using OS SendInput.
+    # QA-only AuthAction interceptor prevents CLI/OAuth/browser effects.
+    $evidence.cell_target_cases=@()
+    if(-not [AumQaWin32]::PostMessageW($main,0x805A,[IntPtr]9,[IntPtr]::Zero)){
+        throw 'Unable to arm dual-window mixed failure fixture'
+    }
+    $mixedReady=$false
+    for($i=0;$i -lt 70;$i++){
+        if($proc.HasExited){throw 'Product exited before mixed-state test'}
+        if([AumQaOsInput]::QueryCta($main,1) -eq 2 -and
+           [AumQaOsInput]::QueryCta($main,5) -eq 1 -and
+           [AumQaOsInput]::QueryCta($main,21) -eq 3){
+            $mixedReady=$true;break
+        }
+        Start-Sleep -Milliseconds 70
+    }
+    if(-not $mixedReady){throw 'Mixed-state weekly/session CTA order not observed'}
+    if([AumQaWin32]::Find($proc.Id,'#32770') -ne [IntPtr]::Zero){
+        throw 'Mixed-state fixture opened dialog before cell click'
+    }
+    $mixedCases=@(
+        @{ name='session'; index=1; action=3; title='AI provider connection diagnosis'; text='Retrieval failed. Check authentication' },
+        @{ name='weekly'; index=0; action=1; title='QA auth dispatch intercepted'; text='qa_claude_login_dispatch_blocked' }
+    )
+    foreach($case in $mixedCases){
+        $idx=[int]$case.index
+        $action=[int]$case.action
+        if([AumQaOsInput]::QueryCta($main,1) -ne 2 -or
+           [AumQaOsInput]::QueryCta($main,5+16*$idx) -ne $action){
+            throw ('Cell action or count changed before click: '+$case.name)
+        }
+        $l=[AumQaOsInput]::QueryCta($main,6+16*$idx)
+        $t=[AumQaOsInput]::QueryCta($main,7+16*$idx)
+        $r=[AumQaOsInput]::QueryCta($main,8+16*$idx)
+        $b=[AumQaOsInput]::QueryCta($main,9+16*$idx)
+        $mode=[AumQaOsInput]::HoverClickOwnedCta(
+            $main,$l,$t,$r,$b,$proc.Id,$action,$idx,2)
+        $clickedDialog=[IntPtr]::Zero
+        for($i=0;$i -lt 100;$i++){
+            if($proc.HasExited){throw ('App exited after mixed cell click '+$case.name)}
+            $clickedDialog=[AumQaWin32]::Find($proc.Id,'#32770')
+            if($clickedDialog -ne [IntPtr]::Zero){break}
+            Start-Sleep -Milliseconds 100
+        }
+        if($clickedDialog -eq [IntPtr]::Zero){
+            throw ('No dialog after clicking '+$case.name)
+        }
+        $title=[AumQaWin32]::Title($clickedDialog)
+        $body=[AumQaWin32]::DialogText($clickedDialog)
+        if($title -ne [string]$case.title -or
+           [AumQaWin32]::GetWindow($clickedDialog,4) -ne $main -or
+           -not $body.Contains([string]$case.text)){
+            throw ('Wrong state dispatched for '+$case.name)
+        }
+        if($case.name -eq 'session' -and $body.Contains('Check authentication. Click')){
+            throw 'Session click incorrectly selected weekly auth-expired state'
+        }
+        $evidence.cell_target_cases+=@{
+            name=$case.name
+            status='pass'
+            simultaneous_window_states=$true
+            selected_target_index=$idx
+            click_mode=$mode
+            product_hover_verified=$true
+            selected_action_code=$action
+            correct_dialog_content_verified=$true
+            external_auth_launch_intercepted=$true
+            no_real_user_auth_tested=$true
+        }
+        if(-not [AumQaWin32]::PostMessageW($clickedDialog,0x0010,[IntPtr]::Zero,[IntPtr]::Zero)){
+            throw ('Could not close mixed-state '+$case.name+' dialog')
+        }
+        for($i=0;$i -lt 50;$i++){
+            if([AumQaWin32]::Find($proc.Id,'#32770') -eq [IntPtr]::Zero){break}
+            Start-Sleep -Milliseconds 100
+        }
+        if([AumQaWin32]::Find($proc.Id,'#32770') -ne [IntPtr]::Zero){
+            throw ('Mixed-state '+$case.name+' dialog did not close')
         }
         $dialog=[IntPtr]::Zero
     }
