@@ -30,7 +30,7 @@ replace_exact(
                 return LRESULT(0);
             }
             let fixture = wparam.0 as u32;
-            if !(1..=5).contains(&fixture) {
+            if !(1..=6).contains(&fixture) {
                 return LRESULT(0);
             }
             {
@@ -51,7 +51,7 @@ replace_exact(
                 s.show_github_copilot = false;
                 s.show_vercel_ai_gateway = false;
                 s.data = None;
-                s.session_state = if fixture == 1 || fixture == 4 || fixture == 5 {
+                s.session_state = if fixture == 1 || fixture == 4 || fixture == 5 || fixture == 6 {
                     CellState::FetchFailed
                 } else {
                     CellState::Ok
@@ -69,8 +69,14 @@ replace_exact(
                 };
                 refresh_usage_texts(s);
             }
-            // This is the real product diagnosis path, using fixture AppState.
-            show_provider_diagnosis(hwnd);
+            // Fixture 6 arms a visible session-only failure but does NOT
+            // directly open a diagnosis. The QA harness must click the real
+            // product help icon to exercise the user input dispatch path.
+            if fixture != 6 {
+                show_provider_diagnosis(hwnd);
+            } else {
+                let _ = windows::Win32::UI::WindowsAndMessaging::InvalidateRect(hwnd, None, false);
+            }
             LRESULT(0)
         }
         // The popup has no native sizing frame."""
