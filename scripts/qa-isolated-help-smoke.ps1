@@ -960,6 +960,96 @@ try {
     $evidence.popup_position.explorer_tray_touched=$false
     $evidence.popup_position.event_restored_left=$eventRestored.Left
     $evidence.popup_position.event_restored_top=$eventRestored.Top
+
+    # Separate disposable-runner-only probe for the ACTUAL Explorer
+    # TrayNotifyWnd location-change event. Unlike the owned-window test
+    # above, this exercises the product's Explorer-thread HWND filter.
+    # Do NOT run against a user desktop. Restore the shell child in finally.
+    $shellProbe=[ordered]@{
+        status='unavailable'
+        reason='TrayNotifyWnd absent in isolated runner'
+        shell_owner_verified=$false
+        shell_move_requested=$false
+        shell_geometry_restored=$false
+        product_repositioned=$false
+        physical_user_action=$false
+    }
+    $evidence.popup_position.explorer_tray_probe=$shellProbe
+    $tray=[AumQaWin32]::FindTrayNotify()
+    if($tray -ne [IntPtr]::Zero) {
+        $trayPid=[AumQaWin32]::OwnerPid($tray)
+        if($trayPid -eq 0 -or (Get-Process -Id ([int]$trayPid)).ProcessName -ne 'explorer') {
+            throw 'Refusing tray probe: HWND owner is not Explorer'
+        }
+        $shellProbe.shell_owner_verified=$true
+        $trayInitial=New-Object AumQaWin32+RECT
+        if(-not [AumQaWin32]::GetWindowRect($tray,[ref]$trayInitial)){
+            throw 'Unable to measure isolated Explorer tray child'
+        }
+        $shellProbe.reason='Shell window refused safe small position change'
+        if(-not [AumQaWin32]::SetWindowPos(
+            $main,[IntPtr]::Zero,
+            $eventRestored.Left-$shiftX,$eventRestored.Top-$shiftY,
+            0,0,$swpFlags)){
+            throw 'Unable to displace QA popup for Explorer tray probe'
+        }
+        $null=WaitQaPosition ($eventRestored.Left-$shiftX) ($eventRestored.Top-$shiftY) 'before Explorer tray event'
+        Start-Sleep -Milliseconds 950
+        $stable=GetQaRect
+        if([Math]::Abs($stable.Left-($eventRestored.Left-$shiftX)) -gt 3 -or
+           [Math]::Abs($stable.Top-($eventRestored.Top-$shiftY)) -gt 3) {
+            throw 'QA popup moved without Explorer tray event; control unstable'
+        }
+        try {
+            # Move only 7 px within the disposable runner. No taskbar
+            # settings, account credentials or display resolution changed.
+            $evidence.popup_position.explorer_tray_touched=$true
+            if([AumQaWin32]::SetWindowPos(
+                $tray,[IntPtr]::Zero,
+                ($trayInitial.Left-7),$trayInitial.Top,
+                0,0,$swpFlags)){
+                $shellProbe.shell_move_requested=$true
+                $trayMoved=New-Object AumQaWin32+RECT
+                if(-not [AumQaWin32]::GetWindowRect($tray,[ref]$trayMoved)){
+                    throw 'Unable to read Explorer tray after movement'
+                }
+                if([Math]::Abs($trayMoved.Left-$trayInitial.Left) -ge 3){
+                    $naturalRestored=WaitQaAnchor 'real Explorer TrayNotifyWnd location WinEvent'
+                    $shellProbe.status='pass'
+                    $shellProbe.reason='Actual Explorer child moved; product re-anchored without direct message'
+                    $shellProbe.product_repositioned=$true
+                    $shellProbe.restored_left=$naturalRestored.Left
+                    $shellProbe.restored_top=$naturalRestored.Top
+                } else {
+                    $shellProbe.reason='Explorer immediately reset child geometry; event not attributable'
+                }
+            }
+        } finally {
+            if($shellProbe.shell_move_requested) {
+                if(-not [AumQaWin32]::SetWindowPos(
+                    $tray,[IntPtr]::Zero,
+                    $trayInitial.Left,$trayInitial.Top,
+                    0,0,$swpFlags)){
+                    throw 'Unable to restore Explorer tray child in disposable runner'
+                }
+                $trayFinal=New-Object AumQaWin32+RECT
+                if(-not [AumQaWin32]::GetWindowRect($tray,[ref]$trayFinal) -or
+                   [Math]::Abs($trayFinal.Left-$trayInitial.Left) -gt 2 -or
+                   [Math]::Abs($trayFinal.Top-$trayInitial.Top) -gt 2){
+                    throw 'Explorer tray child geometry not restored in disposable runner'
+                }
+                $shellProbe.shell_geometry_restored=$true
+            } else {
+                $shellProbe.shell_geometry_restored=$true
+            }
+            # Recover the owned QA popup even when the shell probe is unavailable.
+            if(-not [AumQaWin32]::PostMessageW(
+                $main,0x8005,[IntPtr]::Zero,[IntPtr]::Zero)){
+                throw 'Cannot restore QA popup after Explorer tray probe'
+            }
+            $null=WaitQaAnchor 'cleanup after Explorer tray probe'
+        }
+    }
     $evidence.status='pass_help_diagnostics_antigravity_reposition_own_window_probe'
 } catch {
     $evidence.status='fail'
