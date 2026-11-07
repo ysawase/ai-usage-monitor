@@ -1,0 +1,113 @@
+name: Muse WebView2 Login Shell (experimental)
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'tools/muse-login-shell-poc/**'
+      - '.github/workflows/muse-webview2-poc.yml'
+  push:
+    branches:
+      - feature/muse-webview2-login-shell-20261031
+      - feature/muse-passive-response-diag-20261102
+    paths:
+      - 'tools/muse-login-shell-poc/**'
+      - '.github/workflows/muse-webview2-poc.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  windows-build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install .NET 8 SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+      - name: Restore separate login-only PoC
+        run: dotnet restore tools/muse-login-shell-poc/MuseLoginShellPoc.csproj
+      - name: Build separate login-only PoC
+        run: dotnet build tools/muse-login-shell-poc/MuseLoginShellPoc.csproj --configuration Release --no-restore
+      - name: Publish standalone Windows test executable
+        run: dotnet publish tools/muse-login-shell-poc/MuseLoginShellPoc.csproj --configuration Release --runtime win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:DebugType=None -p:DebugSymbols=false --output artifacts/muse-login-shell-win-x64
+      - name: Confirm test package contains executable
+        shell: pwsh
+        run: |
+          if (!(Test-Path artifacts/muse-login-shell-win-x64/MuseLoginShellPoc.exe)) { throw "Missing test executable" }
+          if (Test-Path artifacts/muse-login-shell-win-x64/claude-code-usage-monitor.exe) { throw "Production executable must never be bundled" }
+      - name: Verify synthetic UI Automation without Muse access
+        shell: pwsh
+        run: |
+          $exe = (Resolve-Path 'artifacts/muse-login-shell-win-x64/MuseLoginShellPoc.exe').Path
+          $p = Start-Process -FilePath $exe -ArgumentList '--synthetic-self-test' -PassThru
+          try {
+            if (-not $p.WaitForExit(30000)) {
+              throw 'Synthetic UIA self-test timed out'
+            }
+            if ($p.ExitCode -ne 0) {
+              throw "Synthetic UIA self-test failed with exit code $($p.ExitCode)"
+            }
+          } finally {
+            if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }
+          }
+      - name: Verify isolated synthetic WebView2 accessibility
+        shell: pwsh
+        run: |
+          $exe = (Resolve-Path 'artifacts/muse-login-shell-win-x64/MuseLoginShellPoc.exe').Path
+          $p = Start-Process -FilePath $exe -ArgumentList '--synthetic-webview2-self-test' -PassThru
+          try {
+            if (-not $p.WaitForExit(35000)) { throw 'Synthetic WebView2 accessibility timed out' }
+            if ($p.ExitCode -ne 0) { throw "Synthetic WebView2 accessibility failed: $($p.ExitCode)" }
+          } finally {
+            $diagnostic = Join-Path $env:TEMP 'MuseSyntheticWebView2-UiaResult.txt'
+            if (Test-Path $diagnostic) { Write-Host ('SYNTHETIC_WEBVIEW2_DIAGNOSTIC: ' + (Get-Content $diagnostic -Raw)) }
+            if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }
+          }
+      - name: Classify synthetic passive WebView2 response stages
+        shell: pwsh
+        run: |
+          $exe = (Resolve-Path 'artifacts/muse-login-shell-win-x64/MuseLoginShellPoc.exe').Path
+          $p = Start-Process -FilePath $exe -ArgumentList '--passive-response-diagnostic' -PassThru
+          try {
+            if (-not $p.WaitForExit(25000)) { throw 'Diagnostic timed out' }
+            if ($p.ExitCode -ne 0) { throw "Passive response diagnostic exited with $($p.ExitCode)" }
+          } finally {
+            $file = Join-Path $env:TEMP 'MusePassiveResponseStage.txt'
+            if (Test-Path $file) { Write-Host ('PASSIVE_RESPONSE_STAGE: ' + (Get-Content $file -Raw)) }
+            if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }
+          }
+      - name: Verify automatic Muse quota transport with synthetic HTTP only
+        shell: pwsh
+        run: |
+          $exe = (Resolve-Path 'artifacts/muse-login-shell-win-x64/MuseLoginShellPoc.exe').Path
+          $p = Start-Process -FilePath $exe -ArgumentList '--automatic-quota-self-test' -PassThru
+          try {
+            if (-not $p.WaitForExit(30000)) { throw 'Synthetic automatic quota self-test timed out' }
+            if ($p.ExitCode -ne 0) { throw "Synthetic automatic quota self-test failed: $($p.ExitCode)" }
+          } finally {
+            if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }
+          }
+      - name: Upload short-lived test artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: muse-login-shell-win-x64-DIAGNOSTIC-TEST-ONLY
+          path: artifacts/muse-login-shell-win-x64/
+          retention-days: 3
+          if-no-files-found: error
+      - name: Ensure tracked Rust product files remain unchanged
+        shell: pwsh
+        run: |
+          git diff --exit-code origin/main HEAD -- src Cargo.toml Cargo.lock
+      - name: Check forbidden integrations are absent
+        shell: pwsh
+        run: |
+          $content = Get-Content tools/muse-login-shell-poc/*.cs -Raw
+          $forbidden = @('GetCookiesAsync', 'ExecuteScriptAsync', 'AddHostObjectToScript', 'WebResourceRequested', 'fetchSubscriptionAction', 'GetDevToolsProtocolEventReceiver')
+          foreach ($token in $forbidden) {
+            if ($content.Contains($token)) { throw "Forbidden integration: $token" }
+          }
