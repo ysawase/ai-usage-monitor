@@ -29,6 +29,14 @@ internal sealed class LoginWindow : Form
     private bool captureArmed;
     private bool captureReading;
     private int captureCandidates;
+    private readonly Button autoToggle = new()
+    { Text = "Muse自動更新を開始（15分間隔）", AutoSize = true, Enabled = false };
+    private readonly System.Windows.Forms.Timer autoTimer = new()
+    { Interval = 15 * 60 * 1000 };
+    private readonly MuseAutomaticQuotaReader autoReader = new();
+    private CancellationTokenSource? autoCancellation;
+    private bool autoEnabled;
+    private bool autoInProgress;
     private bool resetting;
 
     internal LoginWindow()
@@ -38,7 +46,8 @@ internal sealed class LoginWindow : Form
         Height = 720;
         MinimumSize = new Size(550, 400);
 
-        var bar = new TableLayoutPanel { Dock = DockStyle.Top, Height = 64, ColumnCount = 6 };
+        var bar = new TableLayoutPanel { Dock = DockStyle.Top, Height = 84, ColumnCount = 7 };
+        bar.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
         bar.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
         bar.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
         bar.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
@@ -50,7 +59,8 @@ internal sealed class LoginWindow : Form
         bar.Controls.Add(synthetic, 2, 0);
         bar.Controls.Add(readVisible, 3, 0);
         bar.Controls.Add(captureQuota, 4, 0);
-        bar.Controls.Add(status, 5, 0);
+        bar.Controls.Add(autoToggle, 5, 0);
+        bar.Controls.Add(status, 6, 0);
         Controls.Add(browser);
         Controls.Add(bar);
         open.Click += (_, _) => browser.CoreWebView2?.Navigate(MuseUrl);
@@ -58,6 +68,17 @@ internal sealed class LoginWindow : Form
         synthetic.Click += (_, _) => new SyntheticUsageWindow().Show(this);
         readVisible.Click += async (_, _) => await ReadVisibleUsageOnceAsync();
         captureQuota.Click += (_, _) => ArmQuotaCapture();
+        autoToggle.Click += (_, _) =>
+        {
+            if (autoEnabled) StopAutomaticRefresh();
+            else StartAutomaticRefresh();
+        };
+        autoTimer.Tick += async (_, _) => await RefreshAutomaticallyAsync();
+        FormClosed += (_, _) =>
+        {
+            StopAutomaticRefresh(updateStatus: false);
+            autoReader.Dispose();
+        };
         captureTimer.Tick += (_, _) => {
             if (captureArmed) StopQuotaCapture("Muse利用枠の応答が届きませんでした。取得不可として扱います。");
         };
@@ -128,6 +149,7 @@ internal sealed class LoginWindow : Form
             erase.Enabled = true;
             readVisible.Enabled = true;
             captureQuota.Enabled = true;
+            autoToggle.Enabled = true;
         }
         catch (Exception)
         {
@@ -303,6 +325,120 @@ internal sealed class LoginWindow : Form
         }
     }
 
+    private void StartAutomaticRefresh()
+    {
+        if (autoEnabled || resetting || browser.CoreWebView2 is null)
+            return;
+        var url = browser.CoreWebView2.Source;
+        if (!Uri.TryCreate(url, UriKind.Absolute, out var current)
+            || current.Scheme != Uri.UriSchemeHttps
+            || !current.Host.Equals("muse.ai", StringComparison.OrdinalIgnoreCase))
+        {
+            status.Text = "Muse公式サイトにログイン後、自動更新を開始してください。";
+            return;
+        }
+        // Explicit, reversible self-only opt-in; not persisted on disk.
+        autoEnabled = true;
+        autoCancellation = new CancellationTokenSource();
+        autoToggle.Text = "Muse自動更新を停止";
+        autoTimer.Start();
+        _ = RefreshAutomaticallyAsync();
+    }
+
+    private void StopAutomaticRefresh(bool updateStatus = true)
+    {
+        autoEnabled = false;
+        autoTimer.Stop();
+        autoCancellation?.Cancel();
+        autoCancellation?.Dispose();
+        autoCancellation = null;
+        if (!IsDisposed)
+        {
+            autoToggle.Text = "Muse自動更新を開始（15分間隔）";
+            autoToggle.Enabled = !resetting && browser.CoreWebView2 is not null;
+            if (updateStatus)
+                status.Text = "Muse自動更新を停止しました。";
+        }
+    }
+
+    private async Task RefreshAutomaticallyAsync()
+    {
+        if (!autoEnabled || autoInProgress || resetting
+            || browser.CoreWebView2 is null || autoCancellation is null)
+            return;
+        autoInProgress = true;
+        CancellationToken token = autoCancellation.Token;
+        try
+        {
+            // CookieManager is scoped to this PoC's dedicated WebView2 profile.
+            // We never read Chrome/Edge/Opera profiles or persist a cookie string.
+            var cookies = await browser.CoreWebView2.CookieManager
+                .GetCookiesAsync("https://muse.ai/");
+            var selected = cookies
+                .Where(c => c.IsSecure
+                    && (c.Domain.Equals("muse.ai", StringComparison.OrdinalIgnoreCase)
+                        || c.Domain.Equals(".muse.ai", StringComparison.OrdinalIgnoreCase))
+                    && c.Name.Length is > 0 and <= 128
+                    && c.Name.All(ch => char.IsAsciiLetterOrDigit(ch)
+                        || ch == '_' || ch == '-' || ch == '.')
+                    && !c.Value.Any(ch => ch == '\r' || ch == '\n' || ch == '\0'))
+                .Take(40)
+                .Select(c => c.Name + "=" + c.Value)
+                .ToArray();
+            string header = string.Join("; ", selected);
+            if (header.Length > 8192 || header.Length == 0)
+            {
+                StopAutomaticRefresh();
+                status.Text = "Muse認証セッションを確認できません。再ログインが必要な可能性があります。";
+                return;
+            }
+            var browserAgent = browser.CoreWebView2.Settings.UserAgent;
+            var result = await autoReader.ReadAsync(header, browserAgent, token);
+            if (!autoEnabled || token.IsCancellationRequested || IsDisposed)
+                return;
+            if (result.Status == MuseAutomaticStatus.Success
+                && result.Reading is { } quota)
+            {
+                var reset = quota.WeeklyResetAt is null
+                    ? "リセット日時不明"
+                    : TimeZoneInfo.ConvertTimeBySystemTimeZoneId(
+                        quota.WeeklyResetAt.Value, "Tokyo Standard Time")
+                        .ToString("yyyy/MM/dd HH:mm") + " JST";
+                status.Text =
+                    $"自動取得：{quota.Plan} / 週間使用 {quota.UsedPercent:0.##}% / {reset}"
+                    + $" / 取得 {DateTime.Now:HH:mm}（15分ごとに更新）";
+            }
+            else if (result.Status is MuseAutomaticStatus.AuthenticationRequired
+                                      or MuseAutomaticStatus.NoSession
+                                      or MuseAutomaticStatus.RateLimited)
+            {
+                StopAutomaticRefresh();
+                status.Text = result.Status == MuseAutomaticStatus.RateLimited
+                    ? "Muse側から制限応答。自動更新を停止しました。"
+                    : "Muse認証の再確認が必要です。自動更新を停止しました。";
+            }
+            else
+            {
+                // Do not claim the old reading is fresh or fabricate 0%.
+                status.Text = "Museの自動取得に失敗しました（"
+                    + result.Status + "）。値は更新していません。";
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // The user explicitly stopped the poll; nothing is saved.
+        }
+        catch (Exception)
+        {
+            if (autoEnabled && !IsDisposed)
+                status.Text = "Museの自動取得に失敗しました。値は更新していません。";
+        }
+        finally
+        {
+            autoInProgress = false;
+        }
+    }
+
     private async Task ClearSessionAsync()
     {
         if (browser.CoreWebView2 is null || resetting) return;
@@ -310,10 +446,11 @@ internal sealed class LoginWindow : Form
                 "この試作専用のCookie・履歴などを消去します。Museアカウント自体は削除しません。続けますか？",
                 "試作のログイン情報を消去",
                 MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
+        StopAutomaticRefresh(updateStatus: false);
         resetting = true;
         captureArmed = false;
         captureTimer.Stop();
-        open.Enabled = erase.Enabled = readVisible.Enabled = captureQuota.Enabled = false;
+        open.Enabled = erase.Enabled = readVisible.Enabled = captureQuota.Enabled = autoToggle.Enabled = false;
         try
         {
             // Leave the live page first; this profile alone is affected.
@@ -330,7 +467,7 @@ internal sealed class LoginWindow : Form
         finally
         {
             resetting = false;
-            open.Enabled = erase.Enabled = readVisible.Enabled = captureQuota.Enabled = true;
+            open.Enabled = erase.Enabled = readVisible.Enabled = captureQuota.Enabled = autoToggle.Enabled = true;
         }
     }
 }

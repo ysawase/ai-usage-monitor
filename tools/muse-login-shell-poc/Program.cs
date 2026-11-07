@@ -14,6 +14,12 @@ internal static class Program
     {
         try
         {
+            if (args.Contains("--automatic-quota-self-test", StringComparer.Ordinal))
+            {
+                Environment.ExitCode = MuseAutomaticQuotaSelfTest.RunAsync().GetAwaiter().GetResult()
+                    ? 0 : 1;
+                return;
+            }
             if (args.Contains("--passive-response-diagnostic", StringComparer.Ordinal))
             {
                 ApplicationConfiguration.Initialize();

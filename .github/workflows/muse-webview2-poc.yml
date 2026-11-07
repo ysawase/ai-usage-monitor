@@ -81,6 +81,17 @@ jobs:
             if (Test-Path $file) { Write-Host ('PASSIVE_RESPONSE_STAGE: ' + (Get-Content $file -Raw)) }
             if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }
           }
+      - name: Verify automatic Muse quota transport with synthetic HTTP only
+        shell: pwsh
+        run: |
+          $exe = (Resolve-Path 'artifacts/muse-login-shell-win-x64/MuseLoginShellPoc.exe').Path
+          $p = Start-Process -FilePath $exe -ArgumentList '--automatic-quota-self-test' -PassThru
+          try {
+            if (-not $p.WaitForExit(30000)) { throw 'Synthetic automatic quota self-test timed out' }
+            if ($p.ExitCode -ne 0) { throw "Synthetic automatic quota self-test failed: $($p.ExitCode)" }
+          } finally {
+            if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }
+          }
       - name: Upload short-lived test artifact
         uses: actions/upload-artifact@v4
         with:
