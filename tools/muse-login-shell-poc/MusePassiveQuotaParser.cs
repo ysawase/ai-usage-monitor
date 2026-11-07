@@ -22,6 +22,16 @@ internal static class MusePassiveQuotaParser
 {
     internal const int MaxBytes = 65_536;
 
+    // Observed in the self-only real Muse response UI on 2026-11-07:
+    // UTF-8 Japanese "無料" had been displayed as Windows-1252 mojibake
+    // (Museç„¡æ–™). Normalize this one known alias only. Do not attempt
+    // broad decoding or infer tier from weekly usage percentage.
+    internal static string NormalizePlan(string plan) =>
+        plan is "Muse Free" or "Muse無料"
+            or "Muse\u00e7\u201e\u00a1\u00e6\u2013\u2122"
+            ? "Muse Free"
+            : plan;
+
     internal static MusePassiveQuotaParseState Parse(
         string? raw, out MusePassiveQuotaReading? reading)
     {
@@ -79,7 +89,7 @@ internal static class MusePassiveQuotaParser
                         return MusePassiveQuotaParseState.Invalid;
                     reset = DateTimeOffset.FromUnixTimeSeconds(seconds);
                 }
-                reading = new MusePassiveQuotaReading(plan, used, reset);
+                reading = new MusePassiveQuotaReading(NormalizePlan(plan), used, reset);
             }
             catch (JsonException)
             {
