@@ -144,6 +144,26 @@ internal sealed class PassiveResponseDiagnostic : Form
                 out _) == MusePassiveQuotaParseState.Invalid
                 && MusePassiveQuotaParser.Parse("1:{}", out _)
                     == MusePassiveQuotaParseState.NoQuota;
+
+            // Regression: the real-account screenshot displayed the known
+            // mojibake alias alongside a 7% weekly reading. Do not persist
+            // or log any user response; this is entirely synthetic data.
+            string syntheticVariant = "1:" + System.Text.Json.JsonSerializer.Serialize(
+                new {
+                    success = true,
+                    subscription = new {
+                        tier = new { name = "Muse\u00e7\u201e\u00a1\u00e6\u2013\u2122" },
+                        usage = new { percentUsed = 7, resetsAt = 1794584040L }
+                    }
+                });
+            var variantStatus = MusePassiveQuotaParser.Parse(
+                syntheticVariant, out var variant);
+            valid = valid && variantStatus == MusePassiveQuotaParseState.Success
+                && variant is { Plan: "Muse Free", UsedPercent: 7M }
+                && variant.WeeklyResetAt?.UtcDateTime.ToString("yyyy-MM-dd HH:mm")
+                    == "2026-11-13 15:34"
+                && variant.WeeklyResetAt.Value.ToOffset(TimeSpan.FromHours(9))
+                    .ToString("yyyy-MM-dd HH:mm") == "2026-11-14 00:34";
             // Disposal is separately classified: some COM wrappers may not
             // support methods commonly expected from managed streams.
             try { body.Dispose(); }
