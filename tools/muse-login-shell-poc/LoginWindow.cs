@@ -269,11 +269,16 @@ internal sealed class LoginWindow : Form
                 System.Text.Encoding.UTF8.GetString(bytes), out var quota);
             if (state == MusePassiveQuotaParseState.Success && quota is not null)
             {
+                // The exact reset instant can have a different calendar
+                // date in Japan from the first-party UI's date-only label.
+                // Show both time bases, without claiming the UI uses UTC.
                 var reset = quota.WeeklyResetAt is null
                     ? "リセット日時不明"
                     : TimeZoneInfo.ConvertTimeBySystemTimeZoneId(
                         quota.WeeklyResetAt.Value, "Tokyo Standard Time")
-                        .ToString("yyyy/MM/dd HH:mm") + " JST";
+                        .ToString("yyyy/MM/dd HH:mm") + " JST"
+                      + "（UTC: " + quota.WeeklyResetAt.Value.UtcDateTime
+                          .ToString("MM/dd HH:mm") + "）";
                 StopQuotaCapture(
                     $"検証成功（非保存）：{quota.Plan} / 週間使用 {quota.UsedPercent:0.##}% / {reset}");
             }
