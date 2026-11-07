@@ -35,6 +35,7 @@ internal sealed class LoginWindow : Form
     private readonly System.Windows.Forms.Timer autoTimer = new()
     { Interval = 15 * 60 * 1000 };
     private readonly MuseAutomaticQuotaReader autoReader = new();
+    private readonly MuseRefreshHealth refreshHealth = new();
     private CancellationTokenSource? autoCancellation;
     private bool autoEnabled;
     private bool autoInProgress;
@@ -340,6 +341,7 @@ internal sealed class LoginWindow : Form
         }
         // Explicit, reversible self-only opt-in; not persisted on disk.
         autoEnabled = true;
+        refreshHealth.Start(DateTimeOffset.UtcNow);
         autoCancellation = new CancellationTokenSource();
         autoToggle.Text = "Muse自動更新を停止";
         autoTimer.Start();
@@ -348,6 +350,7 @@ internal sealed class LoginWindow : Form
 
     private void StopAutomaticRefresh(bool updateStatus = true)
     {
+        refreshHealth.Stop(DateTimeOffset.UtcNow);
         autoEnabled = false;
         autoTimer.Stop();
         autoCancellation?.Cancel();
@@ -368,6 +371,7 @@ internal sealed class LoginWindow : Form
             || browser.CoreWebView2 is null || autoCancellation is null)
             return;
         autoInProgress = true;
+        refreshHealth.Attempt(DateTimeOffset.UtcNow);
         CancellationToken token = autoCancellation.Token;
         try
         {
@@ -389,6 +393,7 @@ internal sealed class LoginWindow : Form
             string header = string.Join("; ", selected);
             if (header.Length > 8192 || header.Length == 0)
             {
+                refreshHealth.Failure(DateTimeOffset.UtcNow, "NoSession");
                 StopAutomaticRefresh();
                 status.Text = "Muse認証セッションを確認できません。再ログインが必要な可能性があります。";
                 return;
@@ -400,6 +405,7 @@ internal sealed class LoginWindow : Form
             if (result.Status == MuseAutomaticStatus.Success
                 && result.Reading is { } quota)
             {
+                refreshHealth.Success(DateTimeOffset.UtcNow);
                 var reset = quota.WeeklyResetAt is null
                     ? "リセット日時不明"
                     : TimeZoneInfo.ConvertTimeBySystemTimeZoneId(
@@ -413,6 +419,7 @@ internal sealed class LoginWindow : Form
                                       or MuseAutomaticStatus.NoSession
                                       or MuseAutomaticStatus.RateLimited)
             {
+                refreshHealth.Failure(DateTimeOffset.UtcNow, result.Status.ToString());
                 StopAutomaticRefresh();
                 status.Text = result.Status == MuseAutomaticStatus.RateLimited
                     ? "Muse側から制限応答。自動更新を停止しました。"
@@ -420,6 +427,7 @@ internal sealed class LoginWindow : Form
             }
             else
             {
+                refreshHealth.Failure(DateTimeOffset.UtcNow, result.Status.ToString());
                 // Do not claim the old reading is fresh or fabricate 0%.
                 status.Text = "Museの自動取得に失敗しました（"
                     + result.Status + "）。値は更新していません。";
@@ -431,6 +439,7 @@ internal sealed class LoginWindow : Form
         }
         catch (Exception)
         {
+            refreshHealth.Failure(DateTimeOffset.UtcNow, "UnknownFailure");
             if (autoEnabled && !IsDisposed)
                 status.Text = "Museの自動取得に失敗しました。値は更新していません。";
         }

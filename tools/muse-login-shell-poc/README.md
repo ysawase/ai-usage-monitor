@@ -82,3 +82,31 @@ working when Muse changes. Competitors using a similar endpoint do not
 prove Meta permission. Personal-local tests are authorized by the user's
 direction; public free/paid distribution, Store integration, production Rust
 provider wiring and automatic deployment remain on HOLD.
+
+
+## 2026-11-08: bounded local refresh status receipt (personal-only QA)
+
+The user should not need to read a screenshot or communicate the last
+successful fetch time. While the **opt-in automatic mode** is running, the
+PoC writes a single atomic JSON receipt under the same Windows user's
+`%LOCALAPPDATA%\\Solidaily\\MuseLoginShellPoc\\refresh-health.json`.
+Only the following keys are persisted:
+`schema_version`, `state`, `session_started_utc`,
+`last_attempt_utc`, `previous_success_utc`, `last_success_utc`,
+`success_count_in_session`, `last_outcome`, `recorded_utc`.
+
+**No percentage, plan, reset date, subscription data, user ID, email,
+cookie, session token, request URL, request/response body or exception
+message is written.** Unknown errors are one generic status.
+The status file is owned by the local user and is only intended for
+an already-authorized *read-only* diagnostic channel to inspect.
+No telemetry or cloud upload is added; no background task or unattended
+execution is enabled on app startup. The receipt cannot prove that the
+process is *still* running by itself—inspect the process separately.
+
+A successful 15-minute repeat in the same opt-in session requires both
+`success_count_in_session >= 2` and a later
+`last_success_utc` than `previous_success_utc`; the old program cannot
+retroactively generate this receipt. The deterministic synthetic CLI test
+`--refresh-health-self-test` verifies atomic writes, stop/error,
+two successes, session count reset, and exclusion of secret/quota terms.
