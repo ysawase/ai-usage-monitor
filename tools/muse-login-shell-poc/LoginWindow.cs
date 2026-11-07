@@ -6,8 +6,9 @@ using System.Windows.Forms;
 namespace MuseLoginShellPoc;
 
 /// <summary>
-/// Separate, opt-in login-only Windows experiment.
-/// No quota fetching, Cookie APIs, DevTools, injection, or host messaging.
+/// Separate, opt-in personal-local Muse quota experiment.
+/// The optional auto mode temporarily reads only this WebView2's cookies;
+/// no normal browser cookie access, JavaScript injection or host messaging.
 /// </summary>
 internal sealed class LoginWindow : Form
 {
