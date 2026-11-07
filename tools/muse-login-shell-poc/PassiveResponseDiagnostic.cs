@@ -131,6 +131,19 @@ internal sealed class PassiveResponseDiagnostic : Form
             });
             stage = "after_read";
             bool valid = Encoding.UTF8.GetString(all) == SyntheticFixture;
+            // Exercise the very same parser used by the opt-in Muse window
+            // against the actual WebView2-delivered synthetic response.
+            var parseState = MusePassiveQuotaParser.Parse(
+                Encoding.UTF8.GetString(all), out var parsed);
+            valid = valid && parseState == MusePassiveQuotaParseState.Success
+                && parsed is { Plan: "Muse Free", UsedPercent: 2M }
+                && parsed.WeeklyResetAt?.ToUnixTimeSeconds() == 1790634838L;
+            // Fail closed on malformed, missing, duplicate and out-of-range readings.
+            valid = valid && MusePassiveQuotaParser.Parse(
+                "1:{\"success\":true,\"subscription\":{\"tier\":{\"name\":\"Free\"},\"usage\":{\"percentUsed\":105}}}",
+                out _) == MusePassiveQuotaParseState.Invalid
+                && MusePassiveQuotaParser.Parse("1:{}", out _)
+                    == MusePassiveQuotaParseState.NoQuota;
             // Disposal is separately classified: some COM wrappers may not
             // support methods commonly expected from managed streams.
             try { body.Dispose(); }

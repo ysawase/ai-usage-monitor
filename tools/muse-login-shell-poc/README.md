@@ -29,3 +29,24 @@ End users must not be required to install SDKs or run these commands. GitHub CI 
 2. Verify logout and session-data reset as a distinct operation with actual Muse sign-in.
 3. Determine a Meta-permitted, read-only **quota data** source; login alone is not proof.
 4. Verify Windows packaging, account/plan identity, fresh/expired/zero/no-data handling, security, and free/paid Store release permission independently.
+
+
+## 2026-11-07: opt-in passive quota response pilot
+
+After the user signs into the **dedicated WebView2 profile**, they can choose
+`設定画面の応答を取得（1回）` and open Muse's own
+Settings → General → Usage view within 60 seconds. The experiment listens for
+an already-issued first-party `muse.ai` POST response with a `Next-Action`
+request header and `text/x-component` content type. It does **not** issue
+a private action request, read cookies, decrypt browser credentials, or inject
+JavaScript. Only a bounded response (64 KiB), in process memory, is checked
+for `subscription.tier.name`, `usage.percentUsed` and `usage.resetsAt`;
+other fields, raw responses, headers, and account data are not logged or saved.
+
+The feature is **off by default**, single-shot, at most six candidates and
+60 seconds. Unknown schemas or missing data show unavailable, **never 0%**.
+Synthetic CI exercises the WebView2 response and exact parser. No real Muse
+account is used in CI. The live server's actual response format and support for
+this passive technique remain unverified. This code is research-only:
+**NO production Rust integration, NO MSIX/Store distribution, NO public release.**
+This pilot does not establish Meta's permission for public or commercial use.

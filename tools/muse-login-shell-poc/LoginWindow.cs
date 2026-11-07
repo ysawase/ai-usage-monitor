@@ -24,6 +24,11 @@ internal sealed class LoginWindow : Form
     private readonly Button erase = new() { Text = "この試作のログイン情報を消去", AutoSize = true };
     private readonly Button synthetic = new() { Text = "合成データ検証", AutoSize = true };
     private readonly Button readVisible = new() { Text = "表示中の利用状況を1回確認", AutoSize = true, Enabled = false };
+    private readonly Button captureQuota = new() { Text = "設定画面の応答を取得（1回）", AutoSize = true, Enabled = false };
+    private readonly System.Windows.Forms.Timer captureTimer = new() { Interval = 60_000 };
+    private bool captureArmed;
+    private bool captureReading;
+    private int captureCandidates;
     private bool resetting;
 
     internal LoginWindow()
@@ -33,7 +38,8 @@ internal sealed class LoginWindow : Form
         Height = 720;
         MinimumSize = new Size(550, 400);
 
-        var bar = new TableLayoutPanel { Dock = DockStyle.Top, Height = 64, ColumnCount = 5 };
+        var bar = new TableLayoutPanel { Dock = DockStyle.Top, Height = 64, ColumnCount = 6 };
+        bar.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
         bar.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
         bar.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
         bar.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
@@ -43,13 +49,18 @@ internal sealed class LoginWindow : Form
         bar.Controls.Add(erase, 1, 0);
         bar.Controls.Add(synthetic, 2, 0);
         bar.Controls.Add(readVisible, 3, 0);
-        bar.Controls.Add(status, 4, 0);
+        bar.Controls.Add(captureQuota, 4, 0);
+        bar.Controls.Add(status, 5, 0);
         Controls.Add(browser);
         Controls.Add(bar);
         open.Click += (_, _) => browser.CoreWebView2?.Navigate(MuseUrl);
         erase.Click += async (_, _) => await ClearSessionAsync();
         synthetic.Click += (_, _) => new SyntheticUsageWindow().Show(this);
         readVisible.Click += async (_, _) => await ReadVisibleUsageOnceAsync();
+        captureQuota.Click += (_, _) => ArmQuotaCapture();
+        captureTimer.Tick += (_, _) => {
+            if (captureArmed) StopQuotaCapture("Muse利用枠の応答が届きませんでした。取得不可として扱います。");
+        };
         Shown += async (_, _) => await InitializeBrowserAsync();
     }
 
@@ -108,11 +119,15 @@ internal sealed class LoginWindow : Form
             {
                 e.State = CoreWebView2PermissionState.Deny;
             };
+            // Dormant unless the user explicitly arms one limited response read.
+            // No browser cookie APIs, page script injection or new HTTP requests.
+            core.WebResourceResponseReceived += ObserveMuseQuotaResponse;
             core.Navigate(MuseUrl);
-            status.Text = "Muse公式画面にログインできます。試作は利用率を読み取りません。";
+            status.Text = "Muse専用画面。利用枠の応答検証はボタンを押した時だけ有効です。";
             open.Enabled = true;
             erase.Enabled = true;
             readVisible.Enabled = true;
+            captureQuota.Enabled = true;
         }
         catch (Exception)
         {
@@ -170,6 +185,119 @@ internal sealed class LoginWindow : Form
         }
     }
 
+    private void ArmQuotaCapture()
+    {
+        if (resetting || browser.CoreWebView2 is null || captureReading) return;
+        var url = browser.CoreWebView2.Source;
+        if (!Uri.TryCreate(url, UriKind.Absolute, out var current)
+            || current.Scheme != Uri.UriSchemeHttps
+            || !current.Host.Equals("muse.ai", StringComparison.OrdinalIgnoreCase))
+        {
+            status.Text = "muse.ai公式画面でのみ応答を確認できます。";
+            return;
+        }
+        // Explicit, single-use opt-in. The user opens Settings > General > Usage.
+        // Nothing is sent by this code: the embedded browser makes its own requests.
+        captureCandidates = 0;
+        captureArmed = true;
+        captureTimer.Stop();
+        captureTimer.Start();
+        captureQuota.Enabled = false;
+        status.Text = "60秒以内にMuseの「設定 → 利用状況」を開いてください。応答は保存・送信しません。";
+    }
+
+    private void StopQuotaCapture(string message)
+    {
+        captureArmed = false;
+        captureTimer.Stop();
+        if (!IsDisposed)
+        {
+            captureQuota.Enabled = !resetting && browser.CoreWebView2 is not null;
+            status.Text = message;
+        }
+    }
+
+    private async void ObserveMuseQuotaResponse(
+        object? sender, CoreWebView2WebResourceResponseReceivedEventArgs e)
+    {
+        if (!captureArmed || captureReading || resetting || IsDisposed)
+            return;
+        // Only the exact first-party muse.ai origin. Never read auth.muse.ai,
+        // unrelated third-party resources, GET responses or the user's cookies.
+        if (!Uri.TryCreate(e.Request.Uri, UriKind.Absolute, out var uri)
+            || uri.Scheme != Uri.UriSchemeHttps
+            || !uri.Host.Equals("muse.ai", StringComparison.OrdinalIgnoreCase)
+            || uri.Port != 443
+            || !e.Request.Method.Equals("POST", StringComparison.OrdinalIgnoreCase)
+            || !e.Request.Headers.Contains("Next-Action"))
+            return;
+        if (e.Response.StatusCode != 200
+            || !e.Response.Headers.Contains("Content-Type")
+            || !e.Response.Headers.GetHeader("Content-Type").StartsWith(
+                "text/x-component", StringComparison.OrdinalIgnoreCase))
+            return;
+
+        captureReading = true;
+        try
+        {
+            var body = await e.Response.GetContentAsync();
+            if (body is null)
+            {
+                StopQuotaCapture("応答本文がありません。");
+                return;
+            }
+            // WebView2 recommends reading its stream on a worker thread.
+            // Bound memory to 64 KiB and never write the raw body to disk/log/clipboard.
+            byte[] bytes = await Task.Run(() =>
+            {
+                using (body)
+                using (var buffer = new MemoryStream())
+                {
+                    var part = new byte[2048];
+                    while (true)
+                    {
+                        int n = body.Read(part, 0, part.Length);
+                        if (n == 0) break;
+                        if (buffer.Length + n > MusePassiveQuotaParser.MaxBytes)
+                            throw new InvalidDataException("Response too large");
+                        buffer.Write(part, 0, n);
+                    }
+                    return buffer.ToArray();
+                }
+            });
+            var state = MusePassiveQuotaParser.Parse(
+                System.Text.Encoding.UTF8.GetString(bytes), out var quota);
+            if (state == MusePassiveQuotaParseState.Success && quota is not null)
+            {
+                var reset = quota.WeeklyResetAt is null
+                    ? "リセット日時不明"
+                    : TimeZoneInfo.ConvertTimeBySystemTimeZoneId(
+                        quota.WeeklyResetAt.Value, "Tokyo Standard Time")
+                        .ToString("yyyy/MM/dd HH:mm") + " JST";
+                StopQuotaCapture(
+                    $"検証成功（非保存）：{quota.Plan} / 週間使用 {quota.UsedPercent:0.##}% / {reset}");
+            }
+            else if (state != MusePassiveQuotaParseState.NoQuota)
+            {
+                StopQuotaCapture("取得不可：応答形式が不明・不正、または長すぎます。");
+            }
+            else if (++captureCandidates >= 6)
+            {
+                StopQuotaCapture("利用枠の応答が確認できません。別の応答を繰り返し読みません。");
+            }
+        }
+        catch (Exception)
+        {
+            // Exception details, HTTP headers, URLs and response contents may
+            // contain private data; never stringify or persist them.
+            StopQuotaCapture("応答取得に失敗しました（認証・通信・仕様変更など原因未確定）。");
+        }
+        finally
+        {
+            captureReading = false;
+        }
+    }
+
     private async Task ClearSessionAsync()
     {
         if (browser.CoreWebView2 is null || resetting) return;
@@ -178,7 +306,9 @@ internal sealed class LoginWindow : Form
                 "試作のログイン情報を消去",
                 MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
         resetting = true;
-        open.Enabled = erase.Enabled = readVisible.Enabled = false;
+        captureArmed = false;
+        captureTimer.Stop();
+        open.Enabled = erase.Enabled = readVisible.Enabled = captureQuota.Enabled = false;
         try
         {
             // Leave the live page first; this profile alone is affected.
@@ -195,7 +325,7 @@ internal sealed class LoginWindow : Form
         finally
         {
             resetting = false;
-            open.Enabled = erase.Enabled = readVisible.Enabled = true;
+            open.Enabled = erase.Enabled = readVisible.Enabled = captureQuota.Enabled = true;
         }
     }
 }
