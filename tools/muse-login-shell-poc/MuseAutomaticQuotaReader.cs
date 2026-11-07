@@ -70,6 +70,11 @@ internal sealed class MuseAutomaticQuotaReader : IDisposable
         // Never store the cookie in a field or log it.
         if (string.IsNullOrEmpty(museOnlyCookieHeader))
             return new(MuseAutomaticStatus.NoSession);
+        // An entire refresh must finish promptly even if many sequential
+        // action-discovery chunk requests would individually remain pending.
+        using var bounded = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        bounded.CancelAfter(TimeSpan.FromSeconds(75));
+        cancellationToken = bounded.Token;
         try
         {
             if (cachedActionID is not null)
