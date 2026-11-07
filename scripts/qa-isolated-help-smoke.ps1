@@ -33,6 +33,20 @@ using System.Runtime.InteropServices;
 public static class AumQaWin32 {
     [StructLayout(LayoutKind.Sequential)]
     public struct RECT { public int Left,Top,Right,Bottom; }
+    [StructLayout(LayoutKind.Sequential)]
+    public struct POINT { public int X,Y; }
+    [DllImport("user32.dll",SetLastError=true)]
+    private static extern IntPtr GetParent(IntPtr h);
+    [DllImport("user32.dll",SetLastError=true)]
+    private static extern bool ScreenToClient(IntPtr h,ref POINT p);
+    public static POINT ToParentClient(IntPtr child,int screenX,int screenY) {
+        var parent=GetParent(child);
+        if(parent==IntPtr.Zero)throw new InvalidOperationException("Child has no parent");
+        var p=new POINT { X=screenX, Y=screenY };
+        if(!ScreenToClient(parent,ref p))
+            throw new InvalidOperationException("ScreenToClient(parent) failed");
+        return p;
+    }
     private delegate bool EnumProc(IntPtr h, IntPtr arg);
     [DllImport("user32.dll",SetLastError=true)]
     private static extern bool EnumWindows(EnumProc cb,IntPtr arg);
@@ -986,6 +1000,11 @@ try {
         if(-not [AumQaWin32]::GetWindowRect($tray,[ref]$trayInitial)){
             throw 'Unable to measure isolated Explorer tray child'
         }
+        # SetWindowPos on an Explorer CHILD requires coordinates in its
+        # parent's client space; GetWindowRect is SCREEN coordinates.
+        # Do not confuse these on a taskbar at nonzero screen Y.
+        $trayDesired=[AumQaWin32]::ToParentClient($tray,($trayInitial.Left-7),$trayInitial.Top)
+        $trayRestore=[AumQaWin32]::ToParentClient($tray,$trayInitial.Left,$trayInitial.Top)
         $shellProbe.reason='Shell window refused safe small position change'
         if(-not [AumQaWin32]::SetWindowPos(
             $main,[IntPtr]::Zero,
@@ -1006,7 +1025,7 @@ try {
             $evidence.popup_position.explorer_tray_touched=$true
             if([AumQaWin32]::SetWindowPos(
                 $tray,[IntPtr]::Zero,
-                ($trayInitial.Left-7),$trayInitial.Top,
+                $trayDesired.X,$trayDesired.Y,
                 0,0,$swpFlags)){
                 $shellProbe.shell_move_requested=$true
                 $trayMoved=New-Object AumQaWin32+RECT
@@ -1028,7 +1047,7 @@ try {
             if($shellProbe.shell_move_requested) {
                 if(-not [AumQaWin32]::SetWindowPos(
                     $tray,[IntPtr]::Zero,
-                    $trayInitial.Left,$trayInitial.Top,
+                    $trayRestore.X,$trayRestore.Y,
                     0,0,$swpFlags)){
                     throw 'Unable to restore Explorer tray child in disposable runner'
                 }
