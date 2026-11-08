@@ -140,6 +140,17 @@ impl AuthAction {
             }
             return;
         }
+        if self == Self::ClaudeLogin {
+            let is_japanese = {
+                let state = lock_state();
+                state.as_ref().is_some_and(|s| s.language == LanguageId::Japanese)
+            };
+            show_info_message(
+                hwnd,
+                if is_japanese { "Claudeの再認証" } else { "Reconnect Claude" },
+                claude_login_steps(is_japanese),
+            );
+        }
         if !launch_visible_auth_command(hwnd, program, args) {
             diagnose::log(format!("unable to launch auth command for {program}"));
         }
@@ -263,6 +274,16 @@ struct AuthCtaHitTarget {
 /// visible console — this app does not attempt to detect that case, and
 /// does not fall back to reading any credential file if it happens.
 const CLAUDE_AUTH_TROUBLESHOOTING_URL: &str = "https://code.claude.com/docs/en/troubleshooting";
+
+/// Explain the first-party terminal flow before opening the Claude CLI.
+/// The monitor never captures or stores the authorization code.
+fn claude_login_steps(japanese: bool) -> &'static str {
+    if japanese {
+        "Claudeの公式ログイン画面を開きます。\n\n1. ブラウザーが開いたらClaudeにログインしてください。開かない場合は、次の黒い画面に表示されるURLをCtrlキーを押しながらクリックします。\n2. 認証コードが表示された場合はコピーします。\n3. 黒い画面に戻ってコードを貼り付け、Enterキーで確定します。\n\n※ コードは貼り付けても文字が表示されない場合があります。表示されなくてもEnterキーを押してください。\n※ コードをこのモニターに入力する必要はありません。"
+    } else {
+        "Claude's official sign-in will start.\n\n1. Sign in in your browser. If it does not open, Ctrl+click the URL shown in the terminal window.\n2. If an authorization code appears, copy it.\n3. Return to the terminal, paste the code, and press Enter.\n\nNote: The pasted code may be invisible. Press Enter even if no characters appear.\nNever enter the code into this monitor."
+    }
+}
 
 /// Fixed first-party login commands only. On failure, show official recovery
 /// instructions instead of copying or running a pinned historic executable.
@@ -10380,6 +10401,21 @@ mod tests {
         assert!(!command.contains("2.1.308"));
         assert!(!command.contains("Copy-Item"));
         assert!(!command.contains("ExecutionPolicy"));
+    }
+
+
+    #[test]
+    fn claude_login_guidance_explains_invisible_paste_and_enter() {
+        let ja = claude_login_steps(true);
+        let en = claude_login_steps(false);
+        assert!(ja.contains("Ctrl"));
+        assert!(ja.contains("表示されない場合"));
+        assert!(ja.contains("Enterキー"));
+        assert!(en.contains("Ctrl+click"));
+        assert!(en.contains("invisible"));
+        assert!(en.contains("Enter"));
+        assert!(!ja.contains("2.1.308"));
+        assert!(!en.contains("2.1.308"));
     }
 
     #[test]
