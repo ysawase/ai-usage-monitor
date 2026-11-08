@@ -272,6 +272,11 @@ struct AppState {
     vercel_ai_gateway_state: CellState,
     vercel_ai_gateway_percent: Option<f64>,
     vercel_ai_gateway_text: String,
+    muse_weekly_state: CellState,
+    muse_weekly_percent: Option<f64>,
+    muse_weekly_text: String,
+    muse_weekly_section: Option<UsageSection>,
+    show_muse: bool,
     show_claude_code: bool,
     show_codex: bool,
     show_antigravity: bool,
@@ -2004,6 +2009,8 @@ const IDM_MODEL_CODEX: u16 = 61;
 const IDM_MODEL_ANTIGRAVITY: u16 = 62;
 const IDM_MODEL_GITHUB_COPILOT: u16 = 63;
 const IDM_MODEL_VERCEL_AI_GATEWAY: u16 = 64;
+#[cfg(feature = "muse-local-experimental")]
+const IDM_MODEL_MUSE: u16 = 65;
 // 70 is `tray_icon::IDM_TOGGLE_WIDGET`, not redefined here — it shares the
 // same `WM_COMMAND` id space as every constant in this block, so it must be
 // treated as already taken (71 is skipped too, to leave no ambiguity next
@@ -2327,6 +2334,8 @@ struct SettingsFile {
     #[serde(default)]
     show_vercel_ai_gateway: bool,
     #[serde(default)]
+    show_muse: bool,
+    #[serde(default)]
     github_copilot_plan: poller::GithubCopilotPlan,
     #[serde(default, deserialize_with = "deserialize_display_basis")]
     display_basis: DisplayBasis,
@@ -2373,6 +2382,7 @@ impl Default for SettingsFile {
             show_antigravity: false,
             show_github_copilot: false,
             show_vercel_ai_gateway: false,
+            show_muse: false,
             github_copilot_plan: poller::GithubCopilotPlan::Unknown,
             display_basis: DisplayBasis::default(),
             reset_display_mode: ResetDisplayMode::default(),
@@ -2514,6 +2524,8 @@ fn load_settings() -> SettingsFile {
     let mut settings: SettingsFile = serde_json::from_str(&content).unwrap_or_default();
     settings.widget_width_logical = normalize_saved_widget_width(settings.widget_width_logical);
     normalize_github_copilot_settings(&mut settings);
+    #[cfg(not(feature = "muse-local-experimental"))]
+    { settings.show_muse = false; }
     #[cfg(not(feature = "antigravity"))]
     {
         settings.show_antigravity = false;
@@ -2523,6 +2535,7 @@ fn load_settings() -> SettingsFile {
         && !settings.show_antigravity
         && !settings.show_github_copilot
         && !settings.show_vercel_ai_gateway
+        && !settings.show_muse
     {
         settings.show_claude_code = true;
     }
@@ -2570,6 +2583,7 @@ fn save_state_settings() {
             show_antigravity: s.show_antigravity,
             show_github_copilot: s.show_github_copilot,
             show_vercel_ai_gateway: s.show_vercel_ai_gateway,
+            show_muse: s.show_muse,
             github_copilot_plan: s.github_copilot_plan,
             display_basis: s.display_basis,
             reset_display_mode: s.reset_display_mode,
@@ -3300,6 +3314,14 @@ fn refresh_usage_texts(state: &mut AppState) {
     );
     state.vercel_ai_gateway_percent = vercel.bar_percent;
     state.vercel_ai_gateway_text = vercel.text;
+
+    let muse = render_cell_with_reset_mode(
+        state.muse_weekly_state,
+        state.muse_weekly_section.as_ref(),
+        basis, reset_display_mode, strings,
+    );
+    state.muse_weekly_percent = muse.bar_percent;
+    state.muse_weekly_text = muse.text;
 }
 
 fn set_window_title(hwnd: HWND, strings: Strings) {
@@ -5198,6 +5220,11 @@ pub fn run() {
                 vercel_ai_gateway_state: CellState::Loading,
                 vercel_ai_gateway_percent: None,
                 vercel_ai_gateway_text: String::new(),
+                muse_weekly_state: CellState::Disabled,
+                muse_weekly_percent: None,
+                muse_weekly_text: String::new(),
+                muse_weekly_section: None,
+                show_muse: settings.show_muse,
                 show_claude_code: settings.show_claude_code,
                 show_codex: settings.show_codex,
                 show_antigravity: settings.show_antigravity,
@@ -6300,6 +6327,8 @@ fn do_poll(send_hwnd: SendHwnd) {
         show_github_copilot,
         show_vercel_ai_gateway,
         github_copilot_plan,
+        #[cfg(feature = "muse-local-experimental")]
+        show_muse,
     ) = {
         let state = lock_state();
         state
@@ -6312,6 +6341,8 @@ fn do_poll(send_hwnd: SendHwnd) {
                     s.show_github_copilot,
                     s.show_vercel_ai_gateway,
                     s.github_copilot_plan,
+                    #[cfg(feature = "muse-local-experimental")]
+                    s.show_muse,
                 )
             })
             .unwrap_or((
@@ -6321,6 +6352,8 @@ fn do_poll(send_hwnd: SendHwnd) {
                 false,
                 false,
                 poller::GithubCopilotPlan::Unknown,
+                #[cfg(feature = "muse-local-experimental")]
+                false,
             ))
     };
 
@@ -6343,6 +6376,33 @@ fn do_poll(send_hwnd: SendHwnd) {
             }
         },
     );
+
+    // Manual Refresh and TIMER_POLL both enter do_poll. The helper's own
+    // timer is disabled in --muse-local-bridge mode; no second scheduler.
+    #[cfg(feature = "muse-local-experimental")]
+    if show_muse {
+        let fetched = crate::muse_local::read();
+        let mut state = lock_state();
+        if let Some(s) = state.as_mut() {
+            match fetched {
+                Ok(reading) => {
+                    s.muse_weekly_section = Some(UsageSection {
+                        percentage: reading.used_percent,
+                        resets_at: reading.resets_at_epoch_seconds.and_then(|seconds|
+                            UNIX_EPOCH.checked_add(Duration::from_secs(seconds))),
+                    });
+                    s.muse_weekly_state = CellState::Ok;
+                }
+                Err(_) => {
+                    s.muse_weekly_section = None;
+                    s.muse_weekly_state = CellState::NotAvailable;
+                }
+            }
+            refresh_usage_texts(s);
+        }
+        drop(state);
+        unsafe { let _ = PostMessageW(hwnd, WM_APP_USAGE_UPDATED, WPARAM(0), LPARAM(0)); }
+    }
 
     match report.clone().into_app_usage_data() {
         Ok(data) => {
