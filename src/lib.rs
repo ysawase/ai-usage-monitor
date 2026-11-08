@@ -22,6 +22,8 @@ pub mod diagnose;
 pub mod antigravity_statusline;
 pub mod localization;
 pub mod models;
+#[cfg(feature = "muse-local-experimental")]
+pub mod muse_local;
 mod poll_diagnostics;
 pub mod poller;
 pub mod vercel_ai_gateway;

@@ -50,6 +50,16 @@ jobs:
         continue-on-error: true
         run: cargo build --release --locked --no-default-features --features antigravity
 
+      - name: Test experimental same-user Muse IPC parser
+        id: muse_tests
+        continue-on-error: true
+        run: cargo test --locked --no-default-features --features muse-local-experimental
+
+      - name: Build experimental Muse headless client (no Store packaging)
+        id: muse_build
+        continue-on-error: true
+        run: cargo build --locked --no-default-features --features muse-local-experimental --bin aum-quota
+
       - name: Verify Cargo.lock unchanged
         id: lockfile
         continue-on-error: true
@@ -64,6 +74,8 @@ jobs:
           BUILD_OUTCOME: ${{ steps.build.outcome }}
           TEST_ANTIGRAVITY_OUTCOME: ${{ steps.tests_antigravity.outcome }}
           BUILD_ANTIGRAVITY_OUTCOME: ${{ steps.build_antigravity.outcome }}
+          MUSE_TESTS_OUTCOME: ${{ steps.muse_tests.outcome }}
+          MUSE_BUILD_OUTCOME: ${{ steps.muse_build.outcome }}
           LOCKFILE_OUTCOME: ${{ steps.lockfile.outcome }}
         run: |
           $failed = @()
@@ -88,6 +100,8 @@ jobs:
             $failed += 'build (antigravity)'
           }
 
+          if ($env:MUSE_TESTS_OUTCOME -ne 'success') { $failed += 'muse-local tests' }
+          if ($env:MUSE_BUILD_OUTCOME -ne 'success') { $failed += 'muse-local build' }
           if ($env:LOCKFILE_OUTCOME -ne 'success') {
             $failed += 'Cargo.lock'
           }
