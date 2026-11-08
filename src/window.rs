@@ -4149,6 +4149,7 @@ struct ProviderVisibility {
     show_antigravity: bool,
     show_github_copilot: bool,
     show_vercel_ai_gateway: bool,
+    show_muse: bool,
 }
 
 impl ProviderVisibility {
@@ -4159,6 +4160,7 @@ impl ProviderVisibility {
             show_antigravity: state.show_antigravity,
             show_github_copilot: state.show_github_copilot,
             show_vercel_ai_gateway: state.show_vercel_ai_gateway,
+            show_muse: state.show_muse,
         }
     }
 
@@ -4169,6 +4171,7 @@ impl ProviderVisibility {
             (self.show_antigravity, true),
             (self.show_github_copilot, false),
             (self.show_vercel_ai_gateway, false),
+            (self.show_muse, true),
         ])
     }
 
@@ -4179,6 +4182,7 @@ impl ProviderVisibility {
             (self.show_antigravity, false),
             (self.show_github_copilot, true),
             (self.show_vercel_ai_gateway, true),
+            (self.show_muse, false),
         ])
     }
 }
@@ -4675,6 +4679,20 @@ fn active_family_count_with_vercel(
         .max(1)
 }
 
+fn active_family_count_with_muse(
+    show_claude_code: bool,
+    show_codex: bool,
+    show_antigravity: bool,
+    show_github_copilot: bool,
+    show_vercel_ai_gateway: bool,
+    show_muse: bool,
+) -> i32 {
+    (active_family_count_with_vercel(
+        show_claude_code, show_codex, show_antigravity,
+        show_github_copilot, show_vercel_ai_gateway,
+    ) + show_muse as i32).max(1)
+}
+
 fn scaled_for_dpi(px: i32, dpi: u32) -> i32 {
     let dpi = dpi.max(1);
     (px as f64 * dpi as f64 / 96.0).round() as i32
@@ -4857,12 +4875,10 @@ fn total_widget_width_for_state(state: &AppState) -> i32 {
 }
 
 fn active_family_count_for_state(state: &AppState) -> i32 {
-    active_family_count_with_vercel(
-        state.show_claude_code,
-        state.show_codex,
-        state.show_antigravity,
-        state.show_github_copilot,
-        state.show_vercel_ai_gateway,
+    active_family_count_with_muse(
+        state.show_claude_code, state.show_codex, state.show_antigravity,
+        state.show_github_copilot, state.show_vercel_ai_gateway,
+        state.show_muse,
     )
 }
 
@@ -4872,12 +4888,13 @@ fn total_widget_width() -> i32 {
         state
             .as_ref()
             .map(|s| {
-                active_family_count_with_vercel(
+                active_family_count_with_muse(
                     s.show_claude_code,
                     s.show_codex,
                     s.show_antigravity,
                     s.show_github_copilot,
                     s.show_vercel_ai_gateway,
+                    s.show_muse,
                 )
             })
             .unwrap_or(1)
@@ -4904,6 +4921,10 @@ fn antigravity_accent_color() -> Color {
 
 fn github_copilot_accent_color() -> Color {
     Color::from_hex("#8250DF")
+}
+
+fn muse_accent_color() -> Color {
+    Color::from_hex("#4C9F70")
 }
 
 fn vercel_ai_gateway_accent_color() -> Color {
@@ -5116,12 +5137,13 @@ pub fn run() {
 
         // Create as a top-level layered popup, anchored above the taskbar.
         let title = native_interop::wide_str(language.strings().window_title);
-        let initial_model_count = active_family_count_with_vercel(
+        let initial_model_count = active_family_count_with_muse(
             settings.show_claude_code,
             settings.show_codex,
             settings.show_antigravity,
             settings.show_github_copilot,
             settings.show_vercel_ai_gateway,
+            settings.show_muse,
         );
         let hwnd = CreateWindowExW(
             WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_NOACTIVATE,
@@ -5809,6 +5831,7 @@ fn paint_content(
             show_antigravity,
             show_github_copilot,
             show_vercel_ai_gateway,
+            show_muse,
         };
         let session_shows = SessionRowShows {
             claude_code: session_row_cell_shows(
@@ -6327,7 +6350,6 @@ fn do_poll(send_hwnd: SendHwnd) {
         show_github_copilot,
         show_vercel_ai_gateway,
         github_copilot_plan,
-        #[cfg(feature = "muse-local-experimental")]
         show_muse,
     ) = {
         let state = lock_state();
@@ -6341,7 +6363,6 @@ fn do_poll(send_hwnd: SendHwnd) {
                     s.show_github_copilot,
                     s.show_vercel_ai_gateway,
                     s.github_copilot_plan,
-                    #[cfg(feature = "muse-local-experimental")]
                     s.show_muse,
                 )
             })
@@ -6352,7 +6373,6 @@ fn do_poll(send_hwnd: SendHwnd) {
                 false,
                 false,
                 poller::GithubCopilotPlan::Unknown,
-                #[cfg(feature = "muse-local-experimental")]
                 false,
             ))
     };
@@ -7728,6 +7748,32 @@ unsafe extern "system" fn wnd_proc(
                     // Reset the poll timer with the new interval
                     SetTimer(hwnd, TIMER_POLL, new_interval, None);
                 }
+                #[cfg(feature = "muse-local-experimental")]
+                IDM_MODEL_MUSE => {
+                    {
+                        let mut state = lock_state();
+                        if let Some(s) = state.as_mut() {
+                            if s.show_claude_code || s.show_codex || s.show_antigravity
+                                || s.show_github_copilot || s.show_vercel_ai_gateway
+                                || !s.show_muse
+                            {
+                                s.show_muse = !s.show_muse;
+                            }
+                            s.muse_weekly_state = if s.show_muse {
+                                CellState::Loading
+                            } else {
+                                CellState::Disabled
+                            };
+                            s.muse_weekly_section = None;
+                            refresh_usage_texts(s);
+                        }
+                    }
+                    save_state_settings();
+                    position_at_taskbar();
+                    render_layered();
+                    let sh = SendHwnd::from_hwnd(hwnd);
+                    std::thread::spawn(move || do_poll(sh));
+                }
                 IDM_MODEL_CLAUDE_CODE
                 | IDM_MODEL_CODEX
                 | IDM_MODEL_GITHUB_COPILOT
@@ -7949,6 +7995,7 @@ fn show_context_menu(hwnd: HWND) {
             show_antigravity,
             show_github_copilot,
             show_vercel_ai_gateway,
+            show_muse,
             github_copilot_plan,
             display_basis,
             reset_display_mode,
@@ -7972,6 +8019,7 @@ fn show_context_menu(hwnd: HWND) {
                     s.show_antigravity,
                     s.show_github_copilot,
                     s.show_vercel_ai_gateway,
+                    s.show_muse,
                     s.github_copilot_plan,
                     s.display_basis,
                     s.reset_display_mode,
@@ -7989,6 +8037,7 @@ fn show_context_menu(hwnd: HWND) {
                     true,
                     false,
                     true,
+                    false,
                     false,
                     false,
                     false,
@@ -8229,6 +8278,14 @@ fn show_context_menu(hwnd: HWND) {
             IDM_MODEL_VERCEL_AI_GATEWAY as usize,
             PCWSTR::from_raw(vercel_ai_gateway_model.as_ptr()),
         );
+
+        #[cfg(feature = "muse-local-experimental")]
+        {
+            let muse_label = native_interop::wide_str("Muse (personal experimental)");
+            let muse_flags = if show_muse { MF_CHECKED } else { MENU_ITEM_FLAGS(0) };
+            let _ = AppendMenuW(displayed_ai_menu, muse_flags,
+                IDM_MODEL_MUSE as usize, PCWSTR::from_raw(muse_label.as_ptr()));
+        }
 
         let displayed_ai_label = native_interop::wide_str(strings.displayed_ai);
         let _ = AppendMenuW(
@@ -14985,6 +15042,7 @@ mod tests {
                 show_antigravity: provider_mask & 0b00100 != 0,
                 show_github_copilot: provider_mask & 0b01000 != 0,
                 show_vercel_ai_gateway: provider_mask & 0b10000 != 0,
+                show_muse: false,
             };
             let expected_weekly =
                 providers.show_claude_code || providers.show_codex || providers.show_antigravity;
