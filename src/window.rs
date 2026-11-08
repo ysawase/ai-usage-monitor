@@ -7865,6 +7865,7 @@ unsafe extern "system" fn wnd_proc(
                                         || s.show_antigravity
                                         || s.show_github_copilot
                                         || s.show_vercel_ai_gateway
+                                        || s.show_muse
                                         || !s.show_claude_code
                                     {
                                         s.show_claude_code = !s.show_claude_code;
@@ -7875,6 +7876,7 @@ unsafe extern "system" fn wnd_proc(
                                         || s.show_antigravity
                                         || s.show_github_copilot
                                         || s.show_vercel_ai_gateway
+                                        || s.show_muse
                                         || !s.show_codex
                                     {
                                         s.show_codex = !s.show_codex;
@@ -7885,6 +7887,7 @@ unsafe extern "system" fn wnd_proc(
                                         || s.show_codex
                                         || s.show_antigravity
                                         || s.show_github_copilot
+                                        || s.show_muse
                                         || !s.show_vercel_ai_gateway
                                     {
                                         s.show_vercel_ai_gateway = !s.show_vercel_ai_gateway;
@@ -7895,6 +7898,7 @@ unsafe extern "system" fn wnd_proc(
                                         || s.show_codex
                                         || s.show_antigravity
                                         || s.show_vercel_ai_gateway
+                                        || s.show_muse
                                         || !s.show_github_copilot
                                     {
                                         s.show_github_copilot = !s.show_github_copilot;
@@ -7914,6 +7918,11 @@ unsafe extern "system" fn wnd_proc(
                             s.antigravity_weekly_state = CellState::Loading;
                             s.github_copilot_state = CellState::Loading;
                             s.vercel_ai_gateway_state = CellState::Loading;
+                            s.muse_weekly_state = if s.show_muse {
+                                CellState::Loading
+                            } else {
+                                CellState::Disabled
+                            };
                             refresh_usage_texts(s);
                         }
                     }
@@ -7935,6 +7944,7 @@ unsafe extern "system" fn wnd_proc(
                                 || s.show_codex
                                 || s.show_github_copilot
                                 || s.show_vercel_ai_gateway
+                                || s.show_muse
                                 || !s.show_antigravity
                             {
                                 s.show_antigravity = !s.show_antigravity;
@@ -7947,6 +7957,11 @@ unsafe extern "system" fn wnd_proc(
                             s.antigravity_weekly_state = CellState::Loading;
                             s.github_copilot_state = CellState::Loading;
                             s.vercel_ai_gateway_state = CellState::Loading;
+                            s.muse_weekly_state = if s.show_muse {
+                                CellState::Loading
+                            } else {
+                                CellState::Disabled
+                            };
                             refresh_usage_texts(s);
                         }
                     }
