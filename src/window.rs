@@ -5436,11 +5436,14 @@ fn render_layered() {
         github_copilot_text,
         vercel_ai_gateway_percent,
         vercel_ai_gateway_text,
+        muse_weekly_pct,
+        muse_weekly_text,
         show_claude_code,
         show_codex,
         show_antigravity,
         show_github_copilot,
         show_vercel_ai_gateway,
+        show_muse,
         height,
         hovered_auth_cta_rect,
     ) = {
@@ -5485,11 +5488,14 @@ fn render_layered() {
                 s.github_copilot_text.clone(),
                 s.vercel_ai_gateway_percent,
                 s.vercel_ai_gateway_text.clone(),
+                s.muse_weekly_percent,
+                s.muse_weekly_text.clone(),
                 s.show_claude_code,
                 s.show_codex,
                 s.show_antigravity,
                 s.show_github_copilot,
                 s.show_vercel_ai_gateway,
+                s.show_muse,
                 widget_height_for_state(s),
                 s.hovered_auth_cta_rect,
             ),
@@ -5607,11 +5613,14 @@ fn render_layered() {
             &github_copilot_text,
             vercel_ai_gateway_percent,
             &vercel_ai_gateway_text,
+            muse_weekly_pct,
+            &muse_weekly_text,
             show_claude_code,
             show_codex,
             show_antigravity,
             show_github_copilot,
             show_vercel_ai_gateway,
+            show_muse,
             &codex_accent,
             &antigravity_accent,
             popup_layout,
@@ -5720,11 +5729,14 @@ fn paint_content(
     github_copilot_text: &str,
     vercel_ai_gateway_percent: Option<f64>,
     vercel_ai_gateway_text: &str,
+    muse_weekly_pct: Option<f64>,
+    muse_weekly_text: &str,
     show_claude_code: bool,
     show_codex: bool,
     show_antigravity: bool,
     show_github_copilot: bool,
     show_vercel_ai_gateway: bool,
+    show_muse: bool,
     codex_accent: &Color,
     antigravity_accent: &Color,
     popup_layout: PopupLayout,
@@ -5915,6 +5927,7 @@ fn paint_content(
             show_antigravity,
             show_github_copilot,
             show_vercel_ai_gateway,
+            show_muse,
             popup_layout == PopupLayout::Compact,
             weekly_remaining_text,
             codex_weekly_remaining_text,
@@ -5940,6 +5953,7 @@ fn paint_content(
 
         let github_copilot_accent = github_copilot_accent_color();
         let vercel_ai_gateway_accent = vercel_ai_gateway_accent_color();
+        let muse_accent = muse_accent_color();
         let mut weekly_cells = Vec::new();
         if show_claude_code {
             weekly_cells.push(RowCell {
@@ -5992,6 +6006,14 @@ fn paint_content(
             });
         }
 
+        if show_muse {
+            weekly_cells.push(RowCell {
+                percent: muse_weekly_pct, text: muse_weekly_text,
+                accent: &muse_accent, provider_text_color: muse_accent,
+                is_warning: false, auth_action: None,
+            });
+        }
+
         if let Some(weekly_row_y) = layout.weekly_row_y {
             draw_row(
                 hdc,
@@ -6028,15 +6050,17 @@ fn paint_content(
                     show_antigravity,
                     show_github_copilot,
                     show_vercel_ai_gateway,
+                    show_muse,
                 );
             let pace_column_width = provider_column_width_for_client(
                 width,
-                active_family_count_with_vercel(
+                active_family_count_with_muse(
                     show_claude_code,
                     show_codex,
                     show_antigravity,
                     show_github_copilot,
                     show_vercel_ai_gateway,
+                    show_muse,
                 ),
             );
 
@@ -6134,6 +6158,13 @@ fn paint_content(
                     auth_action: None,
                 });
             }
+            if show_muse {
+                session_cells.push(RowCell {
+                    percent: None, text: strings.not_available,
+                    accent: &muse_accent, provider_text_color: muse_accent,
+                    is_warning: false, auth_action: None,
+                });
+            }
             draw_row(
                 hdc,
                 width,
@@ -6200,6 +6231,13 @@ fn paint_content(
                     provider_text_color: vercel_ai_gateway_accent,
                     is_warning: false,
                     auth_action: None,
+                });
+            }
+            if show_muse {
+                monthly_cells.push(RowCell {
+                    percent: None, text: strings.not_available,
+                    accent: &muse_accent, provider_text_color: muse_accent,
+                    is_warning: false, auth_action: None,
                 });
             }
             draw_row(
@@ -6306,12 +6344,13 @@ fn paint_content(
         // already leave between columns, so it never overlaps a column's
         // text or bar.
         if show_column_dividers {
-            let active_families = active_family_count_with_vercel(
+            let active_families = active_family_count_with_muse(
                 show_claude_code,
                 show_codex,
                 show_antigravity,
                 show_github_copilot,
                 show_vercel_ai_gateway,
+                show_muse,
             );
             let divider_column_width = provider_column_width_for_client(width, active_families);
             let column_divider_w = sc(1).max(1);
@@ -8967,11 +9006,14 @@ fn paint(hdc: HDC, hwnd: HWND) {
         github_copilot_text,
         vercel_ai_gateway_percent,
         vercel_ai_gateway_text,
+        muse_weekly_pct,
+        muse_weekly_text,
         show_claude_code,
         show_codex,
         show_antigravity,
         show_github_copilot,
         show_vercel_ai_gateway,
+        show_muse,
         hovered_auth_cta_rect,
     ) = {
         let state = lock_state();
@@ -9013,11 +9055,14 @@ fn paint(hdc: HDC, hwnd: HWND) {
                 s.github_copilot_text.clone(),
                 s.vercel_ai_gateway_percent,
                 s.vercel_ai_gateway_text.clone(),
+                s.muse_weekly_percent,
+                s.muse_weekly_text.clone(),
                 s.show_claude_code,
                 s.show_codex,
                 s.show_antigravity,
                 s.show_github_copilot,
                 s.show_vercel_ai_gateway,
+                s.show_muse,
                 s.hovered_auth_cta_rect,
             ),
             None => return,
@@ -9094,11 +9139,14 @@ fn paint(hdc: HDC, hwnd: HWND) {
             &github_copilot_text,
             vercel_ai_gateway_percent,
             &vercel_ai_gateway_text,
+            muse_weekly_pct,
+            &muse_weekly_text,
             show_claude_code,
             show_codex,
             show_antigravity,
             show_github_copilot,
             show_vercel_ai_gateway,
+            show_muse,
             &codex_accent,
             &antigravity_accent,
             popup_layout,
@@ -9144,18 +9192,20 @@ fn draw_provider_header_row(
     show_antigravity: bool,
     show_github_copilot: bool,
     show_vercel_ai_gateway: bool,
+    show_muse: bool,
     show_weekly_remaining: bool,
     claude_weekly_remaining: Option<&str>,
     codex_weekly_remaining: Option<&str>,
     antigravity_weekly_remaining: Option<&str>,
     codex_banked_reset_text: &str,
 ) {
-    let active_models = active_family_count_with_vercel(
+    let active_models = active_family_count_with_muse(
         show_claude_code,
         show_codex,
         show_antigravity,
         show_github_copilot,
         show_vercel_ai_gateway,
+        show_muse,
     );
     let column_width = provider_column_width_for_client(client_width, active_models);
     let dpi = CURRENT_DPI.load(Ordering::Relaxed);
@@ -9239,15 +9289,21 @@ fn draw_provider_header_row(
                 column_width,
                 client_width,
                 dpi,
-                !show_vercel_ai_gateway,
+                !show_vercel_ai_gateway && !show_muse,
             );
             draw_header_label(hdc, model_x, y, header_width, "GitHub Copilot");
             model_x += column_width + sc(MODEL_RIGHT_MARGIN);
         }
         if show_vercel_ai_gateway {
             let header_width =
-                header_column_width_avoiding_help(model_x, column_width, client_width, dpi, true);
+                header_column_width_avoiding_help(model_x, column_width, client_width, dpi, !show_muse);
             draw_header_label(hdc, model_x, y, header_width, "Vercel AI Gateway");
+            if show_muse { model_x += column_width + sc(MODEL_RIGHT_MARGIN); }
+        }
+        if show_muse {
+            let muse_width = header_column_width_avoiding_help(
+                model_x, column_width, client_width, dpi, true);
+            draw_header_label(hdc, model_x, y, muse_width, "Muse");
         }
     }
 }
@@ -9381,6 +9437,7 @@ fn provider_column_x_positions(
         show_antigravity,
         show_github_copilot,
         false,
+        false,
     )
 }
 
@@ -9392,13 +9449,15 @@ fn provider_column_x_positions_with_vercel(
     show_antigravity: bool,
     show_github_copilot: bool,
     show_vercel_ai_gateway: bool,
+    show_muse: bool,
 ) -> (i32, i32, i32) {
-    let active_families = active_family_count_with_vercel(
+    let active_families = active_family_count_with_muse(
         show_claude_code,
         show_codex,
         show_antigravity,
         show_github_copilot,
         show_vercel_ai_gateway,
+        show_muse,
     );
     let column_width = provider_column_width_for_client(client_width, active_families);
 
