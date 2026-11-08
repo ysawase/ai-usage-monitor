@@ -6439,7 +6439,7 @@ fn paint_content(
         let _ = DeleteObject(help_border_brush);
         let _ = SetTextColor(hdc, COLORREF(heading_text.to_colorref()));
         let mut help_text_rect = help_rect;
-        let mut help_text = native_interop::wide_str("↻");
+        let mut help_text = native_interop::wide_str(if connection_attention_now() { "!" } else { "↻" });
         let _ = DrawTextW(
             hdc,
             &mut help_text,
