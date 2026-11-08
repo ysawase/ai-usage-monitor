@@ -4624,9 +4624,10 @@ const MAX_WIDGET_WIDTH_LOGICAL: i32 = 1200;
 const RESIZE_EDGE_LOGICAL: i32 = 6;
 // Preserve one-click refresh while making the control genuinely usable.
 // Reserve the upper-right corner for a full-size one-click refresh control.
-// The 24px control extends 3px into the row below the 21px header budget;
-// its right-edge location is kept clear of the last provider header.
+// 24px width improves the target while 21px height fits the header exactly;
+// do not let the control overlap quota data rows below.
 const HELP_BUTTON_SIZE_LOGICAL: i32 = 24;
+const HELP_BUTTON_HEIGHT_LOGICAL: i32 = 21;
 const HELP_BUTTON_TOP_LOGICAL: i32 = 0;
 const HELP_BUTTON_RIGHT_MARGIN_LOGICAL: i32 = 4;
 const HELP_BUTTON_CONTENT_GAP_LOGICAL: i32 = 4;
@@ -5187,7 +5188,7 @@ fn help_button_rect_for_client_width(client_width: i32, dpi: u32) -> RECT {
         left,
         top,
         right,
-        bottom: top + size,
+        bottom: top + scaled_for_dpi(HELP_BUTTON_HEIGHT_LOGICAL, dpi),
     }
 }
 
@@ -6576,10 +6577,10 @@ fn paint_content(
         FrameRect(hdc, &help_rect, help_border_brush);
         let _ = DeleteObject(help_border_brush);
         let _ = SetTextColor(hdc, COLORREF(heading_text.to_colorref()));
-        // Keep provider labels at 12px; a 21px font makes the refresh symbol
-        // readable in its 24px corner control.
+        // Keep provider labels at 12px; a 20px font makes the refresh symbol
+        // readable in its 24x21px corner control.
         let control_font = CreateFontW(
-            sc(-21),
+            sc(-20),
             0,
             0,
             0,
@@ -11885,9 +11886,9 @@ mod tests {
             let width = scaled_for_dpi(600, dpi);
             let rect = help_button_rect_for_client_width(width, dpi);
             assert_eq!(rect.right - rect.left, scaled_for_dpi(24, dpi));
-            assert_eq!(rect.bottom - rect.top, scaled_for_dpi(24, dpi));
+            assert_eq!(rect.bottom - rect.top, scaled_for_dpi(21, dpi));
             assert_eq!(rect.top, 0);
-            assert!(rect.bottom <= scaled_for_dpi(3 + HEADER_ROW_H + 4 + SEGMENT_H, dpi));
+            assert!(rect.bottom <= scaled_for_dpi(3 + HEADER_ROW_H + 4, dpi));
             let x = (rect.left + rect.right) / 2;
             let y = (rect.top + rect.bottom) / 2;
             assert_eq!(
