@@ -6458,12 +6458,15 @@ fn do_poll(send_hwnd: SendHwnd) {
     // Manual Refresh and TIMER_POLL both enter do_poll. The helper's own
     // timer is disabled in --muse-local-bridge mode; no second scheduler.
     #[cfg(feature = "muse-local-experimental")]
+    let mut muse_succeeded = false;
+    #[cfg(feature = "muse-local-experimental")]
     if show_muse {
         let fetched = crate::muse_local::read();
         let mut state = lock_state();
         if let Some(s) = state.as_mut() {
             match fetched {
                 Ok(reading) => {
+                    muse_succeeded = true;
                     s.muse_weekly_section = Some(UsageSection {
                         percentage: reading.used_percent,
                         resets_at: reading.resets_at_epoch_seconds.and_then(|seconds| {
@@ -6485,7 +6488,18 @@ fn do_poll(send_hwnd: SendHwnd) {
         }
     }
 
-    match report.clone().into_app_usage_data() {
+    #[cfg(feature = "muse-local-experimental")]
+    let report_result = report.clone().into_app_usage_data().or_else(|error| {
+        if show_muse && muse_succeeded {
+            Ok(AppUsageData::default())
+        } else {
+            Err(error)
+        }
+    });
+    #[cfg(not(feature = "muse-local-experimental"))]
+    let report_result = report.clone().into_app_usage_data();
+
+    match report_result {
         Ok(data) => {
             persist_poll_snapshot(&report);
 
