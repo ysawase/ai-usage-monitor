@@ -110,3 +110,8 @@ A successful 15-minute repeat in the same opt-in session requires both
 retroactively generate this receipt. The deterministic synthetic CLI test
 `--refresh-health-self-test` verifies atomic writes, stop/error,
 two successes, session count reset, and exclusion of secret/quota terms.
+
+
+## Personal-local Muse refresh bridge (opt-in, experimental)
+
+Run the helper with `--muse-local-bridge`, sign into its dedicated WebView2 and click `Museローカル連携を有効にする`. This disables its own 15-minute timer. Only the main monitor's existing Refresh/menu timer will request one update via same-user Windows named pipe `SolidailyMuseQuotaLocalV1`. The protocol is ASCII `READ` plus newline, replying bounded JSON with `schema_version`, `status`, `used_percent`, and `resets_at_epoch_seconds` only. The helper owns its browser credential; the Rust monitor never reads the cookie. CI tests only synthetic local IPC; product Rust client and full UI remain separate validation tasks. No Store/public distribution.

@@ -103,6 +103,17 @@ jobs:
           } finally {
             if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }
           }
+      - name: Verify same-user Muse IPC bridge with synthetic data only
+        shell: pwsh
+        run: |
+          $exe = (Resolve-Path 'artifacts/muse-login-shell-win-x64/MuseLoginShellPoc.exe').Path
+          $p = Start-Process -FilePath $exe -ArgumentList '--muse-bridge-self-test' -PassThru
+          try {
+            if (-not $p.WaitForExit(20000)) { throw 'Muse local bridge test timed out' }
+            if ($p.ExitCode -ne 0) { throw "Muse local bridge test failed: $($p.ExitCode)" }
+          } finally {
+            if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }
+          }
       - name: Upload short-lived test artifact
         uses: actions/upload-artifact@v4
         with:

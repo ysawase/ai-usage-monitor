@@ -14,6 +14,11 @@ internal static class Program
     {
         try
         {
+            if (args.Contains("--muse-bridge-self-test", StringComparer.Ordinal))
+            {
+                Environment.ExitCode = MuseLocalPipeBridgeSelfTest.RunAsync().GetAwaiter().GetResult() ? 0 : 1;
+                return;
+            }
             if (args.Contains("--refresh-health-self-test", StringComparer.Ordinal))
             {
                 Environment.ExitCode = MuseRefreshHealthSelfTest.Run() ? 0 : 1;
@@ -49,7 +54,7 @@ internal static class Program
             Record("Process entered managed Main");
             ApplicationConfiguration.Initialize();
             Record("Windows Forms initialized");
-            using var window = new LoginWindow();
+            using var window = new LoginWindow(bridgeMode: args.Contains("--muse-local-bridge", StringComparer.Ordinal));
             Record("Window constructed");
             window.Shown += (_, _) => Record("Window shown");
             Application.Run(window);

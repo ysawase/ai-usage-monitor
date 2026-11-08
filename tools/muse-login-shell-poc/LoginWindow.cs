@@ -36,14 +36,19 @@ internal sealed class LoginWindow : Form
     { Interval = 15 * 60 * 1000 };
     private readonly MuseAutomaticQuotaReader autoReader = new();
     private readonly MuseRefreshHealth refreshHealth = new();
+    private readonly bool bridgeMode;
+    private MuseLocalPipeBridge? localBridge;
     private CancellationTokenSource? autoCancellation;
     private bool autoEnabled;
     private bool autoInProgress;
     private bool resetting;
 
-    internal LoginWindow()
+    internal LoginWindow(bool bridgeMode = false)
     {
-        Text = "Muse ログイン検証（連携未完成）";
+        this.bridgeMode = bridgeMode;
+        if (bridgeMode) autoToggle.Text = "Museローカル連携を有効にする";
+        Text = bridgeMode ? "Museローカル連携検証（個人用）"
+            : "Muse ログイン検証（連携未完成）";
         Width = 950;
         Height = 720;
         MinimumSize = new Size(550, 400);
@@ -75,10 +80,11 @@ internal sealed class LoginWindow : Form
             if (autoEnabled) StopAutomaticRefresh();
             else StartAutomaticRefresh();
         };
-        autoTimer.Tick += async (_, _) => await RefreshAutomaticallyAsync();
+        autoTimer.Tick += async (_, _) => { if (!bridgeMode) await RefreshAutomaticallyAsync(); };
         FormClosed += (_, _) =>
         {
             StopAutomaticRefresh(updateStatus: false);
+            localBridge?.Dispose();
             autoReader.Dispose();
         };
         captureTimer.Tick += (_, _) => {
@@ -343,9 +349,19 @@ internal sealed class LoginWindow : Form
         autoEnabled = true;
         refreshHealth.Start(DateTimeOffset.UtcNow);
         autoCancellation = new CancellationTokenSource();
-        autoToggle.Text = "Muse自動更新を停止";
-        autoTimer.Start();
-        _ = RefreshAutomaticallyAsync();
+        autoToggle.Text = bridgeMode ? "Museローカル連携を停止" : "Muse自動更新を停止";
+        if (bridgeMode)
+        {
+            // Only the main monitor drives refreshes. No independent timer.
+            localBridge = new MuseLocalPipeBridge(PollFromMonitorAsync);
+            localBridge.Start();
+            status.Text = "ローカル連携が有効です。更新はモニターから行います。";
+        }
+        else
+        {
+            autoTimer.Start();
+            _ = RefreshAutomaticallyAsync();
+        }
     }
 
     private void StopAutomaticRefresh(bool updateStatus = true)
@@ -353,12 +369,16 @@ internal sealed class LoginWindow : Form
         refreshHealth.Stop(DateTimeOffset.UtcNow);
         autoEnabled = false;
         autoTimer.Stop();
+        localBridge?.Dispose();
+        localBridge = null;
         autoCancellation?.Cancel();
         autoCancellation?.Dispose();
         autoCancellation = null;
         if (!IsDisposed)
         {
-            autoToggle.Text = "Muse自動更新を開始（15分間隔）";
+            autoToggle.Text = bridgeMode
+                ? "Museローカル連携を有効にする"
+                : "Muse自動更新を開始（15分間隔）";
             autoToggle.Enabled = !resetting && browser.CoreWebView2 is not null;
             if (updateStatus)
                 status.Text = "Muse自動更新を停止しました。";
@@ -442,6 +462,94 @@ internal sealed class LoginWindow : Form
             refreshHealth.Failure(DateTimeOffset.UtcNow, "UnknownFailure");
             if (autoEnabled && !IsDisposed)
                 status.Text = "Museの自動取得に失敗しました。値は更新していません。";
+        }
+        finally
+        {
+            autoInProgress = false;
+        }
+    }
+
+    // Named pipe worker must marshal WebView2 CookieManager onto the STA.
+    private Task<MuseAutomaticResult> PollFromMonitorAsync(CancellationToken ct)
+    {
+        var tcs = new TaskCompletionSource<MuseAutomaticResult>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        if (IsDisposed || !IsHandleCreated)
+        {
+            tcs.TrySetResult(new(MuseAutomaticStatus.NoSession));
+            return tcs.Task;
+        }
+        try
+        {
+            BeginInvoke(new Action(async () =>
+            {
+                try { tcs.TrySetResult(await PollOnUiThreadAsync(ct)); }
+                catch (Exception)
+                {
+                    tcs.TrySetResult(new(MuseAutomaticStatus.InvalidResponse));
+                }
+            }));
+        }
+        catch (InvalidOperationException)
+        {
+            tcs.TrySetResult(new(MuseAutomaticStatus.NoSession));
+        }
+        return tcs.Task.WaitAsync(ct);
+    }
+
+    private async Task<MuseAutomaticResult> PollOnUiThreadAsync(CancellationToken ct)
+    {
+        if (!bridgeMode || !autoEnabled || resetting || autoInProgress
+            || browser.CoreWebView2 is null || ct.IsCancellationRequested)
+            return new(MuseAutomaticStatus.InvalidResponse);
+        autoInProgress = true;
+        refreshHealth.Attempt(DateTimeOffset.UtcNow);
+        try
+        {
+            // Only this app's dedicated WebView2 profile is queried; never
+            // access other browser profiles, and never send cookies over IPC.
+            var cookies = await browser.CoreWebView2.CookieManager
+                .GetCookiesAsync("https://muse.ai/");
+            string header = string.Join("; ", cookies
+                .Where(c => c.IsSecure
+                    && (c.Domain.Equals("muse.ai", StringComparison.OrdinalIgnoreCase)
+                        || c.Domain.Equals(".muse.ai", StringComparison.OrdinalIgnoreCase))
+                    && c.Name.Length is > 0 and <= 128
+                    && c.Name.All(ch => char.IsAsciiLetterOrDigit(ch)
+                        || ch == '_' || ch == '-' || ch == '.')
+                    && !c.Value.Any(ch => ch is '\r' or '\n' or '\0'))
+                .Take(40)
+                .Select(c => c.Name + "=" + c.Value));
+            if (header.Length is 0 or > 8192)
+            {
+                refreshHealth.Failure(DateTimeOffset.UtcNow, "NoSession");
+                status.Text = "Museに再ログインしてください。";
+                return new(MuseAutomaticStatus.NoSession);
+            }
+            var result = await autoReader.ReadAsync(
+                header, browser.CoreWebView2.Settings.UserAgent, ct);
+            if (ct.IsCancellationRequested || !autoEnabled || IsDisposed)
+                return new(MuseAutomaticStatus.TimedOut);
+            if (result.Status == MuseAutomaticStatus.Success)
+            {
+                refreshHealth.Success(DateTimeOffset.UtcNow);
+                status.Text = "Museの利用枠をモニターへ応答しました。";
+            }
+            else
+            {
+                refreshHealth.Failure(DateTimeOffset.UtcNow, result.Status.ToString());
+                status.Text = "Muse連携：" + result.Status + "（更新されませんでした）。";
+            }
+            return result;
+        }
+        catch (OperationCanceledException)
+        {
+            return new(MuseAutomaticStatus.TimedOut);
+        }
+        catch (Exception)
+        {
+            refreshHealth.Failure(DateTimeOffset.UtcNow, "UnknownFailure");
+            return new(MuseAutomaticStatus.InvalidResponse);
         }
         finally
         {
