@@ -4687,10 +4687,13 @@ fn active_family_count_with_muse(
     show_vercel_ai_gateway: bool,
     show_muse: bool,
 ) -> i32 {
-    (active_family_count_with_vercel(
-        show_claude_code, show_codex, show_antigravity,
-        show_github_copilot, show_vercel_ai_gateway,
-    ) + show_muse as i32).max(1)
+    (show_claude_code as i32
+        + show_codex as i32
+        + show_antigravity as i32
+        + show_github_copilot as i32
+        + show_vercel_ai_gateway as i32
+        + show_muse as i32)
+        .max(1)
 }
 
 fn scaled_for_dpi(px: i32, dpi: u32) -> i32 {
