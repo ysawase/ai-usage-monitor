@@ -3747,18 +3747,60 @@ fn connection_menu_item(
             | CellState::CredentialsUnavailable
     );
     let (status, command) = if is_auth && family == QuotaFamilyId::Claude {
-        (if japanese { "再接続する" } else { "Reconnect" }, Some(IDM_CONNECT_CLAUDE))
+        (
+            if japanese {
+                "再接続する"
+            } else {
+                "Reconnect"
+            },
+            Some(IDM_CONNECT_CLAUDE),
+        )
     } else if is_auth && family == QuotaFamilyId::Codex {
-        (if japanese { "再接続する" } else { "Reconnect" }, Some(IDM_CONNECT_CODEX))
+        (
+            if japanese {
+                "再接続する"
+            } else {
+                "Reconnect"
+            },
+            Some(IDM_CONNECT_CODEX),
+        )
     } else if is_connection_issue_state(state) {
-        (if japanese { "取得できません → 再取得" } else { "Unavailable → Retry" }, Some(1))
+        (
+            if japanese {
+                "取得できません → 再取得"
+            } else {
+                "Unavailable → Retry"
+            },
+            Some(1),
+        )
     } else {
         match state {
-            CellState::Ok => (if japanese { "取得成功" } else { "Connected" }, None),
+            CellState::Ok => (
+                if japanese {
+                    "取得成功"
+                } else {
+                    "Connected"
+                },
+                None,
+            ),
             CellState::Loading => (if japanese { "取得中" } else { "Checking" }, None),
-            CellState::NotAvailable => (if japanese { "利用枠データなし" } else { "No quota data" }, None),
+            CellState::NotAvailable => (
+                if japanese {
+                    "利用枠データなし"
+                } else {
+                    "No quota data"
+                },
+                None,
+            ),
             CellState::Disabled => (if japanese { "無効" } else { "Disabled" }, None),
-            _ => (if japanese { "状態未確認" } else { "Unknown" }, None),
+            _ => (
+                if japanese {
+                    "状態未確認"
+                } else {
+                    "Unknown"
+                },
+                None,
+            ),
         }
     };
     (format!("{name}{window_text}: {status}"), command)
@@ -3768,19 +3810,44 @@ fn enabled_connection_menu_states(
     s: &AppState,
 ) -> Vec<(QuotaFamilyId, CellState, Option<DiagnosisWindow>)> {
     let session_visible = session_row_currently_visible(s);
-    let claude = diagnosis_window_state_with_source(s.weekly_state, s.session_state, session_visible);
-    let codex = diagnosis_window_state_with_source(s.codex_weekly_state, s.codex_session_state, session_visible);
+    let claude =
+        diagnosis_window_state_with_source(s.weekly_state, s.session_state, session_visible);
+    let codex = diagnosis_window_state_with_source(
+        s.codex_weekly_state,
+        s.codex_session_state,
+        session_visible,
+    );
     let antigravity = diagnosis_window_state_with_source(
         s.antigravity_weekly_state,
         s.antigravity_session_state,
         session_visible,
     );
     enabled_provider_diagnosis_rows(&[
-        (s.show_claude_code, QuotaFamilyId::Claude, claude.0, Some(claude.1)),
+        (
+            s.show_claude_code,
+            QuotaFamilyId::Claude,
+            claude.0,
+            Some(claude.1),
+        ),
         (s.show_codex, QuotaFamilyId::Codex, codex.0, Some(codex.1)),
-        (s.show_antigravity, QuotaFamilyId::Antigravity, antigravity.0, Some(antigravity.1)),
-        (s.show_github_copilot, QuotaFamilyId::GithubCopilot, s.github_copilot_state, None),
-        (s.show_vercel_ai_gateway, QuotaFamilyId::VercelAiGateway, s.vercel_ai_gateway_state, None),
+        (
+            s.show_antigravity,
+            QuotaFamilyId::Antigravity,
+            antigravity.0,
+            Some(antigravity.1),
+        ),
+        (
+            s.show_github_copilot,
+            QuotaFamilyId::GithubCopilot,
+            s.github_copilot_state,
+            None,
+        ),
+        (
+            s.show_vercel_ai_gateway,
+            QuotaFamilyId::VercelAiGateway,
+            s.vercel_ai_gateway_state,
+            None,
+        ),
     ])
 }
 
@@ -8685,16 +8752,38 @@ fn show_context_menu(hwnd: HWND) {
             let label_wide = native_interop::wide_str(&label);
             let _ = AppendMenuW(
                 connection_menu,
-                if command.is_some() { MENU_ITEM_FLAGS(0) } else { MF_GRAYED },
+                if command.is_some() {
+                    MENU_ITEM_FLAGS(0)
+                } else {
+                    MF_GRAYED
+                },
                 command.unwrap_or(0) as usize,
                 PCWSTR::from_raw(label_wide.as_ptr()),
             );
         }
         let _ = AppendMenuW(connection_menu, MF_SEPARATOR, 0, PCWSTR::null());
-        let retry_label = native_interop::wide_str(if ja { "すべて再取得" } else { "Refresh all" });
-        let _ = AppendMenuW(connection_menu, MENU_ITEM_FLAGS(0), 1, PCWSTR::from_raw(retry_label.as_ptr()));
-        let connection_title = native_interop::wide_str(if ja { "接続状態・再接続" } else { "Connections & recovery" });
-        let _ = AppendMenuW(menu, MF_POPUP, connection_menu.0 as usize, PCWSTR::from_raw(connection_title.as_ptr()));
+        let retry_label = native_interop::wide_str(if ja {
+            "すべて再取得"
+        } else {
+            "Refresh all"
+        });
+        let _ = AppendMenuW(
+            connection_menu,
+            MENU_ITEM_FLAGS(0),
+            1,
+            PCWSTR::from_raw(retry_label.as_ptr()),
+        );
+        let connection_title = native_interop::wide_str(if ja {
+            "接続状態・再接続"
+        } else {
+            "Connections & recovery"
+        });
+        let _ = AppendMenuW(
+            menu,
+            MF_POPUP,
+            connection_menu.0 as usize,
+            PCWSTR::from_raw(connection_title.as_ptr()),
+        );
 
         let reset_pos_str = native_interop::wide_str(strings.reset_position);
         let _ = AppendMenuW(
@@ -13808,31 +13897,42 @@ mod tests {
     #[test]
     fn connection_menu_actions_are_not_guessed_from_generic_errors() {
         let (ok, command) = connection_menu_item(
-            QuotaFamilyId::Claude, CellState::Ok, Some(DiagnosisWindow::Weekly), true
+            QuotaFamilyId::Claude,
+            CellState::Ok,
+            Some(DiagnosisWindow::Weekly),
+            true,
         );
         assert!(ok.contains("取得成功"));
         assert_eq!(command, None);
 
         let (auth, command) = connection_menu_item(
-            QuotaFamilyId::Claude, CellState::AuthenticationExpired, Some(DiagnosisWindow::Session), true
+            QuotaFamilyId::Claude,
+            CellState::AuthenticationExpired,
+            Some(DiagnosisWindow::Session),
+            true,
         );
         assert!(auth.contains("5時間"));
         assert_eq!(command, Some(IDM_CONNECT_CLAUDE));
 
         let (_, command) = connection_menu_item(
-            QuotaFamilyId::Codex, CellState::AuthenticationProblem, Some(DiagnosisWindow::Weekly), false
+            QuotaFamilyId::Codex,
+            CellState::AuthenticationProblem,
+            Some(DiagnosisWindow::Weekly),
+            false,
         );
         assert_eq!(command, Some(IDM_CONNECT_CODEX));
 
         let (retry, command) = connection_menu_item(
-            QuotaFamilyId::GithubCopilot, CellState::FetchFailed, None, true
+            QuotaFamilyId::GithubCopilot,
+            CellState::FetchFailed,
+            None,
+            true,
         );
         assert!(retry.contains("再取得"));
         assert_eq!(command, Some(1));
 
-        let (_, command) = connection_menu_item(
-            QuotaFamilyId::Claude, CellState::FetchFailed, None, true
-        );
+        let (_, command) =
+            connection_menu_item(QuotaFamilyId::Claude, CellState::FetchFailed, None, true);
         assert_eq!(command, Some(1));
     }
 
