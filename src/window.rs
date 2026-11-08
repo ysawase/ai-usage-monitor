@@ -143,11 +143,17 @@ impl AuthAction {
         if self == Self::ClaudeLogin {
             let is_japanese = {
                 let state = lock_state();
-                state.as_ref().is_some_and(|s| s.language == LanguageId::Japanese)
+                state
+                    .as_ref()
+                    .is_some_and(|s| s.language == LanguageId::Japanese)
             };
             show_info_message(
                 hwnd,
-                if is_japanese { "Claudeの再認証" } else { "Reconnect Claude" },
+                if is_japanese {
+                    "Claudeの再認証"
+                } else {
+                    "Reconnect Claude"
+                },
                 claude_login_steps(is_japanese),
             );
         }
@@ -10402,7 +10408,6 @@ mod tests {
         assert!(!command.contains("Copy-Item"));
         assert!(!command.contains("ExecutionPolicy"));
     }
-
 
     #[test]
     fn claude_login_guidance_explains_invisible_paste_and_enter() {
