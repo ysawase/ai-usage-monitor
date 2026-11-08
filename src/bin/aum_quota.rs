@@ -31,10 +31,10 @@ use claude_code_usage_monitor::antigravity_statusline::{self, BridgeOutcome};
 use claude_code_usage_monitor::dispatcher::{
     self, Complexity, ExecutorSuitability, ModelMapping, PreferredExecutor, Suitability, Task,
 };
-use claude_code_usage_monitor::quota_health::provider_health;
-use claude_code_usage_monitor::quota_report;
 #[cfg(feature = "muse-local-experimental")]
 use claude_code_usage_monitor::muse_local;
+use claude_code_usage_monitor::quota_health::provider_health;
+use claude_code_usage_monitor::quota_report;
 
 fn main() -> ExitCode {
     let mut args: Vec<String> = std::env::args().skip(1).collect();

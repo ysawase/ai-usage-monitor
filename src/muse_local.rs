@@ -59,19 +59,25 @@ pub fn parse_sanitized_reply(bytes: &[u8]) -> Result<MuseReading, MuseBridgeErro
         return Err(MuseBridgeError::InvalidReply);
     }
     let reset = match message.resets_at_epoch_seconds {
-        Some(value) if (946_684_800..=4_102_444_800).contains(&value) =>
-            Some(value as u64),
+        Some(value) if (946_684_800..=4_102_444_800).contains(&value) => Some(value as u64),
         Some(_) => return Err(MuseBridgeError::InvalidReply),
         None => None,
     };
-    Ok(MuseReading { used_percent: pct, resets_at_epoch_seconds: reset })
+    Ok(MuseReading {
+        used_percent: pct,
+        resets_at_epoch_seconds: reset,
+    })
 }
 
 pub fn usage_from_reading(reading: MuseReading) -> UsageData {
     let mut usage = UsageData::default();
-    let reset = reading.resets_at_epoch_seconds
+    let reset = reading
+        .resets_at_epoch_seconds
         .and_then(|s| UNIX_EPOCH.checked_add(Duration::from_secs(s)));
-    usage.set_weekly(UsageSection { percentage: reading.used_percent, resets_at: reset });
+    usage.set_weekly(UsageSection {
+        percentage: reading.used_percent,
+        resets_at: reset,
+    });
     usage
 }
 
@@ -83,12 +89,15 @@ pub fn read() -> Result<MuseReading, MuseBridgeError> {
     // Named pipe ACL is CurrentUserOnly on the helper. Never carry cookies
     // or payloads between processes. No HTTP / profile reading in Rust.
     let mut pipe = OpenOptions::new()
-        .read(true).write(true).open(PIPE_PATH)
+        .read(true)
+        .write(true)
+        .open(PIPE_PATH)
         .map_err(|_| MuseBridgeError::Unavailable)?;
     pipe.write_all(b"READ\n")
         .map_err(|_| MuseBridgeError::Unavailable)?;
     let mut reply = Vec::new();
-    pipe.take(MAX_REPLY_BYTES + 1).read_to_end(&mut reply)
+    pipe.take(MAX_REPLY_BYTES + 1)
+        .read_to_end(&mut reply)
         .map_err(|_| MuseBridgeError::Unavailable)?;
     parse_sanitized_reply(&reply)
 }
@@ -117,13 +126,19 @@ mod tests {
         assert!(!usage.session_available());
         assert!(usage.weekly_available());
         assert_eq!(usage.weekly.percentage, 7.0);
-        assert_eq!(usage.weekly.resets_at, SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(1794584040)));
+        assert_eq!(
+            usage.weekly.resets_at,
+            SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(1794584040))
+        );
     }
 
     #[test]
     fn no_session_is_unavailable_not_zero() {
         let response = br#"{"schema_version":1,"status":"unavailable","used_percent":null,"resets_at_epoch_seconds":null}"#;
-        assert_eq!(parse_sanitized_reply(response), Err(MuseBridgeError::Unavailable));
+        assert_eq!(
+            parse_sanitized_reply(response),
+            Err(MuseBridgeError::Unavailable)
+        );
     }
 
     #[test]
@@ -138,9 +153,14 @@ mod tests {
             br#"{"schema_version":1,"status":"success","used_percent":null,"resets_at_epoch_seconds":null}"#,
         ];
         for input in cases {
-            assert_eq!(parse_sanitized_reply(input), Err(MuseBridgeError::InvalidReply));
+            assert_eq!(
+                parse_sanitized_reply(input),
+                Err(MuseBridgeError::InvalidReply)
+            );
         }
-        assert_eq!(parse_sanitized_reply(&vec![b'x'; 513]),
-            Err(MuseBridgeError::InvalidReply));
+        assert_eq!(
+            parse_sanitized_reply(&vec![b'x'; 513]),
+            Err(MuseBridgeError::InvalidReply)
+        );
     }
 }
