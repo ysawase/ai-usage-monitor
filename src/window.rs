@@ -11889,8 +11889,13 @@ mod tests {
             let y = (rect.top + rect.bottom) / 2;
             assert_eq!(
                 pointer_interaction_target(
-                    x, y, width, horizontal_resize_edge_width_for_dpi(dpi),
-                    scaled_for_dpi(60, dpi), rect, &[]
+                    x,
+                    y,
+                    width,
+                    horizontal_resize_edge_width_for_dpi(dpi),
+                    scaled_for_dpi(60, dpi),
+                    rect,
+                    &[]
                 ),
                 PointerInteractionTarget::HelpButton
             );
