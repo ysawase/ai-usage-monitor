@@ -119,8 +119,12 @@ impl AuthAction {
                 show_antigravity_setup(hwnd);
                 return;
             }
-            Self::ProviderDiagnosis(family, state) => {
-                show_single_provider_diagnosis(hwnd, family, state);
+            Self::ProviderDiagnosis(_, _) => {
+                // For an unclassified fetch failure, retry polling rather than
+                // displaying a passive text-only diagnosis dialog.
+                unsafe {
+                    let _ = PostMessageW(hwnd, WM_COMMAND, WPARAM(1), LPARAM(0));
+                }
                 return;
             }
             _ => {}
@@ -6436,7 +6440,7 @@ fn paint_content(
         let _ = SetTextColor(hdc, COLORREF(heading_text.to_colorref()));
         let mut help_text_rect = help_rect;
         let mut help_text =
-            native_interop::wide_str(if connection_attention_now() { "!" } else { "?" });
+            native_interop::wide_str("↻");
         let _ = DrawTextW(
             hdc,
             &mut help_text,
@@ -7788,11 +7792,9 @@ unsafe extern "system" fn wnd_proc(
             };
 
             if interaction == PointerInteractionTarget::HelpButton {
-                if connection_attention_now() {
-                    show_provider_diagnosis(hwnd);
-                } else {
-                    show_display_guide(hwnd);
-                }
+                // The header control retries fetching instead of showing
+                // a static information dialog.
+                let _ = PostMessageW(hwnd, WM_COMMAND, WPARAM(1), LPARAM(0));
                 return LRESULT(0);
             }
 
@@ -8091,9 +8093,6 @@ unsafe extern "system" fn wnd_proc(
                         do_poll(sh);
                     });
                 }
-                IDM_HELP_DISPLAY_GUIDE => show_display_guide(hwnd),
-                IDM_HELP_AI_QUOTAS => show_ai_quota_help(hwnd),
-                IDM_HELP_PROVIDER_DIAGNOSIS => show_provider_diagnosis(hwnd),
                 IDM_HELP_README => {
                     if !open_readme(hwnd) {
                         let strings = current_strings();
@@ -9356,16 +9355,7 @@ fn show_context_menu(hwnd: HWND) {
 
         let help_menu = CreatePopupMenu().unwrap();
         for (id, label) in [
-            (IDM_HELP_DISPLAY_GUIDE, strings.help_display_guide),
-            (IDM_HELP_AI_QUOTAS, strings.help_ai_quotas),
-            (
-                IDM_HELP_PROVIDER_DIAGNOSIS,
-                if strings.antigravity_setup_title == "Antigravityのセットアップ" {
-                    "AIサービスの接続診断..."
-                } else {
-                    "Diagnose AI connections..."
-                },
-            ),
+            // Exclude text-only help and diagnosis popups from the menu.
         ] {
             let label_str = native_interop::wide_str(label);
             let _ = AppendMenuW(
