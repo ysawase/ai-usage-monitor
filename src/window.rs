@@ -4622,8 +4622,10 @@ const TEXT_WIDTH: i32 = 160;
 const MIN_MULTI_PROVIDER_TEXT_WIDTH: i32 = 96;
 const MAX_WIDGET_WIDTH_LOGICAL: i32 = 1200;
 const RESIZE_EDGE_LOGICAL: i32 = 6;
-const HELP_BUTTON_SIZE_LOGICAL: i32 = 14;
-const HELP_BUTTON_TOP_LOGICAL: i32 = 3;
+// Preserve one-click refresh while making the control genuinely usable.
+// Header budget is 21 logical px (3 + HEADER_ROW_H + 4).
+const HELP_BUTTON_SIZE_LOGICAL: i32 = 20;
+const HELP_BUTTON_TOP_LOGICAL: i32 = 1;
 const HELP_BUTTON_RIGHT_MARGIN_LOGICAL: i32 = 4;
 const HELP_BUTTON_CONTENT_GAP_LOGICAL: i32 = 4;
 const MODEL_RIGHT_MARGIN: i32 = 3;
@@ -6572,6 +6574,25 @@ fn paint_content(
         FrameRect(hdc, &help_rect, help_border_brush);
         let _ = DeleteObject(help_border_brush);
         let _ = SetTextColor(hdc, COLORREF(heading_text.to_colorref()));
+        // The main header font is only 12 logical px. A separate 17px font
+        // makes the refresh icon legible without enlarging provider labels.
+        let control_font = CreateFontW(
+            sc(-17),
+            0,
+            0,
+            0,
+            FW_MEDIUM.0 as i32,
+            0,
+            0,
+            0,
+            DEFAULT_CHARSET.0 as u32,
+            OUT_TT_PRECIS.0 as u32,
+            CLIP_DEFAULT_PRECIS.0 as u32,
+            CLEARTYPE_QUALITY.0 as u32,
+            (DEFAULT_PITCH.0 | FF_DONTCARE.0) as u32,
+            PCWSTR::from_raw(font_name.as_ptr()),
+        );
+        let previous_font = SelectObject(hdc, control_font);
         let mut help_text_rect = help_rect;
         let mut help_text = native_interop::wide_str(if connection_attention_now() {
             "!"
@@ -6584,6 +6605,8 @@ fn paint_content(
             &mut help_text_rect,
             DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
         );
+        SelectObject(hdc, previous_font);
+        let _ = DeleteObject(control_font);
         let _ = SetTextColor(hdc, COLORREF(text_color.to_colorref()));
 
         draw_provider_header_row(
@@ -11850,6 +11873,26 @@ mod tests {
             assert_eq!(
                 rect.right - rect.left,
                 scaled_for_dpi(HELP_BUTTON_SIZE_LOGICAL, dpi)
+            );
+        }
+    }
+
+    #[test]
+    fn refresh_control_is_at_least_twenty_logical_pixels_and_clickable() {
+        for dpi in [96, 144, 192] {
+            let width = scaled_for_dpi(600, dpi);
+            let rect = help_button_rect_for_client_width(width, dpi);
+            assert_eq!(rect.right - rect.left, scaled_for_dpi(20, dpi));
+            assert_eq!(rect.bottom - rect.top, scaled_for_dpi(20, dpi));
+            assert!(rect.bottom <= scaled_for_dpi(3 + HEADER_ROW_H + 4, dpi));
+            let x = (rect.left + rect.right) / 2;
+            let y = (rect.top + rect.bottom) / 2;
+            assert_eq!(
+                pointer_interaction_target(
+                    x, y, width, horizontal_resize_edge_width_for_dpi(dpi),
+                    scaled_for_dpi(60, dpi), rect, &[]
+                ),
+                PointerInteractionTarget::HelpButton
             );
         }
     }
