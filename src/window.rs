@@ -6439,8 +6439,7 @@ fn paint_content(
         let _ = DeleteObject(help_border_brush);
         let _ = SetTextColor(hdc, COLORREF(heading_text.to_colorref()));
         let mut help_text_rect = help_rect;
-        let mut help_text =
-            native_interop::wide_str("↻");
+        let mut help_text = native_interop::wide_str("↻");
         let _ = DrawTextW(
             hdc,
             &mut help_text,
@@ -9354,17 +9353,8 @@ fn show_context_menu(hwnd: HWND) {
         );
 
         let help_menu = CreatePopupMenu().unwrap();
-        for (id, label) in [
-            // Exclude text-only help and diagnosis popups from the menu.
-        ] {
-            let label_str = native_interop::wide_str(label);
-            let _ = AppendMenuW(
-                help_menu,
-                MENU_ITEM_FLAGS(0),
-                id as usize,
-                PCWSTR::from_raw(label_str.as_ptr()),
-            );
-        }
+        // The text-only Help / Diagnosis entries are omitted. Keep actionable
+        // provider setup and the documentation link below.
         #[cfg(feature = "antigravity")]
         {
             let antigravity_setup_label =
