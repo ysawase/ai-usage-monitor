@@ -278,7 +278,8 @@ fn claude_terminal_intro(japanese: bool) -> &'static [&'static str] {
             "=== Claudeの再接続 ===",
             "1. ブラウザでClaudeにログインします。",
             "2. 認証コードが表示された場合はコピーします。",
-            "3. この画面に貼り付けてEnterキーを押してください。",
+            "3. コードが求められた場合だけ、この画面に貼り付けてEnterキーを押します。",
+            "ブラウザだけで認証が完了した場合、コード入力は不要です。",
             "重要: 貼り付けても文字が表示されない場合があります。",
             "文字が見えなくても、そのままEnterキーを押してください。",
             "ブラウザが開かない場合はURLをコピーして開いてください。",
@@ -288,7 +289,8 @@ fn claude_terminal_intro(japanese: bool) -> &'static [&'static str] {
             "=== Reconnect Claude ===",
             "1. Sign in to Claude in the browser.",
             "2. If a sign-in code appears, copy it.",
-            "3. Paste it in this window, then press Enter.",
+            "3. Only if prompted, paste the code here and press Enter.",
+            "If browser sign-in completes automatically, no code is needed.",
             "Important: Pasted characters may be invisible.",
             "Press Enter even if you cannot see the pasted code.",
             "If the browser does not open, copy the displayed URL.",
@@ -336,7 +338,7 @@ fn auth_command_line(program: &str, args: &[&str], japanese: bool) -> String {
         command_line.push_str(" & if errorlevel 1 (");
         if japanese {
             command_line
-                .push_str("echo 認証結果を確認できませんでした。モニターで再取得してください。");
+                .push_str("echo 認証確認できませんでした。モニター右上の更新ボタンを押してください。");
         } else {
             command_line
                 .push_str("echo Could not verify login. Retry quota refresh in the monitor.");
@@ -344,9 +346,9 @@ fn auth_command_line(program: &str, args: &[&str], japanese: bool) -> String {
         command_line.push_str(" ) else (");
         if japanese {
             command_line
-                .push_str("echo Claudeの認証を確認しました。モニターで再取得してください。");
+                .push_str("echo Claudeの認証を確認しました。モニター右上の更新ボタンを押して利用枠を再取得してください。");
         } else {
-            command_line.push_str("echo Claude login verified. Refresh quotas in the monitor.");
+            command_line.push_str("echo Claude login verified. Click the refresh button in the monitor to reload quotas.");
         }
         command_line.push_str(" )");
         command_line.push_str(" )");
@@ -3702,14 +3704,6 @@ fn widget_needs_connection_attention(s: &AppState) -> bool {
     ])
 }
 
-fn connection_attention_now() -> bool {
-    let state = lock_state();
-    state
-        .as_ref()
-        .map(widget_needs_connection_attention)
-        .unwrap_or(false)
-}
-
 fn build_provider_diagnosis_with_sources(
     ja: bool,
     rows: &[(QuotaFamilyId, CellState, Option<DiagnosisWindow>)],
@@ -4697,6 +4691,7 @@ const RESIZE_EDGE_LOGICAL: i32 = 6;
 // Reserve the upper-right corner for a full-size one-click refresh control.
 // 24px width improves the target while 21px height fits the header exactly;
 // do not let the control overlap quota data rows below.
+const REFRESH_BUTTON_GLYPH: &str = "↻";
 const HELP_BUTTON_SIZE_LOGICAL: i32 = 24;
 const HELP_BUTTON_HEIGHT_LOGICAL: i32 = 21;
 const HELP_BUTTON_TOP_LOGICAL: i32 = 0;
@@ -6668,11 +6663,10 @@ fn paint_content(
         );
         let previous_font = SelectObject(hdc, control_font);
         let mut help_text_rect = help_rect;
-        let mut help_text = native_interop::wide_str(if connection_attention_now() {
-            "!"
-        } else {
-            "↻"
-        });
+        // Always show the refresh affordance. Replacing it with "!" on
+        // authentication failure stranded users immediately after re-login.
+        // The per-provider row already displays the concrete error.
+        let mut help_text = native_interop::wide_str(REFRESH_BUTTON_GLYPH);
         let _ = DrawTextW(
             hdc,
             &mut help_text,
@@ -10627,6 +10621,8 @@ mod tests {
             .starts_with("/k set \"PATH=%USERPROFILE%\\.local\\bin;%PATH%\" & chcp 65001>nul"));
         assert!(command.contains("貼り付けても文字が表示されない場合があります"));
         assert!(command.contains("そのままEnterキーを押してください"));
+        assert!(command.contains("コード入力は不要です"));
+        assert!(command.contains("モニター右上の更新ボタンを押して利用枠を再取得してください"));
         assert!(command.contains(" & claude auth login & if errorlevel 1"));
         assert!(command.contains("if errorlevel 1"));
         assert!(command.contains(CLAUDE_AUTH_TROUBLESHOOTING_URL));
@@ -10651,6 +10647,7 @@ mod tests {
         );
         let english = auth_command_line("claude", &["auth", "login"], false);
         assert!(english.contains("Pasted characters may be invisible"));
+        assert!(english.contains("no code is needed"));
         assert!(english.contains("press Enter"));
         assert!(english.contains("Claude login verified."));
         assert!(english.contains("Could not verify login."));
@@ -11965,6 +11962,13 @@ mod tests {
                 scaled_for_dpi(HELP_BUTTON_SIZE_LOGICAL, dpi)
             );
         }
+    }
+
+    #[test]
+    fn refresh_symbol_remains_visible_on_authentication_failure() {
+        // A failed provider's textual row carries the error. The update
+        // button must remain recognizable and usable to retry after login.
+        assert_eq!(REFRESH_BUTTON_GLYPH, "↻");
     }
 
     #[test]
