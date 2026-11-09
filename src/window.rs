@@ -330,13 +330,16 @@ fn auth_command_line(program: &str, args: &[&str], japanese: bool) -> String {
         command_line.push_str("claude auth status >nul 2>nul");
         command_line.push_str(" & if errorlevel 1 (");
         if japanese {
-            command_line.push_str("echo 認証結果を確認できませんでした。モニターで再取得してください。");
+            command_line
+                .push_str("echo 認証結果を確認できませんでした。モニターで再取得してください。");
         } else {
-            command_line.push_str("echo Could not verify login. Retry quota refresh in the monitor.");
+            command_line
+                .push_str("echo Could not verify login. Retry quota refresh in the monitor.");
         }
         command_line.push_str(" ) else (");
         if japanese {
-            command_line.push_str("echo Claudeの認証を確認しました。モニターで再取得してください。");
+            command_line
+                .push_str("echo Claudeの認証を確認しました。モニターで再取得してください。");
         } else {
             command_line.push_str("echo Claude login verified. Refresh quotas in the monitor.");
         }
