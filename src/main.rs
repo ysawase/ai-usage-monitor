@@ -8,6 +8,8 @@ mod diagnose;
 mod diagnose;
 mod localization;
 mod models;
+#[cfg(feature = "muse-local-experimental")]
+mod muse_local;
 mod native_interop;
 mod poll_diagnostics;
 mod poller;

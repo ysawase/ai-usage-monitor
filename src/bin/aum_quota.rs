@@ -31,6 +31,8 @@ use claude_code_usage_monitor::antigravity_statusline::{self, BridgeOutcome};
 use claude_code_usage_monitor::dispatcher::{
     self, Complexity, ExecutorSuitability, ModelMapping, PreferredExecutor, Suitability, Task,
 };
+#[cfg(feature = "muse-local-experimental")]
+use claude_code_usage_monitor::muse_local;
 use claude_code_usage_monitor::quota_health::provider_health;
 use claude_code_usage_monitor::quota_report;
 
@@ -42,6 +44,21 @@ fn main() -> ExitCode {
     let command = args.next().unwrap_or_else(|| "quota".to_string());
 
     match command.as_str() {
+        #[cfg(feature = "muse-local-experimental")]
+        "muse-local" => {
+            // Explicit developer-only invocation, never a background timer.
+            // No credential or raw Muse data leaves the helper process.
+            let response = match muse_local::read() {
+                Ok(reading) => serde_json::json!({
+                    "status":"ok",
+                    "used_percent":reading.used_percent,
+                    "resets_at_epoch_seconds":reading.resets_at_epoch_seconds
+                }),
+                Err(_) => serde_json::json!({"status":"unavailable"}),
+            };
+            print_json(&response, compact);
+            ExitCode::SUCCESS
+        }
         "quota" => {
             let snapshot = quota_report::collect();
             print_json(&snapshot, compact);

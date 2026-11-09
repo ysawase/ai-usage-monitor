@@ -10,6 +10,7 @@ repository = "https://github.com/CodeZeno/Claude-Code-Usage-Monitor"
 [features]
 default = ["antigravity"]
 self-update = []
+muse-local-experimental = []
 legacy-auto-refresh = []
 claude-messages-fallback = []
 antigravity = []
