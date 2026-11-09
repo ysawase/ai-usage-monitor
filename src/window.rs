@@ -337,8 +337,9 @@ fn auth_command_line(program: &str, args: &[&str], japanese: bool) -> String {
         command_line.push_str("claude auth status >nul 2>nul");
         command_line.push_str(" & if errorlevel 1 (");
         if japanese {
-            command_line
-                .push_str("echo 認証確認できませんでした。モニター右上の更新ボタンを押してください。");
+            command_line.push_str(
+                "echo 認証確認できませんでした。モニター右上の更新ボタンを押してください。",
+            );
         } else {
             command_line
                 .push_str("echo Could not verify login. Retry quota refresh in the monitor.");
