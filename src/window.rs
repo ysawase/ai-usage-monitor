@@ -10623,9 +10623,8 @@ mod tests {
     #[test]
     fn claude_auth_failure_offers_official_guidance_without_legacy_binary() {
         let command = auth_command_line("claude", &["auth", "login"], true);
-        assert!(command.starts_with(
-            "/k set \"PATH=%USERPROFILE%\\.local\\bin;%PATH%\" & chcp 65001>nul"
-        ));
+        assert!(command
+            .starts_with("/k set \"PATH=%USERPROFILE%\\.local\\bin;%PATH%\" & chcp 65001>nul"));
         assert!(command.contains("貼り付けても文字が表示されない場合があります"));
         assert!(command.contains("そのままEnterキーを押してください"));
         assert!(command.contains(" & claude auth login & if errorlevel 1"));
