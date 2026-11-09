@@ -270,14 +270,54 @@ const CLAUDE_AUTH_TROUBLESHOOTING_URL: &str = "https://code.claude.com/docs/en/t
 
 /// Fixed first-party login commands only. On failure, show official recovery
 /// instructions instead of copying or running a pinned historic executable.
-fn auth_command_line(program: &str, args: &[&str]) -> String {
-    let mut command_line = String::from("/k ");
+/// The terminal instructions are deliberately simple text, not an OAuth
+/// proxy: code entry and credential storage remain in the first-party CLI.
+fn claude_terminal_intro(japanese: bool) -> &'static [&'static str] {
+    if japanese {
+        &[
+            "=== Claudeの再接続 ===",
+            "1. ブラウザでClaudeにログインします。",
+            "2. 認証コードが表示された場合はコピーします。",
+            "3. この画面に貼り付けてEnterキーを押してください。",
+            "重要: 貼り付けても文字が表示されない場合があります。",
+            "文字が見えなくても、そのままEnterキーを押してください。",
+            "ブラウザが開かない場合はURLをコピーして開いてください。",
+        ]
+    } else {
+        &[
+            "=== Reconnect Claude ===",
+            "1. Sign in to Claude in the browser.",
+            "2. If a sign-in code appears, copy it.",
+            "3. Paste it in this window, then press Enter.",
+            "Important: Pasted characters may be invisible.",
+            "Press Enter even if you cannot see the pasted code.",
+            "If the browser does not open, copy the displayed URL.",
+        ]
+    }
+}
+
+fn auth_command_line(program: &str, args: &[&str], japanese: bool) -> String {
+    let claude_login = program == "claude" && args == ["auth", "login"];
+    let mut command_line = if claude_login {
+        // UTF-8 console output so localized steps can render. All echo
+        // strings are application constants, not user or provider input.
+        let mut prefix = String::from("/k chcp 65001>nul");
+        for line in claude_terminal_intro(japanese) {
+            prefix.push_str(" & echo ");
+            prefix.push_str(line);
+        }
+        prefix.push_str(" & echo.");
+        prefix.push_str(" & ");
+        prefix
+    } else {
+        String::from("/k ")
+    };
     command_line.push_str(program);
     for arg in args {
         command_line.push(' ');
         command_line.push_str(arg);
     }
-    if program == "claude" && args == ["auth", "login"] {
+    if claude_login {
         command_line.push_str(" & if errorlevel 1 (");
         command_line.push_str("echo. & echo Claude Code login failed.");
         command_line.push_str(" & echo For official login troubleshooting, see:");
@@ -290,7 +330,13 @@ fn auth_command_line(program: &str, args: &[&str]) -> String {
 }
 
 fn launch_visible_auth_command(hwnd: HWND, program: &str, args: &[&str]) -> bool {
-    let command_line = auth_command_line(program, args);
+    let japanese = {
+        let state = lock_state();
+        state
+            .as_ref()
+            .is_some_and(|s| s.language == LanguageId::Japanese)
+    };
+    let command_line = auth_command_line(program, args, japanese);
     unsafe {
         let operation = native_interop::wide_str("open");
         let target = native_interop::wide_str("cmd.exe");
@@ -10551,8 +10597,11 @@ mod tests {
     use super::*;
     #[test]
     fn claude_auth_failure_offers_official_guidance_without_legacy_binary() {
-        let command = auth_command_line("claude", &["auth", "login"]);
-        assert!(command.starts_with("/k claude auth login"));
+        let command = auth_command_line("claude", &["auth", "login"], true);
+        assert!(command.starts_with("/k chcp 65001>nul"));
+        assert!(command.contains("貼り付けても文字が表示されない場合があります"));
+        assert!(command.contains("そのままEnterキーを押してください"));
+        assert!(command.contains(" & claude auth login & if errorlevel 1"));
         assert!(command.contains("if errorlevel 1"));
         assert!(command.contains(CLAUDE_AUTH_TROUBLESHOOTING_URL));
         assert!(command.contains("claude doctor"));
@@ -10563,11 +10612,15 @@ mod tests {
 
     #[test]
     fn other_auth_commands_do_not_gain_claude_failure_actions() {
-        assert_eq!(auth_command_line("codex", &["login"]), "/k codex login");
+        assert_eq!(auth_command_line("codex", &["login"], true), "/k codex login");
         assert_eq!(
-            auth_command_line("claude", &["auth", "status"]),
+            auth_command_line("claude", &["auth", "status"], true),
             "/k claude auth status"
         );
+        let english = auth_command_line("claude", &["auth", "login"], false);
+        assert!(english.contains("Pasted characters may be invisible"));
+        assert!(english.contains("press Enter"));
+        assert!(!english.contains("貼り付けても"));
     }
 
     #[test]
