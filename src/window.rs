@@ -10612,7 +10612,10 @@ mod tests {
 
     #[test]
     fn other_auth_commands_do_not_gain_claude_failure_actions() {
-        assert_eq!(auth_command_line("codex", &["login"], true), "/k codex login");
+        assert_eq!(
+            auth_command_line("codex", &["login"], true),
+            "/k codex login"
+        );
         assert_eq!(
             auth_command_line("claude", &["auth", "status"], true),
             "/k claude auth status"
