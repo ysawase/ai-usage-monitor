@@ -60,6 +60,68 @@ jobs:
         continue-on-error: true
         run: cargo build --locked --no-default-features --features muse-local-experimental --bin aum-quota
 
+      # Personal-local QA only. No real account, no secrets, no artifact,
+      # no MSIX package, no Store or production publication.
+      - name: Build experimental Muse GUI and CLI for isolated smoke
+        id: muse_gui_build
+        continue-on-error: true
+        run: cargo build --release --locked --no-default-features --features muse-local-experimental --bin claude-code-usage-monitor --bin aum-quota
+
+      - name: Cross-process same-user Muse IPC smoke with synthetic response
+        id: muse_ipc_smoke
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $client = (Resolve-Path '.\target\release\aum-quota.exe').Path
+          # Missing helper must yield unavailable, not a stale or fake zero.
+          $missing = (& $client muse-local --compact | ConvertFrom-Json)
+          if ($LASTEXITCODE -ne 0 -or $missing.status -ne 'unavailable') {
+            throw 'Missing helper must fail closed'
+          }
+          $job = Start-Job -ScriptBlock {
+            $pipe = [System.IO.Pipes.NamedPipeServerStream]::new(
+              'SolidailyMuseQuotaLocalV1',
+              [System.IO.Pipes.PipeDirection]::InOut, 1,
+              [System.IO.Pipes.PipeTransmissionMode]::Byte,
+              ([System.IO.Pipes.PipeOptions]::Asynchronous -bor
+               [System.IO.Pipes.PipeOptions]::CurrentUserOnly))
+            try {
+              $pipe.WaitForConnection()
+              $request = New-Object byte[] 5
+              $offset = 0
+              while ($offset -lt 5) {
+                $count = $pipe.Read($request, $offset, 5 - $offset)
+                if ($count -eq 0) { throw 'Client disconnected' }
+                $offset += $count
+              }
+              if ([Text.Encoding]::ASCII.GetString($request) -ne "READ" + [char]10) {
+                throw 'Unexpected command'
+              }
+              $bytes = [Text.Encoding]::UTF8.GetBytes(
+                '{"schema_version":1,"status":"success","used_percent":7,"resets_at_epoch_seconds":1794584040}' + [char]10)
+              $pipe.Write($bytes, 0, $bytes.Length)
+              $pipe.Flush()
+            } finally { $pipe.Dispose() }
+          }
+          try {
+            Start-Sleep -Seconds 2
+            if ($job.State -eq 'Failed') { throw 'Mock server failed before client' }
+            $actual = (& $client muse-local --compact | ConvertFrom-Json)
+            if ($LASTEXITCODE -ne 0 -or $actual.status -ne 'ok' -or
+                $actual.used_percent -ne 7 -or
+                $actual.resets_at_epoch_seconds -ne 1794584040) {
+              throw 'Rust CLI did not receive expected same-user response'
+            }
+            Wait-Job $job -Timeout 15 | Out-Null
+            if ($job.State -ne 'Completed') { throw 'Mock helper did not complete' }
+            Receive-Job $job -ErrorAction Stop | Out-Null
+            Write-Output 'MUSE_CROSS_PROCESS_IPC_PASS (synthetic same-user; not real account GUI E2E)'
+          } finally {
+            if ($job.State -in 'Running','NotStarted') { Stop-Job $job }
+            Remove-Job $job -Force
+          }
+
       - name: Verify Cargo.lock unchanged
         id: lockfile
         continue-on-error: true
@@ -76,6 +138,8 @@ jobs:
           BUILD_ANTIGRAVITY_OUTCOME: ${{ steps.build_antigravity.outcome }}
           MUSE_TESTS_OUTCOME: ${{ steps.muse_tests.outcome }}
           MUSE_BUILD_OUTCOME: ${{ steps.muse_build.outcome }}
+          MUSE_GUI_BUILD_OUTCOME: ${{ steps.muse_gui_build.outcome }}
+          MUSE_IPC_SMOKE_OUTCOME: ${{ steps.muse_ipc_smoke.outcome }}
           LOCKFILE_OUTCOME: ${{ steps.lockfile.outcome }}
         run: |
           $failed = @()
@@ -102,6 +166,8 @@ jobs:
 
           if ($env:MUSE_TESTS_OUTCOME -ne 'success') { $failed += 'muse-local tests' }
           if ($env:MUSE_BUILD_OUTCOME -ne 'success') { $failed += 'muse-local build' }
+          if ($env:MUSE_GUI_BUILD_OUTCOME -ne 'success') { $failed += 'muse GUI build' }
+          if ($env:MUSE_IPC_SMOKE_OUTCOME -ne 'success') { $failed += 'muse same-user cross-process IPC' }
           if ($env:LOCKFILE_OUTCOME -ne 'success') {
             $failed += 'Cargo.lock'
           }
