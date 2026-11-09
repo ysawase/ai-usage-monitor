@@ -10629,7 +10629,8 @@ mod tests {
         assert!(command.contains(CLAUDE_AUTH_TROUBLESHOOTING_URL));
         assert!(command.contains("claude doctor"));
         assert!(command.contains("claude auth status >nul 2>nul"));
-        assert!(command.contains("認証結果を確認できませんでした"));
+        assert!(command
+            .contains("認証確認できませんでした。モニター右上の更新ボタンを押してください。"));
         assert!(command.contains("Claudeの認証を確認しました"));
         assert!(!command.contains("2.1.308"));
         assert!(!command.contains("Copy-Item"));
