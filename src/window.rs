@@ -299,9 +299,14 @@ fn claude_terminal_intro(japanese: bool) -> &'static [&'static str] {
 fn auth_command_line(program: &str, args: &[&str], japanese: bool) -> String {
     let claude_login = program == "claude" && args == ["auth", "login"];
     let mut command_line = if claude_login {
-        // UTF-8 console output so localized steps can render. All echo
-        // strings are application constants, not user or provider input.
-        let mut prefix = String::from("/k chcp 65001>nul");
+        // The official native Windows install lives in
+        // %USERPROFILE%\\.local\\bin, which can be absent from the process
+        // PATH (including MSIX launch contexts). Extend PATH in the child
+        // terminal only, using the interactive user's profile; do not
+        // rewrite system/user environment variables or touch credentials.
+        // UTF-8 output is required for localized guidance.
+        let mut prefix =
+            String::from("/k set \"PATH=%USERPROFILE%\\.local\\bin;%PATH%\" & chcp 65001>nul");
         for line in claude_terminal_intro(japanese) {
             prefix.push_str(" & echo ");
             prefix.push_str(line);
@@ -10618,7 +10623,9 @@ mod tests {
     #[test]
     fn claude_auth_failure_offers_official_guidance_without_legacy_binary() {
         let command = auth_command_line("claude", &["auth", "login"], true);
-        assert!(command.starts_with("/k chcp 65001>nul"));
+        assert!(command.starts_with(
+            "/k set \"PATH=%USERPROFILE%\\.local\\bin;%PATH%\" & chcp 65001>nul"
+        ));
         assert!(command.contains("貼り付けても文字が表示されない場合があります"));
         assert!(command.contains("そのままEnterキーを押してください"));
         assert!(command.contains(" & claude auth login & if errorlevel 1"));
