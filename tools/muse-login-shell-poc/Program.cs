@@ -14,6 +14,11 @@ internal static class Program
     {
         try
         {
+            if (args.Contains("--visible-parser-self-test", StringComparer.Ordinal))
+            {
+                Environment.ExitCode = MuseVisibleUsageParserSelfTest.Run() ? 0 : 1;
+                return;
+            }
             if (args.Contains("--muse-bridge-self-test", StringComparer.Ordinal))
             {
                 Environment.ExitCode = MuseLocalPipeBridgeSelfTest.RunAsync().GetAwaiter().GetResult() ? 0 : 1;
