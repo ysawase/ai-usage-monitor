@@ -14,7 +14,8 @@ internal enum MuseVisibleProbeStatus
 }
 
 internal sealed record MuseVisibleProbeResult(
-    MuseVisibleProbeStatus Status, SyntheticUsageReading? Reading, MuseUsageParseStatus? ParseStatus = null);
+    MuseVisibleProbeStatus Status, SyntheticUsageReading? Reading, MuseUsageParseStatus? ParseStatus = null,
+    string? SafeDiagnostic = null);
 
 /// <summary>
 /// User-initiated, single-shot, local UI Automation. Never navigates Muse,
@@ -59,7 +60,25 @@ internal static class MuseVisibleUsageReader
             // Only the bounded snippet is materialized, never logged or saved.
             if (!MuseVisibleUsageParser.TryParse(
                     usageSnippet, out var reading, out var parseStatus))
-                return new(MuseVisibleProbeStatus.SettingsNotRecognized, null, parseStatus);
+            {
+                // Diagnostic metadata only. FindText returns a range but its
+                // contents and coordinates are never read, persisted or sent.
+                // A hit in the document may be unrelated chat content: this
+                // is NOT a source of valid quota values.
+                string? diagnostic = null;
+                if (parseStatus == MuseUsageParseStatus.MissingPlan)
+                {
+                    bool planAnywhere = document.FindText(
+                        "無料プラン", backward: true, ignoreCase: false) is not null;
+                    bool percentAnywhere = document.FindText(
+                        "使用済み", backward: true, ignoreCase: false) is not null;
+                    diagnostic = "lengthCap=" + (usageSnippet.Length >= 770 ? "yes" : "no")
+                        + ";planAnywhere=" + (planAnywhere ? "yes" : "no")
+                        + ";percentAnywhere=" + (percentAnywhere ? "yes" : "no");
+                }
+                return new(MuseVisibleProbeStatus.SettingsNotRecognized,
+                    null, parseStatus, diagnostic);
+            }
             return new(MuseVisibleProbeStatus.Success, reading);
         }
         catch (Exception)

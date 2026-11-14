@@ -197,7 +197,8 @@ internal sealed class LoginWindow : Form
             {
                 status.Text = "取得不可：" + result.Status
                     + (result.ParseStatus is null ? "" : " / " + result.ParseStatus)
-                    + "。設定 → 一般 → 利用状況を表示してください。";
+                    + "。設定 → 一般 → 利用状況を表示してください。"
+                    + (result.SafeDiagnostic is null ? "" : " [診断: " + result.SafeDiagnostic + "]");
                 return;
             }
             var reading = result.Reading;
