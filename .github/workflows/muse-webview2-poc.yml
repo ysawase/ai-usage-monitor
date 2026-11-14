@@ -40,6 +40,17 @@ jobs:
         run: |
           if (!(Test-Path artifacts/muse-login-shell-win-x64/MuseLoginShellPoc.exe)) { throw "Missing test executable" }
           if (Test-Path artifacts/muse-login-shell-win-x64/claude-code-usage-monitor.exe) { throw "Production executable must never be bundled" }
+      - name: Verify visible-usage parser against synthetic text only
+        shell: pwsh
+        run: |
+          $exe = (Resolve-Path 'artifacts/muse-login-shell-win-x64/MuseLoginShellPoc.exe').Path
+          $p = Start-Process -FilePath $exe -ArgumentList '--visible-parser-self-test' -PassThru
+          try {
+            if (-not $p.WaitForExit(15000)) { throw 'Visible parser test timed out' }
+            if ($p.ExitCode -ne 0) { throw "Visible parser test failed: $($p.ExitCode)" }
+          } finally {
+            if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }
+          }
       - name: Verify synthetic UI Automation without Muse access
         shell: pwsh
         run: |
