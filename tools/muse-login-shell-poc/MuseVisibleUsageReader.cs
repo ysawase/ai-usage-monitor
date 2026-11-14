@@ -76,6 +76,25 @@ internal static class MuseVisibleUsageReader
                         + ";planAnywhere=" + (planAnywhere ? "yes" : "no")
                         + ";percentAnywhere=" + (percentAnywhere ? "yes" : "no");
                 }
+                // UIA can expose visible overlay labels before the heading.
+                // Attempt one bounded backward window, never the full document.
+                if (parseStatus == MuseUsageParseStatus.MissingPlan)
+                {
+                    TextPatternRange near = heading.Clone();
+                    near.MoveEndpointByUnit(TextPatternRangeEndpoint.Start,
+                        TextUnit.Character, -240);
+                    near.MoveEndpointByRange(TextPatternRangeEndpoint.End,
+                        heading, TextPatternRangeEndpoint.Start);
+                    string before = near.GetText(240);
+                    // Exactly one heading, at most 240 chars on each side.
+                    // Do not extend the fallback into background chat text.
+                    string after = usageSnippet[..Math.Min(usageSnippet.Length, 244)];
+                    string combined = before + " " + after;
+                    if (MuseVisibleUsageParser.TryParseNearHeading(
+                        combined, out var nearbyReading, out _)
+                        && nearbyReading is not null)
+                        return new(MuseVisibleProbeStatus.Success, nearbyReading);
+                }
                 return new(MuseVisibleProbeStatus.SettingsNotRecognized,
                     null, parseStatus, diagnostic);
             }

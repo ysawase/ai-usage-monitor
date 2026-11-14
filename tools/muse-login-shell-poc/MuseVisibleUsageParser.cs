@@ -31,6 +31,59 @@ internal static class MuseVisibleUsageParser
         RegexOptions.CultureInvariant | RegexOptions.Compiled,
         TimeSpan.FromMilliseconds(150));
 
+    /// <summary>
+    /// Conservative fallback for accessibility providers that expose the
+    /// selected Settings sheet out of visual reading order. Caller supplies
+    /// only a bounded text window around ONE visible Usage heading.
+    /// Reorders that heading for the existing strict parser; never searches
+    /// the full chat or accepts duplicate plans, percentages, or resets.
+    /// </summary>
+    internal static bool TryParseNearHeading(
+        string? text, out SyntheticUsageReading? reading, out MuseUsageParseStatus status)
+    {
+        reading = null;
+        status = MuseUsageParseStatus.AmbiguousOrInvalid;
+        if (string.IsNullOrWhiteSpace(text) || text.Length > 800)
+            return false;
+        string normalized = new string(text.Normalize(NormalizationForm.FormKC)
+            .Where(c => CharUnicodeInfo.GetUnicodeCategory(c) != UnicodeCategory.Format)
+            .ToArray()).Replace('\u00a0', ' ');
+        const string heading = "利用状況";
+        int at = normalized.IndexOf(heading, StringComparison.Ordinal);
+        if (at < 0)
+        {
+            status = MuseUsageParseStatus.MissingUsageSection;
+            return false;
+        }
+        if (normalized.IndexOf(heading, at + heading.Length, StringComparison.Ordinal) >= 0)
+            return false;
+
+        // The three exact fields must form one compact group. This prevents
+        // treating isolated words in old background chat as current quota.
+        var plan = Regex.Match(normalized, "無料\\s*プラン",
+            RegexOptions.CultureInvariant, TimeSpan.FromMilliseconds(150));
+        var used = Percent.Match(normalized);
+        var reset = Reset.Match(normalized);
+        if (plan.Success && used.Success && reset.Success)
+        {
+            int first = Math.Min(plan.Index, Math.Min(used.Index, reset.Index));
+            int last = Math.Max(plan.Index + plan.Length,
+                Math.Max(used.Index + used.Length, reset.Index + reset.Length));
+            // The heading itself must also be close to the field group.
+            // Otherwise an unrelated earlier chat can supply all three fields.
+            int headingDistance = Math.Max(0, Math.Max(
+                first - (at + heading.Length), at - last));
+            if (last - first > 320 || headingDistance > 80)
+                return false;
+        }
+
+        // Move the single heading in front without changing field ordering.
+        // TryParse continues to reject missing and duplicate values.
+        string candidate = heading + " " + normalized[..at]
+            + " " + normalized[(at + heading.Length)..];
+        return TryParse(candidate, out reading, out status);
+    }
+
     internal static bool TryParse(string? text, out SyntheticUsageReading? reading) =>
         TryParse(text, out reading, out _);
 

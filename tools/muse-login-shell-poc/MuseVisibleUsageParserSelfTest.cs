@@ -16,6 +16,17 @@ internal static class MuseVisibleUsageParserSelfTest
         // Fullwidth letters/digits and percent are normalized by FormKC.
         if (!ExpectSuccess("利用状況 無料プラン ２％使用済み １週間の上限は１１月２０日にリセットされます", 2, 11, 20))
             return false;
+        // Accessibility providers can expose a compact visible card before its heading.
+        if (!ExpectNearSuccess(
+            "無料プラン 4%使用済み 1週間の上限は11月20日にリセットされます 利用状況", 4))
+            return false;
+        if (!ExpectNearFailure(
+            "無料プラン 4%使用済み 1週間の上限は11月20日にリセットされます 利用状況 6%使用済み"))
+            return false;
+        if (!ExpectNearFailure(
+            "無料プラン 4%使用済み 1週間の上限は11月20日にリセットされます "
+            + new string('X', 340) + " 利用状況"))
+            return false;
         if (!ExpectFailure("チャット: 無料プラン 2%使用済み 1週間の上限は11月20日にリセットされます",
             MuseUsageParseStatus.MissingUsageSection))
             return false;
@@ -29,6 +40,20 @@ internal static class MuseVisibleUsageParserSelfTest
             MuseUsageParseStatus.AmbiguousOrInvalid))
             return false;
         return true;
+    }
+
+    private static bool ExpectNearSuccess(string text, int used)
+    {
+        return MuseVisibleUsageParser.TryParseNearHeading(text, out var reading, out var status)
+            && status == MuseUsageParseStatus.Success
+            && reading is { Plan: "無料プラン", ResetMonth: 11, ResetDay: 20 }
+            && reading.UsedPercent == used;
+    }
+
+    private static bool ExpectNearFailure(string text)
+    {
+        return !MuseVisibleUsageParser.TryParseNearHeading(text, out var reading, out _)
+            && reading is null;
     }
 
     private static bool ExpectSuccess(string text, int used, int month, int day)
