@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Text;
 using System.Text.RegularExpressions;
 
 namespace MuseLoginShellPoc;
@@ -43,7 +44,12 @@ internal static class MuseVisibleUsageParser
 
         // The real Muse modal can appear after the chat content. Do not log
         // the original or normalized document, even for failed parsing.
-        string normalized = text.Replace('\u00a0', ' ').Replace("\u200b", "");
+        // WebView2 accessibility text may insert Unicode direction/zero-width
+        // format marks inside "無料プラン". Ignore only format characters and
+        // normalize width; do not infer a missing plan or read other documents.
+        string normalized = new string(text.Normalize(NormalizationForm.FormKC)
+            .Where(c => CharUnicodeInfo.GetUnicodeCategory(c) != UnicodeCategory.Format)
+            .ToArray()).Replace('\u00a0', ' ');
         const string heading = "利用状況";
         int start = normalized.LastIndexOf(heading, StringComparison.Ordinal);
         if (start < 0)
