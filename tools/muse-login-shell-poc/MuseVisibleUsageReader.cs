@@ -84,9 +84,12 @@ internal static class MuseVisibleUsageReader
                     near.MoveEndpointByUnit(TextPatternRangeEndpoint.Start,
                         TextUnit.Character, -240);
                     near.MoveEndpointByRange(TextPatternRangeEndpoint.End,
-                        heading, TextPatternRangeEndpoint.End);
-                    string before = near.GetText(280);
-                    string combined = before + " " + usageSnippet;
+                        heading, TextPatternRangeEndpoint.Start);
+                    string before = near.GetText(240);
+                    // Exactly one heading, at most 240 chars on each side.
+                    // Do not extend the fallback into background chat text.
+                    string after = usageSnippet[..Math.Min(usageSnippet.Length, 244)];
+                    string combined = before + " " + after;
                     if (MuseVisibleUsageParser.TryParseNearHeading(
                         combined, out var nearbyReading, out _)
                         && nearbyReading is not null)
