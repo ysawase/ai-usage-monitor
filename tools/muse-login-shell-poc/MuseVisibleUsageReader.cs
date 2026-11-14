@@ -76,6 +76,22 @@ internal static class MuseVisibleUsageReader
                         + ";planAnywhere=" + (planAnywhere ? "yes" : "no")
                         + ";percentAnywhere=" + (percentAnywhere ? "yes" : "no");
                 }
+                // UIA can expose visible overlay labels before the heading.
+                // Attempt one bounded backward window, never the full document.
+                if (parseStatus == MuseUsageParseStatus.MissingPlan)
+                {
+                    TextPatternRange near = heading.Clone();
+                    near.MoveEndpointByUnit(TextPatternRangeEndpoint.Start,
+                        TextUnit.Character, -240);
+                    near.MoveEndpointByRange(TextPatternRangeEndpoint.End,
+                        heading, TextPatternRangeEndpoint.End);
+                    string before = near.GetText(280);
+                    string combined = before + " " + usageSnippet;
+                    if (MuseVisibleUsageParser.TryParseNearHeading(
+                        combined, out var nearbyReading, out _)
+                        && nearbyReading is not null)
+                        return new(MuseVisibleProbeStatus.Success, nearbyReading);
+                }
                 return new(MuseVisibleProbeStatus.SettingsNotRecognized,
                     null, parseStatus, diagnostic);
             }
