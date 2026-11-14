@@ -45,6 +45,13 @@ internal static class MuseVisibleUsageReader
                 || pattern is not TextPattern textPattern)
                 return new(MuseVisibleProbeStatus.NoTextPattern, null);
 
+            // Prefer independent visible UIA text elements. Some WebView2
+            // TextPattern providers FindText correctly but report every start
+            // endpoint as the same location, making text slices unusable.
+            // Never use the full document's chat text as quota data.
+            if (TryReadVisiblePanelElements(documents[0], out var panelReading))
+                return new(MuseVisibleProbeStatus.Success, panelReading);
+
             // Search the text provider directly: a long background chat can
             // place the Settings sheet beyond the first 8192 characters.
             TextPatternRange document = textPattern.DocumentRange;
@@ -106,4 +113,60 @@ internal static class MuseVisibleUsageReader
             return new(MuseVisibleProbeStatus.ReadFailed, null);
         }
     }
+
+    private static bool TryReadVisiblePanelElements(
+        AutomationElement document, out SyntheticUsageReading? reading)
+    {
+        reading = null;
+        // This bounded, read-only lookup is scoped to the ONE dedicated
+        // WebView2 document, never the OS desktop or a normal browser.
+        var nodes = document.FindAll(TreeScope.Descendants,
+            new PropertyCondition(AutomationElement.ControlTypeProperty,
+                ControlType.Text));
+        if (nodes.Count is 0 or > 2500)
+            return false;
+        var headings = new List<AutomationElement>();
+        for (int i = 0; i < nodes.Count; i++)
+        {
+            var e = nodes[i];
+            if (!e.Current.IsOffscreen
+                && e.Current.Name.Trim() == "利用状況"
+                && IsValidRect(e.Current.BoundingRectangle))
+                headings.Add(e);
+        }
+        if (headings.Count != 1)
+            return false;
+        var headingRect = headings[0].Current.BoundingRectangle;
+        var candidates = new List<string>();
+        for (int i = 0; i < nodes.Count; i++)
+        {
+            var e = nodes[i];
+            if (e.Current.IsOffscreen)
+                continue;
+            var rect = e.Current.BoundingRectangle;
+            if (!IsValidRect(rect))
+                continue;
+            // Only the immediately adjacent visible usage panel:
+            // same horizontal bounds, 0-180 px below the heading.
+            if (rect.Top < headingRect.Bottom - 2
+                || rect.Top > headingRect.Bottom + 180
+                || rect.Left < headingRect.Left - 24
+                || rect.Right > headingRect.Right + 36)
+                continue;
+            string name = e.Current.Name;
+            if (name.Length is < 1 or > 120)
+                continue;
+            if (name.Contains("無料プラン", StringComparison.Ordinal)
+                || name.Contains("使用済み", StringComparison.Ordinal)
+                || name.Contains("リセットされます", StringComparison.Ordinal))
+                candidates.Add(name);
+        }
+        // Keep uniqueness/ambiguity handling in the existing strict parser.
+        // No raw text, UIA coordinates or document contents are persisted.
+        return SyntheticUsageParser.TryParse(candidates, out reading);
+    }
+
+    private static bool IsValidRect(System.Windows.Rect rect) =>
+        rect.Width > 0 && rect.Height > 0
+            && !double.IsNaN(rect.X) && !double.IsNaN(rect.Y);
 }
