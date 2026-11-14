@@ -498,50 +498,52 @@ internal sealed class LoginWindow : Form
         return tcs.Task.WaitAsync(ct);
     }
 
+    // A monitor READ uses the SAME verified, user-visible quota panel as the
+    // one-shot QA button. Never retrieve cookies or invoke private Muse actions.
+    // The panel must already be open; this method never navigates the account.
     private async Task<MuseAutomaticResult> PollOnUiThreadAsync(CancellationToken ct)
     {
         if (!bridgeMode || !autoEnabled || resetting || autoInProgress
             || browser.CoreWebView2 is null || ct.IsCancellationRequested)
             return new(MuseAutomaticStatus.InvalidResponse);
+
+        var current = browser.CoreWebView2.Source;
+        if (!Uri.TryCreate(current, UriKind.Absolute, out var url)
+            || url.Scheme != Uri.UriSchemeHttps
+            || !url.Host.Equals("muse.ai", StringComparison.OrdinalIgnoreCase))
+            return new(MuseAutomaticStatus.InvalidResponse);
+
         autoInProgress = true;
         refreshHealth.Attempt(DateTimeOffset.UtcNow);
         try
         {
-            // Only this app's dedicated WebView2 profile is queried; never
-            // access other browser profiles, and never send cookies over IPC.
-            var cookies = await browser.CoreWebView2.CookieManager
-                .GetCookiesAsync("https://muse.ai/");
-            string header = string.Join("; ", cookies
-                .Where(c => c.IsSecure
-                    && (c.Domain.Equals("muse.ai", StringComparison.OrdinalIgnoreCase)
-                        || c.Domain.Equals(".muse.ai", StringComparison.OrdinalIgnoreCase))
-                    && c.Name.Length is > 0 and <= 128
-                    && c.Name.All(ch => char.IsAsciiLetterOrDigit(ch)
-                        || ch == '_' || ch == '-' || ch == '.')
-                    && !c.Value.Any(ch => ch is '\r' or '\n' or '\0'))
-                .Take(40)
-                .Select(c => c.Name + "=" + c.Value));
-            if (header.Length is 0 or > 8192)
+            IntPtr handle = Handle;
+            // UIA runs away from the WebView2 UI thread. Never read a page
+            // document into a log, file or IPC payload.
+            var probe = Task.Run(() => MuseVisibleUsageReader.ReadOnce(handle), ct);
+            var timeout = Task.Delay(TimeSpan.FromSeconds(12), ct);
+            var first = await Task.WhenAny(probe, timeout);
+            if (first != probe || ct.IsCancellationRequested)
             {
-                refreshHealth.Failure(DateTimeOffset.UtcNow, "NoSession");
-                status.Text = "Museに再ログインしてください。";
-                return new(MuseAutomaticStatus.NoSession);
-            }
-            var result = await autoReader.ReadAsync(
-                header, browser.CoreWebView2.Settings.UserAgent, ct);
-            if (ct.IsCancellationRequested || !autoEnabled || IsDisposed)
+                refreshHealth.Failure(DateTimeOffset.UtcNow, "VisiblePanelTimedOut");
+                status.Text = "Muse連携：表示中の利用状況を読み取れません（時間切れ）。";
                 return new(MuseAutomaticStatus.TimedOut);
-            if (result.Status == MuseAutomaticStatus.Success)
-            {
-                refreshHealth.Success(DateTimeOffset.UtcNow);
-                status.Text = "Museの利用枠をモニターへ応答しました。";
             }
-            else
+            var result = await probe;
+            if (result.Status != MuseVisibleProbeStatus.Success
+                || result.Reading is not { } visible)
             {
-                refreshHealth.Failure(DateTimeOffset.UtcNow, result.Status.ToString());
-                status.Text = "Muse連携：" + result.Status + "（更新されませんでした）。";
+                refreshHealth.Failure(DateTimeOffset.UtcNow, "VisiblePanelUnavailable");
+                status.Text = "Muse連携：設定 → 一般 → 利用状況を開いてください。";
+                return new(MuseAutomaticStatus.InvalidResponse);
             }
-            return result;
+            // Visible UI gives month/day, NOT the reset year or clock time.
+            // The wire format supports null reset; never fabricate an epoch.
+            var reading = new MusePassiveQuotaReading(
+                "Muse Free", visible.UsedPercent, WeeklyResetAt: null);
+            refreshHealth.Success(DateTimeOffset.UtcNow);
+            status.Text = $"Muse連携：週間使用{visible.UsedPercent}%を表示画面から応答しました（リセット時刻不明）。";
+            return new(MuseAutomaticStatus.Success, reading);
         }
         catch (OperationCanceledException)
         {
@@ -549,7 +551,7 @@ internal sealed class LoginWindow : Form
         }
         catch (Exception)
         {
-            refreshHealth.Failure(DateTimeOffset.UtcNow, "UnknownFailure");
+            refreshHealth.Failure(DateTimeOffset.UtcNow, "VisiblePanelReadFailed");
             return new(MuseAutomaticStatus.InvalidResponse);
         }
         finally

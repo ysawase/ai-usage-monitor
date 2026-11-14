@@ -17,9 +17,10 @@ internal static class MuseLocalPipeBridgeSelfTest
             count++;
             return Task.FromResult(new MuseAutomaticResult(
                 MuseAutomaticStatus.Success,
-                new MusePassiveQuotaReading(
-                    "Muse Free", 7M,
-                    DateTimeOffset.FromUnixTimeSeconds(1794584040L))));
+                count == 1
+                    ? new MusePassiveQuotaReading("Muse Free", 7M,
+                        DateTimeOffset.FromUnixTimeSeconds(1794584040L))
+                    : new MusePassiveQuotaReading("Muse Free", 5M, null)));
         }, name);
         bridge.Start();
         var one = await ReadAsync(name, "READ\n");
@@ -28,7 +29,7 @@ internal static class MuseLocalPipeBridgeSelfTest
         bridge.Stop();
         return count == 2
             && Check(one, "success", 7M, 1794584040L)
-            && Check(two, "success", 7M, 1794584040L)
+            && Check(two, "success", 5M, null)
             && Check(invalid, "unavailable", null, null)
             && !one.Contains("Muse Free", StringComparison.Ordinal)
             && !one.Contains("Cookie", StringComparison.OrdinalIgnoreCase);
