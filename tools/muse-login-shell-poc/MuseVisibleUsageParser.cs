@@ -69,7 +69,11 @@ internal static class MuseVisibleUsageParser
             int first = Math.Min(plan.Index, Math.Min(used.Index, reset.Index));
             int last = Math.Max(plan.Index + plan.Length,
                 Math.Max(used.Index + used.Length, reset.Index + reset.Length));
-            if (last - first > 320)
+            // The heading itself must also be close to the field group.
+            // Otherwise an unrelated earlier chat can supply all three fields.
+            int headingDistance = Math.Max(0, Math.Max(
+                first - (at + heading.Length), at - last));
+            if (last - first > 320 || headingDistance > 80)
                 return false;
         }
 
