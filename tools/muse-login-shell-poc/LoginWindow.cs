@@ -37,15 +37,17 @@ internal sealed class LoginWindow : Form
     private readonly MuseAutomaticQuotaReader autoReader = new();
     private readonly MuseRefreshHealth refreshHealth = new();
     private readonly bool bridgeMode;
+    private readonly bool autoEnableLocal;
     private MuseLocalPipeBridge? localBridge;
     private CancellationTokenSource? autoCancellation;
     private bool autoEnabled;
     private bool autoInProgress;
     private bool resetting;
 
-    internal LoginWindow(bool bridgeMode = false)
+    internal LoginWindow(bool bridgeMode = false, bool autoEnableLocal = false)
     {
         this.bridgeMode = bridgeMode;
+        this.autoEnableLocal = bridgeMode && autoEnableLocal;
         if (bridgeMode) autoToggle.Text = "Museローカル連携を有効にする";
         Text = bridgeMode ? "Museローカル連携検証（個人用）"
             : "Muse ログイン検証（連携未完成）";
@@ -151,6 +153,24 @@ internal sealed class LoginWindow : Form
             // Dormant unless the user explicitly arms one limited response read.
             // No browser cookie APIs, page script injection or new HTTP requests.
             core.WebResourceResponseReceived += ObserveMuseQuotaResponse;
+            // Wait until the dedicated Muse page has actually navigated.
+            // CoreWebView2.Source can still be blank immediately after Navigate,
+            // so enabling the local bridge synchronously could fail its origin check.
+            if (autoEnableLocal)
+            {
+                bool pending = true;
+                core.NavigationCompleted += (_, args) =>
+                {
+                    if (!pending || !args.IsSuccess || IsDisposed || resetting)
+                        return;
+                    if (!Uri.TryCreate(core.Source, UriKind.Absolute, out var source)
+                        || source.Scheme != Uri.UriSchemeHttps
+                        || !source.Host.Equals("muse.ai", StringComparison.OrdinalIgnoreCase))
+                        return;
+                    pending = false; // one-shot; manual Stop remains respected
+                    StartAutomaticRefresh();
+                };
+            }
             core.Navigate(MuseUrl);
             status.Text = "Muse専用画面。利用枠の応答検証はボタンを押した時だけ有効です。";
             open.Enabled = true;
