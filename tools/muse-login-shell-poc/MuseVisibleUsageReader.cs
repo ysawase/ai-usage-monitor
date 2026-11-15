@@ -137,6 +137,24 @@ internal static class MuseVisibleUsageReader
         if (headings.Count != 1)
             return false;
         var headingRect = headings[0].Current.BoundingRectangle;
+
+        // Muse Free has two distinct percentage cards: weekly quota followed
+        // by "追加のトークン". A broad 180px rectangle includes BOTH values
+        // and strict parsing rejects them as duplicates. Bound the weekly
+        // card at the next visible section heading instead of accepting 0%
+        // from the unrelated token wallet.
+        double panelBottom = headingRect.Bottom + 180;
+        for (int i = 0; i < nodes.Count; i++)
+        {
+            var e = nodes[i];
+            if (e.Current.IsOffscreen
+                || e.Current.Name.Trim() != "追加のトークン")
+                continue;
+            var rect = e.Current.BoundingRectangle;
+            if (IsValidRect(rect) && rect.Top > headingRect.Bottom
+                && rect.Top < panelBottom)
+                panelBottom = Math.Min(panelBottom, rect.Top - 2);
+        }
         var candidates = new List<string>();
         for (int i = 0; i < nodes.Count; i++)
         {
@@ -149,7 +167,7 @@ internal static class MuseVisibleUsageReader
             // Only the immediately adjacent visible usage panel:
             // same horizontal bounds, 0-180 px below the heading.
             if (rect.Top < headingRect.Bottom - 2
-                || rect.Top > headingRect.Bottom + 180
+                || rect.Top >= panelBottom
                 || rect.Left < headingRect.Left - 24
                 || rect.Right > headingRect.Right + 36)
                 continue;
