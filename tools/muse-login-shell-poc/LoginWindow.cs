@@ -520,21 +520,34 @@ internal sealed class LoginWindow : Form
             IntPtr handle = Handle;
             // UIA runs away from the WebView2 UI thread. Never read a page
             // document into a log, file or IPC payload.
-            var probe = Task.Run(() => MuseVisibleUsageReader.ReadOnce(handle), ct);
-            var timeout = Task.Delay(TimeSpan.FromSeconds(12), ct);
-            var first = await Task.WhenAny(probe, timeout);
-            if (first != probe || ct.IsCancellationRequested)
+            // UI Automation may briefly return an empty/incomplete WebView2
+            // accessibility tree even while the Usage sheet remains visible.
+            // Retry only one more time after a short pause. Do not cache
+            // percentages, use a different page, or treat a failed probe as
+            // successful. Keep the total attempt bounded and cancellable.
+            using var deadline = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            deadline.CancelAfter(TimeSpan.FromSeconds(12));
+            MuseVisibleProbeResult? result = null;
+            for (int attempt = 0; attempt < 2; attempt++)
             {
-                refreshHealth.Failure(DateTimeOffset.UtcNow, "VisiblePanelTimedOut");
-                status.Text = "Muse連携：表示中の利用状況を読み取れません（時間切れ）。";
-                return new(MuseAutomaticStatus.TimedOut);
+                if (attempt > 0)
+                    await Task.Delay(500, deadline.Token);
+                var probe = Task.Run(() => MuseVisibleUsageReader.ReadOnce(handle),
+                    deadline.Token);
+                result = await probe.WaitAsync(deadline.Token);
+                if (result.Status == MuseVisibleProbeStatus.Success
+                    && result.Reading is not null)
+                    break;
             }
-            var result = await probe;
-            if (result.Status != MuseVisibleProbeStatus.Success
+            if (result is null || result.Status != MuseVisibleProbeStatus.Success
                 || result.Reading is not { } visible)
             {
-                refreshHealth.Failure(DateTimeOffset.UtcNow, "VisiblePanelUnavailable");
-                status.Text = "Muse連携：設定 → 一般 → 利用状況を開いてください。";
+                // Only an enum is recorded: never include accessibility text.
+                string reason = "VisiblePanel" + (result?.Status.ToString() ?? "Unavailable");
+                refreshHealth.Failure(DateTimeOffset.UtcNow, reason);
+                status.Text = "Muse連携：画面の利用状況を取得できません（"
+                    + (result?.Status.ToString() ?? "Unavailable")
+                    + "）。設定 → 一般 → 利用状況を確認してください。";
                 return new(MuseAutomaticStatus.InvalidResponse);
             }
             // Visible UI gives month/day, NOT the reset year or clock time.
@@ -547,6 +560,8 @@ internal sealed class LoginWindow : Form
         }
         catch (OperationCanceledException)
         {
+            refreshHealth.Failure(DateTimeOffset.UtcNow, "VisiblePanelTimedOut");
+            status.Text = "Muse連携：表示中の利用状況を読み取れません（時間切れ）。";
             return new(MuseAutomaticStatus.TimedOut);
         }
         catch (Exception)
