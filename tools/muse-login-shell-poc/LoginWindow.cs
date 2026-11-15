@@ -37,15 +37,17 @@ internal sealed class LoginWindow : Form
     private readonly MuseAutomaticQuotaReader autoReader = new();
     private readonly MuseRefreshHealth refreshHealth = new();
     private readonly bool bridgeMode;
+    private readonly bool autoEnableLocal;
     private MuseLocalPipeBridge? localBridge;
     private CancellationTokenSource? autoCancellation;
     private bool autoEnabled;
     private bool autoInProgress;
     private bool resetting;
 
-    internal LoginWindow(bool bridgeMode = false)
+    internal LoginWindow(bool bridgeMode = false, bool autoEnableLocal = false)
     {
         this.bridgeMode = bridgeMode;
+        this.autoEnableLocal = bridgeMode && autoEnableLocal;
         if (bridgeMode) autoToggle.Text = "Museローカル連携を有効にする";
         Text = bridgeMode ? "Museローカル連携検証（個人用）"
             : "Muse ログイン検証（連携未完成）";
@@ -158,6 +160,12 @@ internal sealed class LoginWindow : Form
             readVisible.Enabled = true;
             captureQuota.Enabled = true;
             autoToggle.Enabled = true;
+            if (autoEnableLocal)
+            {
+                // Explicit launcher opt-in only; does not imply that Muse is
+                // logged in or that quota data can be read yet.
+                StartAutomaticRefresh();
+            }
         }
         catch (Exception)
         {
