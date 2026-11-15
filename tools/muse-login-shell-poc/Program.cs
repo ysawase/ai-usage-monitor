@@ -59,7 +59,13 @@ internal static class Program
             Record("Process entered managed Main");
             ApplicationConfiguration.Initialize();
             Record("Windows Forms initialized");
-            using var window = new LoginWindow(bridgeMode: args.Contains("--muse-local-bridge", StringComparer.Ordinal));
+            bool bridgeMode = args.Contains("--muse-local-bridge", StringComparer.Ordinal);
+            bool autoEnableLocal = bridgeMode &&
+                args.Contains("--muse-auto-enable-local", StringComparer.Ordinal);
+            // Explicit command-line opt-in for the isolated personal QA
+            // launcher only. Never on ordinary or Store launches.
+            using var window = new LoginWindow(bridgeMode: bridgeMode,
+                autoEnableLocal: autoEnableLocal);
             Record("Window constructed");
             window.Shown += (_, _) => Record("Window shown");
             Application.Run(window);
