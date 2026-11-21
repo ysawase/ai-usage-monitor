@@ -1,0 +1,22 @@
+name: Preservation gate negative tests
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/release.yml"
+      - ".github/workflows/preservation-gate-test.yml"
+      - "scripts/verify-preserved-baseline.ps1"
+      - "scripts/test-preservation-gate.ps1"
+      - "docs/preservation-baseline.json"
+
+permissions:
+  contents: read
+
+jobs:
+  preservation-negative:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Confirm unsafe baselines are rejected
+        shell: pwsh
+        run: .\scripts\test-preservation-gate.ps1

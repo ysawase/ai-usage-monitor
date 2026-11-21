@@ -22,6 +22,10 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      - name: Verify accepted QA baseline and required functionality
+        shell: pwsh
+        run: .\scripts\verify-preserved-baseline.ps1
+
       - name: Build release binary
         run: cargo build --release --locked --no-default-features --features antigravity
 

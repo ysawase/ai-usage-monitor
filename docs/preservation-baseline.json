@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "baseline": {
+    "id": "CURRENT_RUNNING_QA_2026-11-17",
+    "status": "UNVERIFIED",
+    "exe_filename": "AUM_Copy_Status_Neutral_QA_20261117.exe",
+    "exe_sha256": "C9BA7B263B8577FC01A9C5F2A4B625AF13D9A9F35A684695BD0C58FDB9179B33",
+    "source_commit": null,
+    "source_provenance": "UNKNOWN",
+    "acceptance_evidence": null
+  },
+  "required_features": [
+    {
+      "id": "muse-display-selection",
+      "acceptance_test": null
+    },
+    {
+      "id": "muse-runtime-display",
+      "acceptance_test": null
+    },
+    {
+      "id": "muse-ipc-read",
+      "acceptance_test": null
+    },
+    {
+      "id": "codex-quota",
+      "acceptance_test": null
+    },
+    {
+      "id": "codex-auth-recovery",
+      "acceptance_test": null
+    },
+    {
+      "id": "copy-current-and-filtered",
+      "acceptance_test": null
+    }
+  ]
+}
