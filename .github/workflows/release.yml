@@ -20,6 +20,10 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Verify accepted QA baseline and required functionality
+        shell: pwsh
+        run: .\scripts\verify-preserved-baseline.ps1
+
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Build release binary
