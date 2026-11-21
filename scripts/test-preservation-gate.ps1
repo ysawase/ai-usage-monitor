@@ -39,6 +39,7 @@ try {
   $m | ConvertTo-Json -Depth 24 | Set-Content -LiteralPath $noTests -Encoding utf8
   Assert-Rejected 'required features lack acceptance tests' $noTests 'no acceptance test:'
   Write-Output 'PRESERVATION_NEGATIVE_TESTS=PASS'
+  exit 0
 }
 finally {
   Remove-Item -LiteralPath $temp -Recurse -Force -ErrorAction SilentlyContinue
