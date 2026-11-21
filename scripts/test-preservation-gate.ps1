@@ -13,7 +13,7 @@ try {
     $code = $LASTEXITCODE
     $output = $lines -join [Environment]::NewLine
     if ($code -ne 2 -or !$output.Contains($Expected)) {
-      throw "FAIL $Name: expected exit 2 and text '$Expected'; got exit $code; output: $output"
+      throw "FAIL ${Name}: expected exit 2 and text '$Expected'; got exit $code; output: $output"
     }
     Write-Output "PASS negative case: $Name (exit 2)"
   }
